@@ -1,5 +1,6 @@
 __pycache__/
 results*/
+data/
 convert_ckpt_to_params.py
 *.pt
 *.pth
@@ -20,4 +21,5 @@ tmp/
 sam31_repro_*/
 tmp/sam3_probe/
 logs/
+wandb/
 *.ts
