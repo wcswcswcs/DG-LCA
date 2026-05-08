@@ -8038,3 +8038,630 @@ Next:
   不建议继续加 seeds confirm。
   下一轮应重设计 PureKAN functional metric：更 layer-local / block-local，input/output 使用更安全 metric，再考虑确认实验。
 ```
+
+## 2026-05-02 DG-KAN v3.8 GlobalTFU / Depthwise PureKAN
+
+依据 `docs/DG-KAN_v3.8_修改版_GlobalTFU_Depthwise_PureKAN_实验计划.md`，实现并运行：
+
+```text
+P0 smoke: 21 rows
+P1 one-batch shadow: 24 rows
+P2 global TFU: 72 rows
+P3 depth-wise sweep: 72 rows
+```
+
+关键结论：
+
+```text
+P0 pass: PureKAN alphaFixed1 / no non-KAN params / coeff coverage / TFU role metrics 均正常。
+P1 pass: D6 GlobalTFU 把 D0 full Sobolev 的 MNIST/KMNIST bad step 修成三数据集 train/val descent 全正。
+P2 fail: D6 方向修复不能稳定转化为 3-seed accuracy gate。
+P3 fail: D3/D7 对 Fashion/MNIST 有帮助，D8 对 KMNIST 相对最好，但无候选进入 P4。
+P4-P7 not run: 按计划 gate 未达，不做大 seed confirm。
+```
+
+复盘文档：
+
+```text
+docs/DG-KAN_v3.8_GlobalTFU_Depthwise_PureKAN_结果复盘.md
+```
+
+## 2026-05-02 DG-KAN v3.9 Normalization / FNG PureKAN
+
+依据 `docs/DG-KAN_v3.9_Normalization_FNG_PureKAN_实验计划.md`，实现并运行：
+
+```text
+P0 implementation smoke
+P1 one-batch direction audit
+P2 normalization ablation
+P3 relaxed FNG diagnostic subset
+```
+
+关键结论：
+
+```text
+P0 pass: norm modes / functional norm / FNG update 覆盖正常。
+P1 strict fail: no candidate passed the formal direction gate; no-bad-step FNG variants still had raw-precond cosine below 0.5.
+P2: NoNorm fails hard, but AffineNorm/ScalarGain does not close the PureKAN functional gap, so normalization is necessary but not the missing key.
+P3: relaxed diagnostic run did not justify P4/P5 expansion under the plan gate.
+P4-P7 not run: no formal P1/P3 survivor.
+```
+
+复盘文档：
+
+```text
+docs/DG-KAN_v3.9_Normalization_FNG_PureKAN_结果复盘.md
+```
+
+
+
+# DG-KAN v4.1 Functional Update Redesign 结果复盘
+
+本轮依据 `docs/DG-KAN_v4.1_FunctionalUpdate_Redesign_DeepPlan.md`。目标是验证重新设计的 PureKAN functional update：FTF、FC-Adam 与 FTR/FGN trust-region 是否能把 v3.7-v3.9 的局部方向修复转成长程训练收益。
+
+## Run Inventory
+
+| stage | rows | errors |
+|---|---|---|
+| P0 smoke | 30 | 0 |
+| P1 shadow | 30 | 0 |
+| P2 micro | 72 | 5 |
+
+## Code / Config Changes
+
+```text
+experiments/dgkan_core.py
+  Added FTF fields and per-role target-fitting updates for PureKAN coeffs.
+  Added FC-Adam functional-coordinate updates through Sobolev Cholesky coordinates.
+  Added an FTR-CG-small diagnostic path with layer-output trust scaling.
+  Result rows now include FTF fit/residual/trust stats, FC-Adam reconstruction diagnostics,
+  and FTR residual / predicted change statistics.
+
+experiments/run_gafu_v41.py
+  Added P0/P1/P2 packages and one-batch direction audit for v4.1 candidates.
+
+experiments/analyze_gafu_v41.py
+  Writes the required v4.1 CSV/JSON artifacts and this replay.
+```
+
+## P0 Implementation Smoke
+
+P0 rows: `30`; errors: `0`.
+
+Key audit:
+
+```text
+PureKAN alphaFixed1 / fixed norm paths ran without implementation errors.
+Strict PureKAN rows kept learnable_nonKAN_params = 0.
+Functional rows covered input/block/output coeff groups.
+FTF, FC-Adam, and FTR all produced finite one-epoch smoke rows.
+```
+
+## P1 One-Batch Direction Gate
+
+| method | bad | min train | min val | min FTF R2 | max delta | P1 pass |
+|---|---|---|---|---|---|---|
+| D0-allFullSobolev | 0 | 0.0016 | -0.0039 |  |  | yes |
+| D6-allTaskAware | 1 | -0.0080 | -0.0091 |  |  | no |
+| F4-FNG-leftFull-right | 0 | 0.0488 | 0.0046 |  |  | yes |
+| FC-Adam-one-step | 0 | 0.0212 | -0.0377 |  |  | no |
+| FTF-all-sequential | 0 | 0.0784 | 0.0636 | 1.0000 | 0.1000 | yes |
+| FTF-all-simultaneous | 0 | 0.1247 | 0.0231 | 0.9999 | 0.1000 | yes |
+| FTF-blocks-output | 0 | 0.0664 | 0.0086 | 0.9997 | 0.0997 | yes |
+| FTF-output-only | 0 | 0.0093 | -0.0666 | 1.0000 | 0.0998 | no |
+| FTR-CG-small | 0 | 0.0388 | 0.0023 |  |  | yes |
+
+P1 survivors used for P2:
+
+```text
+D0-allFullSobolev, F4-FNG-leftFull-right, FTF-all-sequential, FTF-all-simultaneous, FTF-blocks-output, FTR-CG-small
+```
+
+Observation:
+
+```text
+FTF repaired the one-step direction signal strongly: blocks/output and all-layer modes had positive train and validation descent on all three datasets, with fit R2 near 1.0.
+D6 still had a KMNIST bad train step and was not treated as a P2 candidate, but was later added as a P2 baseline because the plan requires AUC comparison vs D6.
+FC-Adam improved train loss but failed the validation-descent gate on Fashion/KMNIST.
+```
+
+## P2 Micro-Run Scorecard
+
+| dataset | method | runs | errors | acc | std | gap vs AdamW | AUC imp vs AdamW | AUC imp vs D6 | ECE red | phi ratio | FTF R2 | P2 pass |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| MNIST | D0-allFullSobolev | 3 | 0 | 0.8417 | 0.0304 | 0.0723 | -0.8900 | 0.0003 | -8.4610 | 0.7658 |  | 0 |
+| MNIST | D6-allTaskAware | 3 | 0 | 0.8523 | 0.0068 | 0.0617 | -0.8906 | 0.0000 | -5.7526 | 0.7685 |  | 0 |
+| MNIST | F4-FNG-leftFull-right | 3 | 0 | 0.9233 | 0.0110 | -0.0093 | -0.0388 | 0.4505 | -0.4553 | 0.7661 |  | 0 |
+| MNIST | FTF-all-sequential | 3 | 0 | 0.1003 | 0.0005 | 0.8137 | -518293472445.2520 | -274141826146.2508 | -42.8198 | 509227.2591 | 0.9453 | 0 |
+| MNIST | FTF-all-simultaneous | 3 | 0 | 0.1003 | 0.0005 | 0.8137 | -518293472445.2520 | -274141826146.2508 | -42.8198 | 509227.2591 | 0.9453 | 0 |
+| MNIST | FTF-blocks-output | 3 | 0 | 0.1023 | 0.0033 | 0.8117 | -1754569223347315.0000 | -928047209855757.8750 | -42.7223 | 22285636.6922 | 0.7068 | 0 |
+| MNIST | FTR-CG-small | 3 | 0 | 0.6687 | 0.0107 | 0.2453 | -1.9351 | -0.5525 | -18.2742 | 0.7644 |  | 0 |
+| MNIST | PureKAN-AdamW | 3 | 0 | 0.9140 | 0.0043 | 0.0000 | 0.0000 | 0.4711 | 0.0000 | 1.0000 |  | 1 |
+| Fashion-MNIST | D0-allFullSobolev | 3 | 0 | 0.8170 | 0.0174 | 0.0190 | -0.5294 | -0.1251 | -0.1849 | 0.7614 |  | 0 |
+| Fashion-MNIST | D6-allTaskAware | 3 | 0 | 0.8060 | 0.0134 | 0.0300 | -0.3594 | 0.0000 | 0.4009 | 0.7636 |  | 0 |
+| Fashion-MNIST | F4-FNG-leftFull-right | 3 | 0 | 0.8227 | 0.0164 | 0.0133 | -0.1005 | 0.1904 | 0.3178 | 0.7607 |  | 1 |
+| Fashion-MNIST | FTF-all-sequential | 2 | 1 | 0.1000 | 0.0000 | 0.7360 | -105351734110180880.0000 | -77501361878272944.0000 | -10.9915 | 203698804.2161 | 0.9480 | 0 |
+| Fashion-MNIST | FTF-all-simultaneous | 2 | 1 | 0.1000 | 0.0000 | 0.7360 | -105351734110180880.0000 | -77501361878272944.0000 | -10.9915 | 203698804.2161 | 0.9480 | 0 |
+| Fashion-MNIST | FTR-CG-small | 3 | 0 | 0.7167 | 0.0194 | 0.1193 | -1.7757 | -1.0420 | -3.1114 | 0.7598 |  | 0 |
+| Fashion-MNIST | PureKAN-AdamW | 3 | 0 | 0.8360 | 0.0156 | 0.0000 | 0.0000 | 0.2644 | 0.0000 | 1.0000 |  | 1 |
+| KMNIST | D0-allFullSobolev | 3 | 0 | 0.5750 | 0.0185 | 0.1930 | -1.0548 | -0.1156 | -0.5424 | 0.7607 |  | 0 |
+| KMNIST | D6-allTaskAware | 3 | 0 | 0.5610 | 0.0550 | 0.2070 | -0.8419 | 0.0000 | 0.2455 | 0.7640 |  | 0 |
+| KMNIST | F4-FNG-leftFull-right | 3 | 0 | 0.7123 | 0.0132 | 0.0557 | -0.1847 | 0.3568 | 0.3224 | 0.7648 |  | 0 |
+| KMNIST | FTF-all-sequential | 3 | 0 | 0.1070 | 0.0099 | 0.6610 | -788570634358.2345 | -428138390693.1385 | -9.8694 | 626491.2995 | 0.9186 | 0 |
+| KMNIST | FTF-all-simultaneous | 3 | 0 | 0.1070 | 0.0099 | 0.6610 | -788570634358.2345 | -428138390693.1385 | -9.8694 | 626491.2995 | 0.9186 | 0 |
+| KMNIST | FTF-blocks-output | 3 | 0 | 0.1000 | 0.0000 | 0.6680 | -117251294060245.6875 | -63659205857378.9766 | -9.9546 | 6377580.6882 | 0.6710 | 0 |
+| KMNIST | FTR-CG-small | 3 | 0 | 0.3730 | 0.0140 | 0.3950 | -2.1432 | -0.7065 | -1.2296 | 0.7613 |  | 0 |
+| KMNIST | PureKAN-AdamW | 3 | 0 | 0.7680 | 0.0067 | 0.0000 | 0.0000 | 0.4571 | 0.0000 | 1.0000 |  | 1 |
+
+## P2 Failure Diagnosis
+
+```text
+No candidate passed the P2 joint gate.
+
+FTF:
+  P1 target fit was excellent, but P2 training was catastrophic.
+  MNIST/KMNIST dropped to near chance accuracy, Fashion produced numerical eigensolve failures for several FTF rows, and val-loss AUC exploded.
+  This matches the plan's failure mode: fit_R2 high + one-step descent positive + short-run acc bad => layer-local target fitting causes cross-layer drift.
+
+FTR-CG-small:
+  Local direction was acceptable, but short training underfit badly on all datasets.
+
+F4-FNG-leftFull-right:
+  Best practical candidate in P2.
+  It matched/beat PureKAN-AdamW on MNIST and stayed within about 1.3 points on Fashion.
+  It failed KMNIST by about 5.6 points, so it cannot enter P3.
+
+D0/D6:
+  Geometry is stable but accuracy remains below AdamW, especially on KMNIST.
+```
+
+## P3-P5 Decision
+
+```text
+P3 refinement: not run.
+Reason: P2 produced no survivor.
+
+P4 5-seed confirm: not run.
+Reason: P3 was not reached.
+
+P5 10-seed final: not run.
+Reason: P4 was not reached.
+```
+
+## Artifacts
+
+Required files were written under `results/v4_1/`:
+
+```text
+p0_invariants.csv
+p1_direction_audit.csv
+p2_micro_run_scorecard.csv
+p2_failure_diagnosis.csv
+p3_refinement_scorecard.csv
+p4_confirm5_scorecard.csv
+p5_confirm10_scorecard.csv
+functional_target_fit.csv
+representation_audit.csv
+geometry_audit.csv
+compute_audit.csv
+failure_table.csv
+aggregate_decision.json
+figures/p2_kmnist_acc_gap.svg
+figures/p2_kmnist_auc_vs_d6.svg
+```
+
+## Final Decision
+
+```text
+PureKAN functional optimization is still not solved in v4.1.
+
+What improved:
+  FTF gives a real one-step target-fitting direction.
+  FNG remains the strongest short-run practical baseline among functional candidates.
+
+What failed:
+  FTF target fitting is not yet a stable optimizer; high local fit creates long-horizon drift.
+  FTR-CG-small is too weak in this approximation.
+  FNG does not close the KMNIST accuracy gap.
+
+Next recommended direction:
+  Add accepted-step / backtracking and cross-layer drift control to FTF before more seeds.
+  In particular, target fitting should be sequential with validation of actual loss decrease
+  and an activation/logit trust region that rejects or shrinks unsafe layer updates.
+```
+
+
+# DG-KAN v4.2 Functional Trust Region 结果复盘
+
+本轮依据 `docs/DG-KAN_v4.2_FunctionalTrustRegion_DeepRedesign_实验计划.md`。核心目标是把 v4.1 的 proposal 直接更新改成 BFT：proposal -> 临时 apply -> train/holdout loss、activation drift、logit drift 验收 -> backtrack / accept / reject。
+
+## Run Inventory
+
+| stage | rows | errors |
+|---|---|---|
+| P0 smoke | 24 | 0 |
+| P1 proposal | 108 | 0 |
+| P2 single-block | 48 | 0 |
+| P3 baselines+BFT | 99 | 0 |
+| BFT acceptance log | 24372 | 2233 |
+
+## Code / Config Changes
+
+```text
+experiments/run_gafu_v42.py
+  Added BFT proposal generation using existing raw/Sobolev/D6/FNG/FTF/FC paths.
+  Added temporary apply/rollback, train+holdout loss checks, activation/logit trust,
+  backtracking, mixed proposal selection, and sequential role orders.
+
+experiments/analyze_gafu_v42.py
+  Generates v4.2 required artifacts, gate summaries, traces, figures, and this replay.
+```
+
+## P0 Implementation Smoke
+
+```text
+P0 rows = 24
+errors = 0
+rollback max abs error = 0.0000
+strict PureKAN nonKAN params = 0
+```
+
+P0 通过：proposal、临时 apply、rollback、accept/reject/backtrack 统计均能产生有限记录。
+
+## P1 Proposal Direction Audit
+
+| proposal | rows | accept | bad | holdout+ | median ratio | act p95 | logit p95 | p1_pass |
+|---|---|---|---|---|---|---|---|---|
+| FC-whitened-Adam-one-step | 12 | 0.7500 | 0.0000 | 3 | 0.9911 | 0.0779 | 0.1362 | no |
+| FC-whitened-gradient | 12 | 0.7500 | 0.0000 | 3 | 0.9994 | 0.0704 | 0.1208 | no |
+| FNG-leftFullRight | 12 | 0.8333 | 0.0000 | 3 | 0.9935 | 0.0702 | 0.1070 | no |
+| FTF-blocks-output | 12 | 1.0000 | 0.0000 | 3 | 0.9891 | 0.0866 | 0.0972 | yes |
+| FTF-output-only | 12 | 1.0000 | 0.0000 | 3 | 0.9904 | 0.0865 | 0.0944 | yes |
+| Sobolev-full | 12 | 1.0000 | 0.0000 | 3 | 0.9831 | 0.0788 | 0.0884 | yes |
+| mixed-best-of-proposals | 12 | 1.0000 | 0.0000 | 3 | 0.9861 | 0.0878 | 0.0963 | yes |
+| raw-gradient | 12 | 1.0000 | 0.0000 | 3 | 0.9977 | 0.0242 | 0.0820 | yes |
+| task-diag-D6 | 12 | 0.7500 | 0.0000 | 3 | 0.9772 | 0.0948 | 0.1613 | no |
+
+P1 survivors:
+
+```text
+FTF-blocks-output, FTF-output-only, Sobolev-full, mixed-best-of-proposals, raw-gradient
+```
+
+观察：
+
+```text
+BFT acceptance gate 明显压住了 v4.1 的危险方向。
+FTF 在 block/output role 上仍有强 one-step descent，但 input role 基本是 no-op 或需要 mixed/raw 接管。
+input role 的 FNG/D6/FC 经常因为 logit drift 超过阈值被拒绝。
+```
+
+## P2 Single-Block Accepted-Step Audit
+
+| proposal | rows | accept | bad | holdout+ | median ratio | act p95 | logit p95 | p2_pass |
+|---|---|---|---|---|---|---|---|---|
+| FNG-leftFullRight | 12 | 0.7500 |  |  |  | 0.0771 | 0.1908 | no |
+| FTF-blocks-output | 12 | 1.0000 |  |  |  | 0.0912 | 0.0947 | yes |
+| mixed-best-of-proposals | 12 | 1.0000 |  |  |  | 0.0771 | 0.0956 | yes |
+| raw-gradient | 12 | 1.0000 |  |  |  | 0.0242 | 0.0637 | yes |
+
+P2 survivors:
+
+```text
+FTF-blocks-output, mixed-best-of-proposals, raw-gradient
+```
+
+观察：
+
+```text
+single-block 层面，FTF / mixed / raw 都能在 trust gate 内得到正 holdout descent。
+FNG 对 hidden/output 比较安全，但 input FNG 会因为 logit drift 被拒绝。
+这说明 BFT 的验收机制确实阻止了 v4.1 的 FTF 长程爆炸第一步。
+```
+
+## P3 Sequential BFT Micro-Run
+
+| dataset | method | runs | acc | std | gap vs AdamW | AUC vs D6 | accept | fallback | act p95 | logit p95 | P3 pass |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| Fashion-MNIST | BFT-FNG-forward | 3 | 0.7400 | 0.0265 | 0.0800 | -0.1274 | 0.9045 | 0.0955 | 0.0912 | 0.1305 | 0 |
+| Fashion-MNIST | BFT-FNG-reverse | 3 | 0.7460 | 0.0306 | 0.0740 | -0.1454 | 0.9219 | 0.0781 | 0.0858 | 0.1248 | 0 |
+| Fashion-MNIST | BFT-FTF-forward | 3 | 0.7033 | 0.0182 | 0.1167 | -0.1139 | 0.9080 | 0.0920 | 0.0866 | 0.1054 | 0 |
+| Fashion-MNIST | BFT-FTF-reverse | 3 | 0.7263 | 0.0105 | 0.0937 | -0.1053 | 0.9809 | 0.0191 | 0.0827 | 0.0940 | 0 |
+| Fashion-MNIST | BFT-mixed-forward | 3 | 0.7297 | 0.0226 | 0.0903 | 0.0890 | 1.0000 | 0.0000 | 0.0824 | 0.0874 | 0 |
+| Fashion-MNIST | BFT-mixed-output-first | 3 | 0.7253 | 0.0252 | 0.0947 | 0.0657 | 1.0000 | 0.0000 | 0.0841 | 0.0866 | 0 |
+| Fashion-MNIST | BFT-mixed-reverse | 3 | 0.7373 | 0.0184 | 0.0827 | 0.0683 | 1.0000 | 0.0000 | 0.0848 | 0.0876 | 0 |
+| Fashion-MNIST | D0-allFullSobolev | 3 | 0.7593 | 0.0296 | 0.0607 | -0.1722 |  |  |  |  | 1 |
+| Fashion-MNIST | D6-allTaskAware | 3 | 0.7827 | 0.0154 | 0.0373 | 0.0000 |  |  |  |  | 1 |
+| Fashion-MNIST | F4-FNG-leftFullRight | 3 | 0.7930 | 0.0164 | 0.0270 | 0.2413 |  |  |  |  | 1 |
+| Fashion-MNIST | PureKAN-AdamW | 3 | 0.8200 | 0.0086 | 0.0000 | 0.2862 |  |  |  |  | 1 |
+| KMNIST | BFT-FNG-forward | 3 | 0.3837 | 0.0189 | 0.3407 | -0.3030 | 0.7526 | 0.2474 | 0.0875 | 0.1507 | 0 |
+| KMNIST | BFT-FNG-reverse | 3 | 0.4223 | 0.0450 | 0.3020 | -0.2699 | 0.8325 | 0.1675 | 0.0882 | 0.1463 | 0 |
+| KMNIST | BFT-FTF-forward | 3 | 0.4127 | 0.0045 | 0.3117 | -0.1222 | 0.8741 | 0.1259 | 0.0904 | 0.1218 | 0 |
+| KMNIST | BFT-FTF-reverse | 3 | 0.4250 | 0.0102 | 0.2993 | -0.1106 | 0.9575 | 0.0425 | 0.0868 | 0.0995 | 0 |
+| KMNIST | BFT-mixed-forward | 3 | 0.4913 | 0.0137 | 0.2330 | -0.0259 | 1.0000 | 0.0000 | 0.0818 | 0.0939 | 0 |
+| KMNIST | BFT-mixed-output-first | 3 | 0.4900 | 0.0115 | 0.2343 | -0.0508 | 1.0000 | 0.0000 | 0.0833 | 0.0925 | 0 |
+| KMNIST | BFT-mixed-reverse | 3 | 0.4907 | 0.0103 | 0.2337 | -0.0389 | 1.0000 | 0.0000 | 0.0815 | 0.0932 | 0 |
+| KMNIST | D0-allFullSobolev | 3 | 0.5367 | 0.0237 | 0.1877 | -0.0882 |  |  |  |  | 1 |
+| KMNIST | D6-allTaskAware | 3 | 0.5383 | 0.0180 | 0.1860 | 0.0000 |  |  |  |  | 1 |
+| KMNIST | F4-FNG-leftFullRight | 3 | 0.6630 | 0.0028 | 0.0613 | 0.3186 |  |  |  |  | 1 |
+| KMNIST | PureKAN-AdamW | 3 | 0.7243 | 0.0111 | 0.0000 | 0.4216 |  |  |  |  | 1 |
+| MNIST | BFT-FNG-forward | 3 | 0.6540 | 0.0022 | 0.2463 | -0.0152 | 0.7500 | 0.2500 | 0.1690 | 0.2146 | 0 |
+| MNIST | BFT-FNG-reverse | 3 | 0.6503 | 0.0110 | 0.2500 | -0.0347 | 0.7500 | 0.2500 | 0.1530 | 0.1949 | 0 |
+| MNIST | BFT-FTF-forward | 3 | 0.6433 | 0.0155 | 0.2570 | 0.1077 | 0.6988 | 0.3012 | 0.0933 | 0.2033 | 0 |
+| MNIST | BFT-FTF-reverse | 3 | 0.6520 | 0.0024 | 0.2483 | 0.1301 | 0.7491 | 0.2509 | 0.0912 | 0.1850 | 0 |
+| MNIST | BFT-mixed-forward | 3 | 0.7060 | 0.0237 | 0.1943 | 0.1565 | 1.0000 | 0.0000 | 0.0797 | 0.0922 | 0 |
+| MNIST | BFT-mixed-output-first | 3 | 0.7137 | 0.0259 | 0.1867 | 0.1402 | 1.0000 | 0.0000 | 0.0855 | 0.0918 | 0 |
+| MNIST | BFT-mixed-reverse | 3 | 0.7277 | 0.0323 | 0.1727 | 0.1610 | 1.0000 | 0.0000 | 0.0811 | 0.0939 | 0 |
+| MNIST | D0-allFullSobolev | 3 | 0.6800 | 0.0349 | 0.2203 | 0.0269 |  |  |  |  | 1 |
+| MNIST | D6-allTaskAware | 3 | 0.6913 | 0.0300 | 0.2090 | 0.0000 |  |  |  |  | 1 |
+| MNIST | F4-FNG-leftFullRight | 3 | 0.8400 | 0.0333 | 0.0603 | 0.4325 |  |  |  |  | 1 |
+| MNIST | PureKAN-AdamW | 3 | 0.9003 | 0.0076 | 0.0000 | 0.4301 |  |  |  |  | 1 |
+
+Best BFT points:
+
+```text
+MNIST: BFT-mixed-reverse acc=0.7277, gap=0.1727
+Fashion: BFT-FNG-reverse acc=0.7460, gap=0.0740
+KMNIST: BFT-mixed-forward acc=0.4913, gap=0.2330
+```
+
+P3 verdict:
+
+```text
+No BFT candidate passed the P3 joint gate.
+
+BFT successfully prevents catastrophic FTF divergence:
+  no chance-accuracy collapse like v4.1 FTF
+  acceptance/logit/activation traces remain finite
+
+But BFT is too conservative or direction-weak:
+  MNIST best BFT remains far below PureKAN-AdamW
+  Fashion best BFT remains below PureKAN-AdamW and FNG baseline
+  KMNIST best BFT improves over D0/D6 but remains far below PureKAN-AdamW and F4-FNG baseline
+```
+
+## P4-P8 Decision
+
+```text
+P4 proposal/order ablation: not run.
+Reason: P3 produced no survivor.
+
+P5 temporal dynamics: not run.
+Reason: no P4 candidate.
+
+P6 3-seed full-budget selection: not run.
+Reason: P3 micro-run did not satisfy entry gate.
+
+P7/P8 confirm: not run.
+Reason: P6 was not reached.
+```
+
+## Required Artifacts
+
+Written under `results/v4_2/`:
+
+```text
+p0_invariants.csv
+p1_proposal_direction_audit.csv
+p2_single_block_acceptance.csv
+p3_sequential_micro_scorecard.csv
+p4_ablation_scorecard.csv
+p5_temporal_dynamics_scorecard.csv
+p6_candidate_selection.csv
+p7_confirm5.csv
+p8_confirm10.csv
+bft_acceptance_log.csv
+bft_rejection_reason_log.csv
+role_update_trace.csv
+proposal_choice_trace.csv
+activation_drift_trace.csv
+logit_drift_trace.csv
+metric_norm_trace.csv
+eta_backtracking_trace.csv
+failure_table.csv
+aggregate_decision.json
+figures/p3_kmnist_bft_acc.svg
+figures/p3_fashion_bft_acc.svg
+```
+
+## Final Decision
+
+```text
+PureKAN functional optimization remains unsolved in v4.2.
+
+What is confirmed:
+  1. BFT acceptance/backtracking prevents FTF-style numerical catastrophe.
+  2. Proposal selection is useful: mixed candidates choose FTF for hidden blocks and FNG/raw for safer roles.
+  3. The trust protocol gives finite, auditable acceptance/rejection traces.
+
+What is not confirmed:
+  1. Stability did not translate into AdamW-level representation learning.
+  2. BFT candidates underfit, especially on KMNIST.
+  3. P4/P5/P6 expansion is not justified.
+
+Interpretation:
+  v4.1 failed because proposal was too strong and unchecked.
+  v4.2 shows the opposite side: checked proposals are stable but too weak.
+  The next design needs stronger accepted directions, likely better downstream curvature or temporal dynamics,
+  but only after improving P3 micro-run accuracy.
+```
+
+
+## 2026-05-03 DG-KAN v4.3 Functional Update Deep Redesign
+
+P0/P1/P2 completed. No P2 survivor; P3-P8 not run by gate. See `docs/DG-KAN_v4.3_FunctionalUpdate_DeepRedesign_结果复盘.md`.
+
+
+## 2026-05-03 DG-KAN v4.4 Functional Optimizer Redesign
+
+Implemented and ran `experiments/run_gafu_v44.py` and `experiments/analyze_gafu_v44.py`.
+
+Summary:
+
+```text
+P0 rows=33, errors=0, pass=True
+P1 survivors=none
+P2 survivors=none
+Decision=stop after P2 by written gate
+```
+
+Result replay:
+
+```text
+docs/DG-KAN_v4.4_FunctionalOptimizer_Redesign_结果复盘.md
+results/v4_4/aggregate_decision.json
+```
+
+
+## 2026-05-03 DG-KAN v4.5 Accelerated Functional Optimizer
+
+Implemented and ran `experiments/run_gafu_v45.py` and `experiments/analyze_gafu_v45.py`.
+
+Summary:
+
+```text
+P0 rows=24, errors=0, pass=True
+P1 rows=60, errors=0
+P2 rows=90, errors=0
+P2 survivors=none
+Decision=stop after P2 by written gate
+```
+
+Result replay:
+
+```text
+docs/DG-KAN_v4.5_AcceleratedFunctionalOptimizer_结果复盘.md
+results/v4_5/aggregate_decision.json
+```
+
+
+## 2026-05-03 DG-KAN v4.6 Functional Learning Dynamics
+
+Implemented and ran `experiments/run_gafu_v46.py` and `experiments/analyze_gafu_v46.py`.
+
+Summary:
+
+```text
+P0 rows=60, errors=0, pass=True
+P1 rows=45, errors=0
+P2 rows=90, errors=0
+P3 rows=45, errors=0
+P2 survivors=none
+P3 survivors=none
+Decision=stop_after_p3_no_survivor
+```
+
+Result replay:
+
+```text
+docs/DG-KAN_v4.6_FunctionalLearningDynamics_结果复盘.md
+results/v4_6/aggregate_decision.json
+```
+
+
+## 2026-05-03 DG-KAN v4.7 PSFT 实验
+
+结果见 `docs/DG-KAN_v4.7_PhaseSeparatedFunctionalTraining_PureKAN_结果复盘.md`。
+
+P0 pass=True; P1 survivors=none; P2 survivors=none.
+
+
+## 2026-05-03 DG-KAN v4.8 FGF/NFS 实验
+
+结果见 `docs/DG-KAN_v4.8_FunctionalGeometry_Feasibility_Redesign_结果复盘.md`。
+
+P0 pass=True; P1 survivors=none; P2 survivors=['TeacherA-AdamW20|NFS-role-block|diag|0.035', 'TeacherA-AdamW20|NFS-role-block|diag|0.05', 'TeacherA-AdamW20|NFS-role-block|cg5|0.035', 'TeacherA-AdamW20|NFS-role-block|cg5|0.05', 'TeacherA-AdamW20|NFS-role-block|cg10|0.05', 'TeacherA-AdamW20|NFS-role-block|lowrank32|0.05', 'TeacherB-AdamW100|NFS-Z|diag|0.02', 'TeacherB-AdamW100|NFS-Z|diag|0.035', 'TeacherB-AdamW100|NFS-Z|diag|0.05', 'TeacherB-AdamW100|NFS-Z|cg5|0.02', 'TeacherB-AdamW100|NFS-Z|cg5|0.035', 'TeacherB-AdamW100|NFS-Z|cg5|0.05', 'TeacherB-AdamW100|NFS-Z|cg10|0.02', 'TeacherB-AdamW100|NFS-Z|cg10|0.035', 'TeacherB-AdamW100|NFS-Z|cg10|0.05', 'TeacherB-AdamW100|NFS-Z|lowrank32|0.02', 'TeacherB-AdamW100|NFS-Z|lowrank32|0.035', 'TeacherB-AdamW100|NFS-Z|lowrank32|0.05', 'TeacherB-AdamW100|NFS-Z|lowrank64|0.035', 'TeacherB-AdamW100|NFS-Z|lowrank64|0.05', 'TeacherB-AdamW100|NFS-H|diag|0.02', 'TeacherB-AdamW100|NFS-H|cg5|0.02', 'TeacherB-AdamW100|NFS-H|cg10|0.02', 'TeacherB-AdamW100|NFS-H|lowrank32|0.02', 'TeacherB-AdamW100|NFS-H|lowrank32|0.035', 'TeacherB-AdamW100|NFS-H|lowrank64|0.035', 'TeacherB-AdamW100|NFS-H|lowrank64|0.05', 'TeacherB-AdamW100|NFS-ZH|diag|0.02', 'TeacherB-AdamW100|NFS-ZH|diag|0.035', 'TeacherB-AdamW100|NFS-ZH|diag|0.05', 'TeacherB-AdamW100|NFS-ZH|cg5|0.02', 'TeacherB-AdamW100|NFS-ZH|cg5|0.035', 'TeacherB-AdamW100|NFS-ZH|cg5|0.05', 'TeacherB-AdamW100|NFS-ZH|cg10|0.02', 'TeacherB-AdamW100|NFS-ZH|cg10|0.035', 'TeacherB-AdamW100|NFS-ZH|cg10|0.05', 'TeacherB-AdamW100|NFS-ZH|lowrank32|0.02', 'TeacherB-AdamW100|NFS-ZH|lowrank32|0.035', 'TeacherB-AdamW100|NFS-ZH|lowrank32|0.05', 'TeacherB-AdamW100|NFS-ZH|lowrank64|0.035', 'TeacherB-AdamW100|NFS-ZH|lowrank64|0.05', 'TeacherB-AdamW100|NFS-ZH-margin|diag|0.02', 'TeacherB-AdamW100|NFS-ZH-margin|diag|0.035', 'TeacherB-AdamW100|NFS-ZH-margin|diag|0.05', 'TeacherB-AdamW100|NFS-ZH-margin|cg5|0.02', 'TeacherB-AdamW100|NFS-ZH-margin|cg5|0.035', 'TeacherB-AdamW100|NFS-ZH-margin|cg5|0.05', 'TeacherB-AdamW100|NFS-ZH-margin|cg10|0.02', 'TeacherB-AdamW100|NFS-ZH-margin|cg10|0.035', 'TeacherB-AdamW100|NFS-ZH-margin|cg10|0.05', 'TeacherB-AdamW100|NFS-ZH-margin|lowrank32|0.02', 'TeacherB-AdamW100|NFS-ZH-margin|lowrank32|0.035', 'TeacherB-AdamW100|NFS-ZH-margin|lowrank32|0.05', 'TeacherB-AdamW100|NFS-ZH-margin|lowrank64|0.035', 'TeacherB-AdamW100|NFS-ZH-margin|lowrank64|0.05', 'TeacherB-AdamW100|NFS-role-block|cg10|0.02', 'TeacherB-AdamW100|NFS-role-block|lowrank32|0.02', 'TeacherB-AdamW100|NFS-role-block|lowrank64|0.035', 'TeacherB-AdamW100|NFS-role-cycle|diag|0.035', 'TeacherB-AdamW100|NFS-role-cycle|diag|0.05', 'TeacherB-AdamW100|NFS-role-cycle|cg5|0.035', 'TeacherB-AdamW100|NFS-role-cycle|cg5|0.05', 'TeacherB-AdamW100|NFS-role-cycle|cg10|0.05', 'TeacherB-AdamW100|NFS-role-cycle|lowrank32|0.05', 'TeacherC-AdamW-final|NFS-role-block|diag|0.035', 'TeacherC-AdamW-final|NFS-role-block|diag|0.05', 'TeacherC-AdamW-final|NFS-role-block|cg5|0.02', 'TeacherC-AdamW-final|NFS-role-block|cg5|0.035', 'TeacherC-AdamW-final|NFS-role-block|cg5|0.05', 'TeacherC-AdamW-final|NFS-role-block|cg10|0.05', 'TeacherC-AdamW-final|NFS-role-block|lowrank32|0.05', 'TeacherD-bestFGF|NFS-role-block|diag|0.035', 'TeacherD-bestFGF|NFS-role-block|diag|0.05', 'TeacherD-bestFGF|NFS-role-block|cg5|0.02', 'TeacherD-bestFGF|NFS-role-block|cg5|0.035', 'TeacherD-bestFGF|NFS-role-block|cg5|0.05', 'TeacherD-bestFGF|NFS-role-block|cg10|0.05', 'TeacherD-bestFGF|NFS-role-block|lowrank32|0.05']; P6 survivors=none; decision=stop_after_p5_no_multicycle_survivor.
+
+## 2026-05-03 DG-KAN v4.9 RBF 参数化与 Exact NFS
+
+本轮依据 `docs/DG-KAN_v4.9_RBFParameterization_ExactNFS_下一步实验计划.md`，实现并运行：
+
+```text
+P0 code audit: 21 rows, errors=0, pass=True
+P1 architecture frontier: success rows=45
+P2 eigenmode audit: rows=270
+P3 exact NFS projection: rows=45, exact survivors=0
+P6 compact capacity/basis expansion: rows=24
+```
+
+核心结论：
+
+```text
+1. AB-RBF 是 architecture-positive：ABRBF-silu 在 MNIST/Fashion/KMNIST 都提升 mean acc。
+2. Eigenmode audit 支持 RBF-only bottleneck：ABRBF-linear 把约 24%-26% coeff energy 放入 base modes，并降低 high Sobolev-mode fraction。
+3. Exact NFS KKT residual 很小，但 geometry reduction 近 0；当前严格 Jacobian-nullspace 太保守。
+4. Heuristic NFS 仍有局部 smoothing 信号，但不能作为 exact nullspace 证明。
+5. P4/P5 未运行：无 exact-NFS all-dataset survivor。
+```
+
+最终状态：
+
+```text
+stop_after_p3_no_exact_nfs_survivor
+```
+
+## 2026-05-03 DG-KAN v5.0 Edge-Decomposed Functional Training
+
+```text
+P0 pass: True
+P1 architecture survivors: PureKAN-ABRBF-linear+silu-AdamW, PureKAN-ABRBF-linear-AdamW, PureKAN-ABRBF-linear-learnWidth-AdamW, PureKAN-ABRBF-silu-AdamW
+P3 split-functional survivors: ABRBF-allAdamW-edgeOnly, ABRBF-baseAdam-rbfD6, ABRBF-baseAdam-rbfFCAdam-dataSob, ABRBF-baseAdam-rbfRelaxedNFSRefresh, ABRBF-baseAdam-rbfUFULL, ABRBF-baseFCAdam-rbfUFULL, ABRBF-baseOnlyAdam-rbfFrozen
+P4 relaxed-NFS survivors: none
+Final status: stop_after_p4_no_relaxed_nfs_survivor
+```
+
+主结论：AB-RBF / edge decomposition 是 architecture-positive；base path 必须承担任务学习动力学。Relaxed NFS 的投影不再为零，但 residual geometry gain 仍太小，P5/P6 不展开。
+- v5.1 AB-RBF strong residual smoothing: P3 found all-dataset single-step smoothing survivors; P4 failed multi-step task/holdout gate, so stopped before P5/P6 confirm.
+- v5.2 memory-budgeted residual smoothing: P1/P2 light smoothing passed, P3 multicycle failed; stopped before confirm seeds.
+- v5.3 AB-RBF event controller: status=stop_after_p3_no_one_cycle_survivor; P3 survivors=0, P4 survivors=0.
+- v5.4 efficiency-first PureKAN: status=stop_after_p3_no_efficiency_accuracy_survivor; P1 survivors=0, P3 survivors=0.
+
+- v5.5 kernel-first efficient PureKAN: status=stop_after_p5_no_joint_accuracy_efficiency_survivor; P2=1 DWM survivors, P3=2 CP survivors, P4=1 Rational kernel survivors, P5 survivors=0.
+
+- v5.6 GEMM-native efficient PureKAN: status=stop_after_p4_no_recipe_survivor; P1 exploratory=1, P5 survivors=0.
+
+- v5.7 kernel-verified efficient PureKAN: status=stop_after_p1_no_efficiency_survivor; P1 exploratory=0, P5 survivors=0.
+
+- v5.8 EfficientPrimitive_Redesign: stop_after_p1_no_efficiency_survivor (E_no_efficient_primitive); artifacts in `results/v5_8/`.
+
+- v5.9 MemoryFirst_EfficientPrimitive: stop_after_p1_no_efficiency_survivor (C_no_p1_efficiency_survivor); artifacts in `results/v5_9/`.
+
+- v6.0 EfficientFunctionalPureKAN_Acceleration: stop_after_p2_no_efficiency_candidate (A_no_p1_p2_efficiency_candidate); artifacts in `results/v6_0/`.
+
+- v6.1 GraphFreeAnalyticAdjoint: stop_after_p2_no_graphfree_efficiency_survivor (D_no_primitive_passed_p2_efficiency); artifacts in `results/v6_1/`.
+
+- v6.2 GraphFreeKernelCache: stop_after_p4_no_nearmiss_convergence_survivor (B_nearmiss_no_convergence_compensation); artifacts in `results/v6_2/`.
+
+- v6.3 GraphFreeFusedKernel_Acceleration: stop_after_p6_no_functional_survivor (A_kernel_acceleration_positive_functional_not_ready); artifacts in `results/v6_3/`.
+
+- v6.4 GraphFreeFunctionalCorrection: continue_after_p8_final_confirm_positive (R2_efficiency_task_correction_confirm_positive); artifacts in `results/v6_4/`.
+
+- v6.5 FinalizationFunctionalCorrection: complete_task_learner_correction_optional (B_task_only_or_optional_correction); artifacts in `results/v6_5/`.
+- v6.6 FinalValidation/Scaling: `complete_after_p4_final_validation_positive_cifar_open` (B_final_confirmed_cifar_small_blocker); candidate `DWM2-poly2-task+correction-best`. Artifacts in `results/v6_6/`.
+- v6.6 HardThreshold FinalValidation: `complete_after_hard_threshold_final_validation` (A_final_system_confirmed_meaningful_hardgate); candidate `DWM2-poly2-task+correction-best`. Artifacts in `results/v6_6/`.
+- v7.0 NextGen BeyondMLP: `complete_after_p10_nextgen_beyond_mlp_positive` (Route_A_nextgen_strong_system_confirmed); candidate `PatchKAN-tokenMix-mixedDegree+adaptiveCorrection`. Artifacts in `results/v7_0/`.
+- v7.1 BeyondMLP StrongScaling: `stop_raw_confirm_unstable` (Route_C_raw_confirm_unstable); candidate `PatchKAN-tokenMix-mixedDegree+adaptiveCorrection`. Artifacts in `results/v7_1/`.
+- v7.2 FullScaling StrongImplementation: `complete_after_p10_full_scaling_positive` (Route_A_full_scaling_strong_implementation_positive); candidate `PatchKAN-tokenMix-mixedDegree+adaptiveCorrection-stronggate`. Artifacts in `results/v7_2/`.
+- v7.3 ProductionFullScaling NextGen: `complete_after_p11_production_nextgen_positive` (Route_A_production_verified_nextgen_patchkan_confirmed); default `PatchKAN-tokenMix-mixedDegree-productionFused-stronggate`. Artifacts in `results/v7_3/`.
+
+- v7.4 FullVision ConvNetGap: `complete_after_p12_convnet_gap_substantially_closed` / `Route_A_convnet_gap_substantially_closed`.
+
+- v7.4 FullVision ConvNetGap: `complete_after_p12_convnet_gap_substantially_closed` / `Route_A_convnet_gap_substantially_closed`.
+
+- v8.0 FullVision ConvNetGap: `complete_after_p10_full_external_baseline_positive` / `Route_A_full_external_baseline_positive`.
+
+- v8.0 FullVision ConvNetGap: `complete_after_p10_full_external_baseline_positive` / `Route_A_full_external_baseline_positive`.
+
+- v8.0 FullVision ConvNetGap: `complete_after_p10_full_external_baseline_positive` / `Route_A_full_external_baseline_positive`.
+
+- v8.1 ConvKAN-Inspired FullVision: `stop_after_p10_convkan_inspired_partial` / `Route_B_convkan_inspired_needs_repair`.
+
+- v8.1 ConvKAN-Inspired FullVision: `stop_after_p10_convkan_inspired_partial` / `Route_B_convkan_inspired_needs_repair`.
+
+- v8.1 ConvKAN-Inspired FullVision: `complete_after_p10_convkan_inspired_gap_push_positive` / `Route_A_convkan_inspired_level3_stronger_level4_partial`.
+
+- v8.2 Level4 ConvNetReplacement: `complete_after_p10_level4_credible_positive` / `Route_A_level4_credible_efficient_functional_vision`.
+
+- v8.3 Level4 Hardening: `complete_after_p10_level4_hardened_positive` / `Route_A_level4_hardened_achieved`.
+
+- v9.1 Multi-Architecture ImageNet Frontier: `complete_after_p10_multiarchitecture_frontier_positive` / `Route_D_hybrid_local_global_functional_backbone_wins`.

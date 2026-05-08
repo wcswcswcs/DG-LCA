@@ -1,6 +1,7 @@
 __pycache__/
 results*/
 data/
+dataset/
 convert_ckpt_to_params.py
 *.pt
 *.pth

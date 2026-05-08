@@ -338,40 +338,7 @@ def _make_fake_bundle(
     seed: int,
     label_noise: float,
 ) -> DataBundle:
-    rng = np.random.default_rng(seed)
-    input_dim = 28 * 28
-    num_classes = 10
-    prototypes = rng.normal(0.0, 0.8, size=(num_classes, input_dim)).astype("float32")
-
-    def make_split(n: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        y = np.arange(n, dtype=np.int64) % num_classes
-        rng.shuffle(y)
-        x = prototypes[y] + rng.normal(0.0, 0.75, size=(n, input_dim)).astype("float32")
-        return torch.from_numpy(x), torch.from_numpy(y)
-
-    x_train, y_clean = make_split(train_size)
-    x_val, y_val = make_split(val_size)
-    x_test, y_test = make_split(test_size)
-    y_train = y_clean.clone()
-    if label_noise > 0:
-        mask = rng.random(train_size) < label_noise
-        noisy = rng.integers(0, num_classes, size=train_size)
-        noisy = np.where(noisy == y_clean.numpy(), (noisy + 1) % num_classes, noisy)
-        y_train[torch.from_numpy(mask)] = torch.from_numpy(noisy[mask]).long()
-    return DataBundle(
-        name=name,
-        input_dim=input_dim,
-        num_classes=num_classes,
-        x_train=x_train,
-        y_train=y_train,
-        y_train_clean=y_clean,
-        x_val=x_val,
-        y_val=y_val,
-        x_test=x_test,
-        y_test=y_test,
-        label_noise=label_noise,
-        used_fake_data=True,
-    )
+    raise RuntimeError("fake vision bundles are disabled in no-proxy mode; use real datasets only.")
 
 
 def _load_kmnist_bundle(
@@ -444,6 +411,10 @@ def load_vision_bundle(
     download: bool = True,
     allow_fake_data: bool = False,
 ) -> DataBundle:
+    if allow_fake_data:
+        raise RuntimeError(
+            "allow_fake_data=True is disabled in no-proxy mode; experiment runners must use real datasets only."
+        )
     canonical = dataset_name.lower().replace("_", "-")
     if canonical == "kmnist":
         try:
@@ -561,6 +532,8 @@ class RBFDense(nn.Module):
             self.register_parameter("bias", None)
         self.last_basis_mean: Optional[torch.Tensor] = None
         self.last_input: Optional[torch.Tensor] = None
+        self.last_output: Optional[torch.Tensor] = None
+        self.last_output_grad: Optional[torch.Tensor] = None
 
     def basis(self, x: torch.Tensor) -> torch.Tensor:
         z = (x.unsqueeze(-1) - self.centers) / self.width
@@ -578,7 +551,1064 @@ class RBFDense(nn.Module):
         out = torch.einsum("bik,oik->bo", basis, self.coeff)
         if self.bias is not None:
             out = out + self.bias
+        self.last_output = out.detach()
+        if out.requires_grad:
+            def _save_output_grad(grad: torch.Tensor) -> None:
+                self.last_output_grad = grad.detach()
+
+            out.register_hook(_save_output_grad)
         return out
+
+
+class ABRBFDense(RBFDense):
+    """Edge-decomposed RBF layer with explicit base channels plus RBF residual.
+
+    The learnable tensor is still named ``coeff`` so older functional-update code
+    can see the edge as one coefficient object.  ``base_dim`` and
+    ``rbf_basis_count`` identify the base/residual slices for newer audits and
+    split-update controllers.
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        basis_count: int,
+        *,
+        bias: bool = True,
+        base_kind: str = "linear",
+    ) -> None:
+        super().__init__(in_dim, out_dim, max(1, basis_count), bias=bias)
+        key = base_kind.lower().replace("-", "_").replace("+", "_")
+        if key in {"linear", "ab_linear"}:
+            self.base_kind = "linear"
+            self.base_dim = 2
+            self.rbf_basis_count = int(basis_count)
+        elif key in {"silu", "ab_silu"}:
+            self.base_kind = "silu"
+            self.base_dim = 1
+            self.rbf_basis_count = int(basis_count)
+        elif key in {"linear_silu", "linear+silu", "ab_linear_silu"}:
+            self.base_kind = "linear_silu"
+            self.base_dim = 3
+            self.rbf_basis_count = int(basis_count)
+        elif key in {"baseonly_linear", "base_only_linear"}:
+            self.base_kind = "baseonly_linear"
+            self.base_dim = 2
+            self.rbf_basis_count = 0
+        elif key in {"baseonly_silu", "base_only_silu"}:
+            self.base_kind = "baseonly_silu"
+            self.base_dim = 1
+            self.rbf_basis_count = 0
+        else:
+            raise ValueError(f"unknown ABRBFDense base_kind: {base_kind}")
+        total_basis = self.base_dim + self.rbf_basis_count
+        scale = 1.0 / math.sqrt(max(1, in_dim * total_basis))
+        self.coeff = nn.Parameter(torch.randn(out_dim, in_dim, total_basis) * scale)
+
+    def _base_basis_and_derivative(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.base_kind in {"linear", "baseonly_linear"}:
+            const = torch.ones_like(x).unsqueeze(-1)
+            linear = x.unsqueeze(-1)
+            basis = torch.cat([const, linear], dim=-1)
+            deriv = torch.cat([torch.zeros_like(const), torch.ones_like(linear)], dim=-1)
+            return basis, deriv
+        if self.base_kind in {"silu", "baseonly_silu"}:
+            sig = torch.sigmoid(x)
+            return F.silu(x).unsqueeze(-1), (sig + x * sig * (1.0 - sig)).unsqueeze(-1)
+        const = torch.ones_like(x).unsqueeze(-1)
+        linear = x.unsqueeze(-1)
+        silu = F.silu(x).unsqueeze(-1)
+        sig = torch.sigmoid(x)
+        silu_deriv = (sig + x * sig * (1.0 - sig)).unsqueeze(-1)
+        basis = torch.cat([const, linear, silu], dim=-1)
+        deriv = torch.cat([torch.zeros_like(const), torch.ones_like(linear), silu_deriv], dim=-1)
+        return basis, deriv
+
+    def _rbf_basis_and_derivative(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.rbf_basis_count <= 0:
+            empty = x.new_zeros(*x.shape, 0)
+            return empty, empty
+        centers = self.centers[: self.rbf_basis_count]
+        z = (x.unsqueeze(-1) - centers) / self.width
+        rbf = torch.exp(-0.5 * z.square())
+        deriv = -((x.unsqueeze(-1) - centers) / (self.width**2)) * rbf
+        return rbf, deriv
+
+    def basis(self, x: torch.Tensor) -> torch.Tensor:
+        base, _ = self._base_basis_and_derivative(x)
+        rbf, _ = self._rbf_basis_and_derivative(x)
+        return torch.cat([base, rbf], dim=-1) if rbf.numel() else base
+
+    def basis_and_derivative(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        base, base_deriv = self._base_basis_and_derivative(x)
+        rbf, rbf_deriv = self._rbf_basis_and_derivative(x)
+        if rbf.numel():
+            return torch.cat([base, rbf], dim=-1), torch.cat([base_deriv, rbf_deriv], dim=-1)
+        return base, base_deriv
+
+
+class ABRBFDepthwiseMixDense(nn.Module):
+    """Depthwise AB-RBF edge transform followed by edge-owned channel mixing."""
+
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        basis_count: int,
+        *,
+        bias: bool = True,
+        base_kind: str = "linear_silu",
+    ) -> None:
+        super().__init__()
+        self.in_dim = int(in_dim)
+        self.out_dim = int(out_dim)
+        key = base_kind.lower().replace("-", "_").replace("+", "_")
+        if key in {"linear", "ab_linear"}:
+            self.base_kind = "linear"
+            self.base_dim = 2
+        elif key in {"silu", "ab_silu"}:
+            self.base_kind = "silu"
+            self.base_dim = 1
+        elif key in {"linear_silu", "linear+silu", "ab_linear_silu"}:
+            self.base_kind = "linear_silu"
+            self.base_dim = 3
+        else:
+            raise ValueError(f"unknown ABRBFDepthwiseMixDense base_kind: {base_kind}")
+        self.rbf_basis_count = int(basis_count)
+        total_basis = self.base_dim + self.rbf_basis_count
+        centers = torch.linspace(-2.5, 2.5, max(1, basis_count))
+        self.register_buffer("centers", centers)
+        self.width = float((centers[1] - centers[0]).abs() * 1.4) if basis_count > 1 else 1.0
+        self.dw_coeff = nn.Parameter(torch.randn(in_dim, total_basis) / math.sqrt(max(1, total_basis)))
+        self.mix_coeff = nn.Parameter(torch.randn(out_dim, in_dim) / math.sqrt(max(1, in_dim)))
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_dim))
+        else:
+            self.register_parameter("bias", None)
+        self.last_basis_mean: Optional[torch.Tensor] = None
+        self.last_input: Optional[torch.Tensor] = None
+        self.last_output: Optional[torch.Tensor] = None
+        self.last_output_grad: Optional[torch.Tensor] = None
+
+    def _base_basis_and_derivative(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.base_kind == "linear":
+            const = torch.ones_like(x).unsqueeze(-1)
+            linear = x.unsqueeze(-1)
+            return torch.cat([const, linear], dim=-1), torch.cat([torch.zeros_like(const), torch.ones_like(linear)], dim=-1)
+        if self.base_kind == "silu":
+            sig = torch.sigmoid(x)
+            return F.silu(x).unsqueeze(-1), (sig + x * sig * (1.0 - sig)).unsqueeze(-1)
+        const = torch.ones_like(x).unsqueeze(-1)
+        linear = x.unsqueeze(-1)
+        silu = F.silu(x).unsqueeze(-1)
+        sig = torch.sigmoid(x)
+        silu_deriv = (sig + x * sig * (1.0 - sig)).unsqueeze(-1)
+        return torch.cat([const, linear, silu], dim=-1), torch.cat([torch.zeros_like(const), torch.ones_like(linear), silu_deriv], dim=-1)
+
+    def _rbf_basis_and_derivative(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.rbf_basis_count <= 0:
+            empty = x.new_zeros(*x.shape, 0)
+            return empty, empty
+        centers = self.centers[: self.rbf_basis_count]
+        z = (x.unsqueeze(-1) - centers) / self.width
+        rbf = torch.exp(-0.5 * z.square())
+        deriv = -((x.unsqueeze(-1) - centers) / (self.width**2)) * rbf
+        return rbf, deriv
+
+    def basis(self, x: torch.Tensor) -> torch.Tensor:
+        base, _ = self._base_basis_and_derivative(x)
+        rbf, _ = self._rbf_basis_and_derivative(x)
+        return torch.cat([base, rbf], dim=-1)
+
+    def basis_and_derivative(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        base, base_deriv = self._base_basis_and_derivative(x)
+        rbf, rbf_deriv = self._rbf_basis_and_derivative(x)
+        return torch.cat([base, rbf], dim=-1), torch.cat([base_deriv, rbf_deriv], dim=-1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        basis = self.basis(x)
+        self.last_input = x.detach()
+        self.last_basis_mean = basis.detach().mean(dim=(0, 1))
+        transformed = torch.einsum("bik,ik->bi", basis, self.dw_coeff)
+        out = transformed.matmul(self.mix_coeff.t())
+        if self.bias is not None:
+            out = out + self.bias
+        self.last_output = out.detach()
+        if out.requires_grad:
+            def _save_output_grad(grad: torch.Tensor) -> None:
+                self.last_output_grad = grad.detach()
+
+            out.register_hook(_save_output_grad)
+        return out
+
+
+class CPABRBFDense(nn.Module):
+    """Low-rank CP factorization of an AB-RBF dense edge."""
+
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        basis_count: int,
+        *,
+        bias: bool = True,
+        rank: int = 8,
+        base_kind: str = "linear_silu",
+    ) -> None:
+        super().__init__()
+        self.in_dim = int(in_dim)
+        self.out_dim = int(out_dim)
+        self.rank = int(rank)
+        key = base_kind.lower().replace("-", "_").replace("+", "_")
+        if key in {"linear", "ab_linear"}:
+            self.base_kind = "linear"
+            self.base_dim = 2
+        elif key in {"silu", "ab_silu"}:
+            self.base_kind = "silu"
+            self.base_dim = 1
+        elif key in {"linear_silu", "linear+silu", "ab_linear_silu"}:
+            self.base_kind = "linear_silu"
+            self.base_dim = 3
+        else:
+            raise ValueError(f"unknown CPABRBFDense base_kind: {base_kind}")
+        self.rbf_basis_count = int(basis_count)
+        centers = torch.linspace(-2.5, 2.5, max(1, basis_count))
+        self.register_buffer("centers", centers)
+        self.width = float((centers[1] - centers[0]).abs() * 1.4) if basis_count > 1 else 1.0
+        self.base_coeff = nn.Parameter(torch.randn(out_dim, in_dim, self.base_dim) / math.sqrt(max(1, in_dim * self.base_dim)))
+        self.cp_u = nn.Parameter(torch.randn(out_dim, self.rank) / math.sqrt(max(1, self.rank)))
+        self.cp_v = nn.Parameter(torch.randn(in_dim, self.rank) / math.sqrt(max(1, in_dim)))
+        self.cp_w = nn.Parameter(torch.randn(self.rbf_basis_count, self.rank) / math.sqrt(max(1, self.rbf_basis_count)))
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_dim))
+        else:
+            self.register_parameter("bias", None)
+        self.last_basis_mean: Optional[torch.Tensor] = None
+        self.last_input: Optional[torch.Tensor] = None
+        self.last_output: Optional[torch.Tensor] = None
+        self.last_output_grad: Optional[torch.Tensor] = None
+
+    def _base_basis_and_derivative(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.base_kind == "linear":
+            const = torch.ones_like(x).unsqueeze(-1)
+            linear = x.unsqueeze(-1)
+            return torch.cat([const, linear], dim=-1), torch.cat([torch.zeros_like(const), torch.ones_like(linear)], dim=-1)
+        if self.base_kind == "silu":
+            sig = torch.sigmoid(x)
+            return F.silu(x).unsqueeze(-1), (sig + x * sig * (1.0 - sig)).unsqueeze(-1)
+        const = torch.ones_like(x).unsqueeze(-1)
+        linear = x.unsqueeze(-1)
+        silu = F.silu(x).unsqueeze(-1)
+        sig = torch.sigmoid(x)
+        silu_deriv = (sig + x * sig * (1.0 - sig)).unsqueeze(-1)
+        return torch.cat([const, linear, silu], dim=-1), torch.cat([torch.zeros_like(const), torch.ones_like(linear), silu_deriv], dim=-1)
+
+    def _rbf_basis_and_derivative(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        centers = self.centers[: self.rbf_basis_count]
+        z = (x.unsqueeze(-1) - centers) / self.width
+        rbf = torch.exp(-0.5 * z.square())
+        deriv = -((x.unsqueeze(-1) - centers) / (self.width**2)) * rbf
+        return rbf, deriv
+
+    def basis(self, x: torch.Tensor) -> torch.Tensor:
+        base, _ = self._base_basis_and_derivative(x)
+        rbf, _ = self._rbf_basis_and_derivative(x)
+        return torch.cat([base, rbf], dim=-1)
+
+    def basis_and_derivative(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        base, base_deriv = self._base_basis_and_derivative(x)
+        rbf, rbf_deriv = self._rbf_basis_and_derivative(x)
+        return torch.cat([base, rbf], dim=-1), torch.cat([base_deriv, rbf_deriv], dim=-1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        base_basis, _ = self._base_basis_and_derivative(x)
+        rbf_basis, _ = self._rbf_basis_and_derivative(x)
+        self.last_input = x.detach()
+        self.last_basis_mean = torch.cat([base_basis, rbf_basis], dim=-1).detach().mean(dim=(0, 1))
+        base_out = torch.einsum("bik,oik->bo", base_basis, self.base_coeff)
+        rank_features = torch.einsum("bik,ir,kr->br", rbf_basis, self.cp_v, self.cp_w)
+        out = base_out + rank_features.matmul(self.cp_u.t())
+        if self.bias is not None:
+            out = out + self.bias
+        self.last_output = out.detach()
+        if out.requires_grad:
+            def _save_output_grad(grad: torch.Tensor) -> None:
+                self.last_output_grad = grad.detach()
+
+            out.register_hook(_save_output_grad)
+        return out
+
+
+class RationalKATDense(nn.Module):
+    """Rational/KAT-style edge transform followed by edge-owned channel mixing."""
+
+    base_dim = 4
+    rbf_basis_count = 0
+
+    def __init__(self, in_dim: int, out_dim: int, basis_count: int, *, bias: bool = True) -> None:
+        super().__init__()
+        self.in_dim = int(in_dim)
+        self.out_dim = int(out_dim)
+        self.basis_count = int(basis_count)
+        self.weight_numerator = nn.Parameter(torch.randn(in_dim, 4) / math.sqrt(4.0))
+        self.weight_denominator = nn.Parameter(torch.zeros(in_dim, 2))
+        self.mix_coeff = nn.Parameter(torch.randn(out_dim, in_dim) / math.sqrt(max(1, in_dim)))
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_dim))
+        else:
+            self.register_parameter("bias", None)
+        self.last_input: Optional[torch.Tensor] = None
+        self.last_output: Optional[torch.Tensor] = None
+        self.last_output_grad: Optional[torch.Tensor] = None
+        self.last_basis_mean: Optional[torch.Tensor] = None
+
+    def basis(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.stack([torch.ones_like(x), x, F.silu(x), x.square()], dim=-1)
+
+    def basis_and_derivative(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        sig = torch.sigmoid(x)
+        basis = self.basis(x)
+        deriv = torch.stack([torch.zeros_like(x), torch.ones_like(x), sig + x * sig * (1.0 - sig), 2.0 * x], dim=-1)
+        return basis, deriv
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        basis = self.basis(x)
+        num = torch.einsum("bik,ik->bi", basis, self.weight_numerator)
+        den = 1.0 + F.softplus(self.weight_denominator[:, 0]).unsqueeze(0) * x.abs() + F.softplus(self.weight_denominator[:, 1]).unsqueeze(0) * x.square()
+        transformed = num / den.clamp_min(1.0e-4)
+        out = transformed.matmul(self.mix_coeff.t())
+        if self.bias is not None:
+            out = out + self.bias
+        self.last_input = x.detach()
+        self.last_basis_mean = basis.detach().mean(dim=(0, 1))
+        self.last_output = out.detach()
+        if out.requires_grad:
+            def _save_output_grad(grad: torch.Tensor) -> None:
+                self.last_output_grad = grad.detach()
+
+            out.register_hook(_save_output_grad)
+        return out
+
+
+class GEMMNativeDepthwiseMixDense(ABRBFDepthwiseMixDense):
+    """GEMM-native depthwise AB-RBF transform followed by edge-owned mixing.
+
+    This keeps the same edge-owned parameterization as ``ABRBFDepthwiseMixDense``
+    but removes the einsum from the hot path.  Optional channel normalization is
+    buffer-only so it does not introduce non-KAN trainable parameters.
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        basis_count: int,
+        *,
+        bias: bool = True,
+        base_kind: str = "linear_silu",
+        channel_norm: bool = False,
+        mix_scale: float = 1.0,
+    ) -> None:
+        super().__init__(in_dim, out_dim, basis_count, bias=bias, base_kind=base_kind)
+        self.channel_norm = bool(channel_norm)
+        self.mix_scale = float(mix_scale)
+        self.kernel_path = "gemm_native_depthwise_mix"
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        basis = self.basis(x)
+        self.last_input = x.detach()
+        self.last_basis_mean = basis.detach().mean(dim=(0, 1))
+        transformed = (basis * self.dw_coeff.unsqueeze(0)).sum(dim=-1)
+        if self.channel_norm:
+            scale = transformed.detach().square().mean(dim=0, keepdim=True).add(1.0e-6).sqrt()
+            transformed = transformed / scale
+        out = F.linear(transformed, self.mix_coeff * self.mix_scale, self.bias)
+        self.last_output = out.detach()
+        if out.requires_grad:
+            def _save_output_grad(grad: torch.Tensor) -> None:
+                self.last_output_grad = grad.detach()
+
+            out.register_hook(_save_output_grad)
+        return out
+
+
+class GEMMNativeCPABRBFDense(CPABRBFDense):
+    """Two-stage GEMM-friendly CP AB-RBF edge.
+
+    The dense base path is flattened into one GEMM and the residual basis is
+    projected into rank features before the output GEMM.  No runner-local helper
+    class is needed for the v5.6 profiler.
+    """
+
+    kernel_path = "gemm_native_cp_abrbf"
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        base_basis, _ = self._base_basis_and_derivative(x)
+        rbf_basis, _ = self._rbf_basis_and_derivative(x)
+        self.last_input = x.detach()
+        self.last_basis_mean = torch.cat([base_basis, rbf_basis], dim=-1).detach().mean(dim=(0, 1))
+
+        base_flat = base_basis.reshape(x.shape[0], -1)
+        base_weight = self.base_coeff.reshape(self.out_dim, -1)
+        base_out = F.linear(base_flat, base_weight)
+
+        basis_rank = torch.matmul(rbf_basis, self.cp_w)
+        rank_features = (basis_rank * self.cp_v.unsqueeze(0)).sum(dim=1)
+        out = F.linear(rank_features, self.cp_u, self.bias) + base_out
+        self.last_output = out.detach()
+        if out.requires_grad:
+            def _save_output_grad(grad: torch.Tensor) -> None:
+                self.last_output_grad = grad.detach()
+
+            out.register_hook(_save_output_grad)
+        return out
+
+
+class GEMMNativeRationalKATDense(RationalKATDense):
+    """GEMM-native Rational/KAT edge transform.
+
+    The grouped/order arguments are recipe metadata for v5.6 sweeps; the current
+    core implementation keeps the audited numerator/denominator parameter names
+    so existing parameter discovery and functional tooling remain consistent.
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        basis_count: int,
+        *,
+        bias: bool = True,
+        groups: int = 8,
+        base_kind: str = "linear_silu",
+        rational_order: Tuple[int, int] = (3, 2),
+        init: str = "kat_default",
+    ) -> None:
+        super().__init__(in_dim, out_dim, basis_count, bias=bias)
+        self.groups = int(groups)
+        self.base_kind = str(base_kind)
+        self.rational_order = tuple(int(v) for v in rational_order)
+        self.init = str(init)
+        self.kernel_path = "gemm_native_rational_kat"
+        if self.init == "identity_like":
+            with torch.no_grad():
+                self.weight_numerator.zero_()
+                self.weight_numerator[:, 1].fill_(1.0)
+                self.weight_denominator.fill_(-4.0)
+        elif self.init == "small_residual":
+            with torch.no_grad():
+                self.weight_numerator.mul_(0.25)
+                self.weight_numerator[:, 1].add_(0.75)
+                self.weight_denominator.fill_(-2.0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        one = torch.ones_like(x)
+        silu = F.silu(x)
+        basis = torch.stack([one, x, silu, x.square()], dim=-1)
+        num = (basis * self.weight_numerator.unsqueeze(0)).sum(dim=-1)
+        a = F.softplus(self.weight_denominator[:, 0]).unsqueeze(0)
+        b = F.softplus(self.weight_denominator[:, 1]).unsqueeze(0)
+        den = 1.0 + a * x.abs() + b * x.square()
+        transformed = num / den.clamp_min(1.0e-4)
+        out = F.linear(transformed, self.mix_coeff, self.bias)
+        self.last_input = x.detach()
+        self.last_basis_mean = basis.detach().mean(dim=(0, 1))
+        self.last_output = out.detach()
+        if out.requires_grad:
+            def _save_output_grad(grad: torch.Tensor) -> None:
+                self.last_output_grad = grad.detach()
+
+            out.register_hook(_save_output_grad)
+        return out
+
+
+class DWM2Dense(nn.Module):
+    """PreMix -> channel AB function -> PostMix efficient PureKAN edge.
+
+    ``pre_mix_coeff`` and ``post_mix_coeff`` are treated as edge-owned mixing
+    parameters.  The nonlinear channel function remains depthwise AB-RBF so the
+    hot path is GEMM + elementwise/basis transform + GEMM rather than a dense
+    output-by-input-by-basis contraction.
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        basis_count: int,
+        *,
+        bias: bool = True,
+        hidden_dim: Optional[int] = None,
+        base_kind: str = "linear_silu",
+        variant: str = "pre_post",
+        residual_scale: float = 0.1,
+        channel_norm: bool = False,
+    ) -> None:
+        super().__init__()
+        self.in_dim = int(in_dim)
+        self.out_dim = int(out_dim)
+        self.hidden_dim = int(hidden_dim or out_dim)
+        self.variant = str(variant)
+        self.residual_scale = float(residual_scale)
+        self.channel_norm = bool(channel_norm)
+        key = base_kind.lower().replace("-", "_").replace("+", "_")
+        if key in {"linear", "ab_linear"}:
+            self.base_kind = "linear"
+            self.base_dim = 2
+        elif key in {"silu", "ab_silu"}:
+            self.base_kind = "silu"
+            self.base_dim = 1
+        elif key in {"linear_silu", "linear+silu", "ab_linear_silu"}:
+            self.base_kind = "linear_silu"
+            self.base_dim = 3
+        else:
+            raise ValueError(f"unknown DWM2Dense base_kind: {base_kind}")
+        self.rbf_basis_count = int(basis_count)
+        total_basis = self.base_dim + self.rbf_basis_count
+        centers = torch.linspace(-2.5, 2.5, max(1, basis_count))
+        self.register_buffer("centers", centers)
+        self.width = float((centers[1] - centers[0]).abs() * 1.4) if basis_count > 1 else 1.0
+        self.pre_mix_coeff = nn.Parameter(torch.randn(self.hidden_dim, in_dim) / math.sqrt(max(1, in_dim)))
+        self.dw_coeff = nn.Parameter(torch.randn(self.hidden_dim, total_basis) / math.sqrt(max(1, total_basis)))
+        self.post_mix_coeff = nn.Parameter(torch.randn(out_dim, self.hidden_dim) / math.sqrt(max(1, self.hidden_dim)))
+        if "gated" in self.variant:
+            self.gate_coeff = nn.Parameter(torch.zeros(self.hidden_dim))
+        else:
+            self.register_parameter("gate_coeff", None)
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_dim))
+        else:
+            self.register_parameter("bias", None)
+        self.last_basis_mean: Optional[torch.Tensor] = None
+        self.last_input: Optional[torch.Tensor] = None
+        self.last_output: Optional[torch.Tensor] = None
+        self.last_output_grad: Optional[torch.Tensor] = None
+        self.last_gate_mean: Optional[torch.Tensor] = None
+
+    def _base_basis(self, x: torch.Tensor) -> torch.Tensor:
+        if self.base_kind == "linear":
+            return torch.stack([torch.ones_like(x), x], dim=-1)
+        if self.base_kind == "silu":
+            return F.silu(x).unsqueeze(-1)
+        return torch.stack([torch.ones_like(x), x, F.silu(x)], dim=-1)
+
+    def _rbf_basis(self, x: torch.Tensor) -> torch.Tensor:
+        if self.rbf_basis_count <= 0:
+            return x.new_zeros(*x.shape, 0)
+        centers = self.centers[: self.rbf_basis_count]
+        z = (x.unsqueeze(-1) - centers) / self.width
+        return torch.exp(-0.5 * z.square())
+
+    def basis(self, x: torch.Tensor) -> torch.Tensor:
+        h = F.linear(x, self.pre_mix_coeff)
+        return torch.cat([self._base_basis(h), self._rbf_basis(h)], dim=-1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = F.linear(x, self.pre_mix_coeff)
+        if self.channel_norm:
+            scale = h.detach().square().mean(dim=0, keepdim=True).add(1.0e-6).sqrt()
+            h = h / scale
+        basis = torch.cat([self._base_basis(h), self._rbf_basis(h)], dim=-1)
+        self.last_input = x.detach()
+        self.last_basis_mean = basis.detach().mean(dim=(0, 1))
+        channel = (basis * self.dw_coeff.unsqueeze(0)).sum(dim=-1)
+        if "residual" in self.variant:
+            channel = h + self.residual_scale * channel
+        elif "gated" in self.variant and self.gate_coeff is not None:
+            gate = torch.sigmoid(h * self.gate_coeff.unsqueeze(0))
+            self.last_gate_mean = gate.detach().mean()
+            channel = h + self.residual_scale * gate * channel
+        else:
+            channel = self.residual_scale * channel
+        out = F.linear(channel, self.post_mix_coeff, self.bias)
+        self.last_output = out.detach()
+        if out.requires_grad:
+            def _save_output_grad(grad: torch.Tensor) -> None:
+                self.last_output_grad = grad.detach()
+
+            out.register_hook(_save_output_grad)
+        return out
+
+
+class DWM2LiteDense(nn.Module):
+    """Single-GEMM DWM2-lite edge: ``y = W(x + s r(x))``.
+
+    The channel-wise residual can be a tiny RBF expansion or a lookup-table
+    interpolation.  This is intentionally more constrained than ``DWM2Dense``:
+    it removes the pre/post mix pair so v5.9 can isolate whether a KAN-like
+    channel residual can live on an MLP-like compute path.
+    """
+
+    base_dim = 0
+
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        basis_count: int,
+        *,
+        bias: bool = True,
+        residual_kind: str = "rbf",
+        residual_scale: float = 0.05,
+        grid_min: float = -2.5,
+        grid_max: float = 2.5,
+    ) -> None:
+        super().__init__()
+        self.in_dim = int(in_dim)
+        self.out_dim = int(out_dim)
+        self.residual_kind = residual_kind.lower()
+        self.residual_scale = float(residual_scale)
+        self.basis_count = int(max(2, basis_count))
+        self.rbf_basis_count = self.basis_count if self.residual_kind == "rbf" else 0
+        self.grid_size = self.basis_count if self.residual_kind == "lut" else 0
+        self.mix_coeff = nn.Parameter(torch.randn(out_dim, in_dim) / math.sqrt(max(1, in_dim)))
+        if self.residual_kind == "rbf":
+            centers = torch.linspace(-2.5, 2.5, self.basis_count)
+            self.register_buffer("centers", centers)
+            self.width = float((centers[1] - centers[0]).abs() * 1.4) if self.basis_count > 1 else 1.0
+            self.dw_coeff = nn.Parameter(torch.randn(in_dim, self.basis_count) * 0.02)
+            self.register_parameter("lut_values", None)
+            self.register_buffer("grid", torch.empty(0))
+        elif self.residual_kind == "lut":
+            self.register_buffer("grid", torch.linspace(float(grid_min), float(grid_max), self.basis_count))
+            self.lut_values = nn.Parameter(torch.zeros(in_dim, self.basis_count))
+            with torch.no_grad():
+                self.lut_values.copy_(self.grid.unsqueeze(0).expand(in_dim, -1))
+            self.register_parameter("dw_coeff", None)
+            self.register_buffer("centers", torch.empty(0))
+            self.width = 1.0
+        else:
+            raise ValueError(f"unknown DWM2LiteDense residual_kind: {residual_kind}")
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_dim))
+        else:
+            self.register_parameter("bias", None)
+        self.last_input: Optional[torch.Tensor] = None
+        self.last_basis_mean: Optional[torch.Tensor] = None
+        self.last_output: Optional[torch.Tensor] = None
+        self.last_output_grad: Optional[torch.Tensor] = None
+        self.last_dead_bin_fraction: float = 0.0
+        self.last_out_of_grid_fraction: float = 0.0
+
+    def _rbf_residual(self, x: torch.Tensor) -> torch.Tensor:
+        z = (x.unsqueeze(-1) - self.centers[: self.basis_count]) / self.width
+        basis = torch.exp(-0.5 * z.square())
+        self.last_basis_mean = basis.detach().mean(dim=(0, 1))
+        return (basis * self.dw_coeff.unsqueeze(0)).sum(dim=-1)
+
+    def _lut_residual(self, x: torch.Tensor) -> torch.Tensor:
+        lo = self.grid[0]
+        hi = self.grid[-1]
+        step = (hi - lo) / max(1, self.basis_count - 1)
+        out_grid = (x < lo) | (x > hi)
+        xc = x.clamp(float(lo), float(hi))
+        pos = (xc - lo) / step
+        idx0 = pos.floor().long().clamp(0, self.basis_count - 2)
+        frac = (pos - idx0.to(dtype=x.dtype)).clamp(0.0, 1.0)
+        table = self.lut_values.unsqueeze(0).expand(x.shape[0], -1, -1)
+        v0 = torch.gather(table, 2, idx0.unsqueeze(-1)).squeeze(-1)
+        v1 = torch.gather(table, 2, (idx0 + 1).unsqueeze(-1)).squeeze(-1)
+        if self.training:
+            with torch.no_grad():
+                hist = torch.bincount(idx0.detach().flatten(), minlength=self.basis_count - 1).float()
+                self.last_dead_bin_fraction = float((hist == 0).float().mean().cpu())
+                self.last_out_of_grid_fraction = float(out_grid.detach().float().mean().cpu())
+        transformed = v0 + frac * (v1 - v0)
+        self.last_basis_mean = transformed.detach().mean(dim=0)
+        return transformed - x
+
+    def residual(self, x: torch.Tensor) -> torch.Tensor:
+        if self.residual_kind == "rbf":
+            return self._rbf_residual(x)
+        return self._lut_residual(x)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        transformed = x + self.residual_scale * self.residual(x)
+        out = F.linear(transformed, self.mix_coeff, self.bias)
+        self.last_input = x.detach()
+        self.last_output = out.detach()
+        if out.requires_grad:
+            def _save_output_grad(grad: torch.Tensor) -> None:
+                self.last_output_grad = grad.detach()
+
+            out.register_hook(_save_output_grad)
+        return out
+
+    def lut_geometry_stats(self) -> Dict[str, float]:
+        if self.residual_kind != "lut" or self.lut_values is None:
+            return {
+                "finite_difference_slope_p95": 0.0,
+                "finite_difference_curvature_p95": 0.0,
+                "dead_bin_fraction": 0.0,
+                "out_of_grid_fraction": 0.0,
+            }
+        with torch.no_grad():
+            diff1 = self.lut_values[:, 1:] - self.lut_values[:, :-1]
+            diff2 = diff1[:, 1:] - diff1[:, :-1] if diff1.shape[1] > 1 else diff1.new_zeros(diff1.shape[0], 1)
+            return {
+                "finite_difference_slope_p95": float(torch.quantile(diff1.detach().abs().flatten().float(), 0.95).cpu()),
+                "finite_difference_curvature_p95": float(torch.quantile(diff2.detach().abs().flatten().float(), 0.95).cpu()),
+                "dead_bin_fraction": float(self.last_dead_bin_fraction),
+                "out_of_grid_fraction": float(self.last_out_of_grid_fraction),
+            }
+
+
+class SparseInterpKANDense(nn.Module):
+    """Sparse two-bin interpolation KAN edge followed by one GEMM.
+
+    Unlike dense RBF / LUT edge expansions this layer never materializes a
+    ``[batch, in_dim, basis]`` tensor.  Each channel stores a tiny 1D table and
+    gathers only the two neighboring bins needed for the current input.
+    """
+
+    rbf_basis_count = 0
+
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        basis_count: int,
+        *,
+        bias: bool = True,
+        base_kind: str = "linear",
+        residual_scale: float = 0.05,
+        grid_min: float = -2.5,
+        grid_max: float = 2.5,
+    ) -> None:
+        super().__init__()
+        self.in_dim = int(in_dim)
+        self.out_dim = int(out_dim)
+        self.base_kind = str(base_kind)
+        self.residual_scale = float(residual_scale)
+        self.basis_count = int(max(3, basis_count))
+        self.grid_size = self.basis_count
+        self.base_dim = 3 if "silu" in self.base_kind else 2
+        self.base_coeff = nn.Parameter(torch.zeros(in_dim, self.base_dim))
+        with torch.no_grad():
+            self.base_coeff[:, 0].fill_(1.0)
+        self.interp_values = nn.Parameter(torch.zeros(in_dim, self.basis_count))
+        self.mix_coeff = nn.Parameter(torch.randn(out_dim, in_dim) / math.sqrt(max(1, in_dim)))
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_dim))
+        else:
+            self.register_parameter("bias", None)
+        self.register_buffer("grid", torch.linspace(float(grid_min), float(grid_max), self.basis_count))
+        self.last_input: Optional[torch.Tensor] = None
+        self.last_output: Optional[torch.Tensor] = None
+        self.last_output_grad: Optional[torch.Tensor] = None
+        self.last_dead_bin_fraction: float = 0.0
+        self.last_out_of_grid_fraction: float = 0.0
+        self.last_bin_entropy: float = 0.0
+        self.last_residual_over_base: float = 0.0
+
+    def _base(self, x: torch.Tensor) -> torch.Tensor:
+        base = self.base_coeff[:, 0].unsqueeze(0) * x + self.base_coeff[:, 1].unsqueeze(0)
+        if self.base_dim > 2:
+            base = base + self.base_coeff[:, 2].unsqueeze(0) * F.silu(x)
+        return base
+
+    def _interp_weight(self, frac: torch.Tensor) -> torch.Tensor:
+        return frac
+
+    def _sparse_interp(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        lo = self.grid[0]
+        hi = self.grid[-1]
+        step = (hi - lo) / max(1, self.basis_count - 1)
+        out_grid = (x < lo) | (x > hi)
+        xc = x.clamp(float(lo), float(hi))
+        pos = (xc - lo) / step
+        idx0 = pos.floor().long().clamp(0, self.basis_count - 2)
+        frac = (pos - idx0.to(dtype=x.dtype)).clamp(0.0, 1.0)
+        w = self._interp_weight(frac)
+        table = self.interp_values.unsqueeze(0).expand(x.shape[0], -1, -1)
+        v0 = torch.gather(table, 2, idx0.unsqueeze(-1)).squeeze(-1)
+        v1 = torch.gather(table, 2, (idx0 + 1).unsqueeze(-1)).squeeze(-1)
+        return v0 + w * (v1 - v0), idx0, frac, out_grid
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        base = self._base(x)
+        residual, idx0, _frac, out_grid = self._sparse_interp(x)
+        transformed = base + self.residual_scale * residual
+        out = F.linear(transformed, self.mix_coeff, self.bias)
+        self.last_input = x.detach()
+        self.last_output = out.detach()
+        if self.training:
+            with torch.no_grad():
+                hist = torch.bincount(idx0.detach().flatten(), minlength=self.basis_count - 1).float()
+                prob = hist / hist.sum().clamp_min(1.0)
+                entropy = -(prob[prob > 0] * prob[prob > 0].log()).sum() / math.log(max(2, self.basis_count - 1))
+                self.last_bin_entropy = float(entropy.cpu())
+                self.last_dead_bin_fraction = float((hist == 0).float().mean().cpu())
+                self.last_out_of_grid_fraction = float(out_grid.detach().float().mean().cpu())
+                self.last_residual_over_base = float(
+                    residual.detach().norm().cpu() / base.detach().norm().cpu().clamp_min(1.0e-6)
+                )
+        if out.requires_grad:
+            def _save_output_grad(grad: torch.Tensor) -> None:
+                self.last_output_grad = grad.detach()
+
+            out.register_hook(_save_output_grad)
+        return out
+
+    def sparse_geometry_stats(self) -> Dict[str, float]:
+        with torch.no_grad():
+            diff1 = self.interp_values[:, 1:] - self.interp_values[:, :-1]
+            diff2 = diff1[:, 1:] - diff1[:, :-1] if diff1.shape[1] > 1 else diff1.new_zeros(diff1.shape[0], 1)
+            tv = diff1.detach().abs().sum(dim=1).mean()
+            return {
+                "interp_bin_occupancy_entropy": float(self.last_bin_entropy),
+                "empty_bin_fraction": float(self.last_dead_bin_fraction),
+                "out_of_grid_fraction": float(self.last_out_of_grid_fraction),
+                "residual_over_base": float(self.last_residual_over_base),
+                "function_total_variation": float(tv.cpu()),
+                "function_second_difference_energy": float(diff2.detach().square().mean().cpu()),
+                "slope_p95": float(torch.quantile(diff1.detach().abs().flatten().float(), 0.95).cpu()),
+                "curvature_proxy": float(torch.quantile(diff2.detach().abs().flatten().float(), 0.95).cpu()),
+                "bin_jump_p95": float(torch.quantile(diff1.detach().abs().flatten().float(), 0.95).cpu()),
+            }
+
+
+class SparseSplineKANDense(SparseInterpKANDense):
+    """Sparse cubic-lite interpolation KAN edge.
+
+    The interpolation still gathers only two table values; the spline flavor is
+    the smoothstep weight ``3t^2 - 2t^3``, which gives a cheap smoother basis
+    without dense cubic basis materialization.
+    """
+
+    def _interp_weight(self, frac: torch.Tensor) -> torch.Tensor:
+        return frac.square() * (3.0 - 2.0 * frac)
+
+
+class RationalKATV2Dense(nn.Module):
+    """Identity/base/gated rational residual plus GEMM mixing."""
+
+    base_dim = 4
+    rbf_basis_count = 0
+
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        basis_count: int,
+        *,
+        bias: bool = True,
+        groups: int = 8,
+        variant: str = "identity_residual",
+        residual_scale: float = 0.1,
+        denominator_damping: float = 1.0e-2,
+    ) -> None:
+        super().__init__()
+        self.in_dim = int(in_dim)
+        self.out_dim = int(out_dim)
+        self.groups = int(groups)
+        self.variant = str(variant)
+        self.residual_scale = float(residual_scale)
+        self.denominator_damping = float(denominator_damping)
+        self.weight_numerator = nn.Parameter(torch.randn(in_dim, 4) * 0.05)
+        self.weight_denominator = nn.Parameter(torch.full((in_dim, 2), -3.0))
+        self.mix_coeff = nn.Parameter(torch.randn(out_dim, in_dim) / math.sqrt(max(1, in_dim)))
+        if "base_plus" in self.variant:
+            self.base_coeff = nn.Parameter(torch.zeros(in_dim, 2))
+            with torch.no_grad():
+                self.base_coeff[:, 0].fill_(1.0)
+        else:
+            self.register_parameter("base_coeff", None)
+        if "gated" in self.variant:
+            self.gate_coeff = nn.Parameter(torch.zeros(in_dim))
+        else:
+            self.register_parameter("gate_coeff", None)
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_dim))
+        else:
+            self.register_parameter("bias", None)
+        self.last_input: Optional[torch.Tensor] = None
+        self.last_basis_mean: Optional[torch.Tensor] = None
+        self.last_output: Optional[torch.Tensor] = None
+        self.last_output_grad: Optional[torch.Tensor] = None
+
+    def basis(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.stack([torch.ones_like(x), x, F.silu(x), x.square()], dim=-1)
+
+    def _rational_residual(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        basis = self.basis(x)
+        num = (basis * self.weight_numerator.unsqueeze(0)).sum(dim=-1)
+        a = F.softplus(self.weight_denominator[:, 0]).unsqueeze(0) + self.denominator_damping
+        b = F.softplus(self.weight_denominator[:, 1]).unsqueeze(0) + self.denominator_damping
+        den = 1.0 + a * x.abs() + b * x.square()
+        return num / den.clamp_min(1.0e-4), den
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual, den = self._rational_residual(x)
+        if self.base_coeff is not None:
+            base = self.base_coeff[:, 0].unsqueeze(0) * x + self.base_coeff[:, 1].unsqueeze(0) * F.silu(x)
+        else:
+            base = x
+        if self.gate_coeff is not None:
+            gate = torch.sigmoid(x * self.gate_coeff.unsqueeze(0))
+            transformed = base + self.residual_scale * gate * residual
+        else:
+            transformed = base + self.residual_scale * residual
+        out = F.linear(transformed, self.mix_coeff, self.bias)
+        self.last_input = x.detach()
+        self.last_basis_mean = self.basis(x).detach().mean(dim=(0, 1))
+        self.last_output = out.detach()
+        if out.requires_grad:
+            def _save_output_grad(grad: torch.Tensor) -> None:
+                self.last_output_grad = grad.detach()
+
+            out.register_hook(_save_output_grad)
+        return out
+
+    def denominator_stats(self, x: torch.Tensor) -> Dict[str, float]:
+        with torch.no_grad():
+            _, den = self._rational_residual(x)
+            flat = den.detach().flatten().float()
+            return {
+                "den_actual_min_batch": float(flat.min().cpu()),
+                "den_actual_p01_batch": float(torch.quantile(flat, 0.01).cpu()),
+                "den_actual_condition_batch": float((flat.max() / flat.min().clamp_min(1.0e-12)).cpu()),
+            }
+
+
+class RationalKATV3Dense(RationalKATV2Dense):
+    """v6.0 rational KAN edge with conservative identity-like defaults."""
+
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        basis_count: int,
+        *,
+        bias: bool = True,
+        groups: int = 8,
+        mode: str = "identity_rational",
+        residual_scale: float = 0.05,
+        denominator_damping: float = 2.0e-2,
+        mixing_init: str = "xavier",
+    ) -> None:
+        variant = "base_plus"
+        if "gated" in mode:
+            variant = "base_plus_gated"
+        super().__init__(
+            in_dim,
+            out_dim,
+            basis_count,
+            bias=bias,
+            groups=groups,
+            variant=variant,
+            residual_scale=residual_scale,
+            denominator_damping=denominator_damping,
+        )
+        self.mode = str(mode)
+        self.mixing_init = str(mixing_init)
+        with torch.no_grad():
+            self.weight_numerator.mul_(0.25)
+            self.weight_denominator.fill_(-2.5)
+            if self.base_coeff is not None:
+                self.base_coeff.zero_()
+                self.base_coeff[:, 0].fill_(1.0)
+            if "orthogonal" in self.mixing_init and in_dim == out_dim:
+                nn.init.orthogonal_(self.mix_coeff)
+            elif "identity" in self.mixing_init and in_dim == out_dim:
+                self.mix_coeff.zero_()
+                self.mix_coeff.fill_diagonal_(1.0)
+
+
+class LUTKANDense(nn.Module):
+    """Piecewise-linear LUT KAN edge plus GEMM mixing."""
+
+    base_dim = 0
+    rbf_basis_count = 0
+
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        basis_count: int,
+        *,
+        bias: bool = True,
+        grid_min: float = -2.5,
+        grid_max: float = 2.5,
+        variant: str = "channelwise",
+        residual_scale: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.in_dim = int(in_dim)
+        self.out_dim = int(out_dim)
+        self.grid_size = int(max(3, basis_count))
+        self.variant = str(variant)
+        self.residual_scale = float(residual_scale)
+        self.register_buffer("grid", torch.linspace(float(grid_min), float(grid_max), self.grid_size))
+        self.lut_values = nn.Parameter(torch.zeros(in_dim, self.grid_size))
+        with torch.no_grad():
+            self.lut_values.copy_(self.grid.unsqueeze(0).expand(in_dim, -1))
+        self.mix_coeff = nn.Parameter(torch.randn(out_dim, in_dim) / math.sqrt(max(1, in_dim)))
+        if "gated" in self.variant:
+            self.gate_coeff = nn.Parameter(torch.zeros(in_dim))
+        else:
+            self.register_parameter("gate_coeff", None)
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_dim))
+        else:
+            self.register_parameter("bias", None)
+        self.last_input: Optional[torch.Tensor] = None
+        self.last_output: Optional[torch.Tensor] = None
+        self.last_output_grad: Optional[torch.Tensor] = None
+        self.last_basis_mean: Optional[torch.Tensor] = None
+        self.last_dead_bin_fraction: float = 0.0
+        self.last_out_of_grid_fraction: float = 0.0
+
+    def _interp(self, x: torch.Tensor) -> torch.Tensor:
+        lo = self.grid[0]
+        hi = self.grid[-1]
+        step = (hi - lo) / max(1, self.grid_size - 1)
+        out_grid = (x < lo) | (x > hi)
+        xc = x.clamp(float(lo), float(hi))
+        pos = (xc - lo) / step
+        idx0 = pos.floor().long().clamp(0, self.grid_size - 2)
+        frac = (pos - idx0.to(dtype=x.dtype)).clamp(0.0, 1.0)
+        table = self.lut_values.unsqueeze(0).expand(x.shape[0], -1, -1)
+        v0 = torch.gather(table, 2, idx0.unsqueeze(-1)).squeeze(-1)
+        v1 = torch.gather(table, 2, (idx0 + 1).unsqueeze(-1)).squeeze(-1)
+        if self.training:
+            with torch.no_grad():
+                hist = torch.bincount(idx0.detach().flatten(), minlength=self.grid_size - 1).float()
+                self.last_dead_bin_fraction = float((hist == 0).float().mean().cpu())
+                self.last_out_of_grid_fraction = float(out_grid.detach().float().mean().cpu())
+        return v0 + frac * (v1 - v0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = self._interp(x)
+        if "base_residual" in self.variant:
+            transformed = x + self.residual_scale * (residual - x)
+        elif self.gate_coeff is not None:
+            gate = torch.sigmoid(x * self.gate_coeff.unsqueeze(0))
+            transformed = x + self.residual_scale * gate * (residual - x)
+        else:
+            transformed = residual
+        out = F.linear(transformed, self.mix_coeff, self.bias)
+        self.last_input = x.detach()
+        self.last_basis_mean = transformed.detach().mean(dim=0)
+        self.last_output = out.detach()
+        if out.requires_grad:
+            def _save_output_grad(grad: torch.Tensor) -> None:
+                self.last_output_grad = grad.detach()
+
+            out.register_hook(_save_output_grad)
+        return out
+
+    def lut_geometry_stats(self) -> Dict[str, float]:
+        with torch.no_grad():
+            diff1 = self.lut_values[:, 1:] - self.lut_values[:, :-1]
+            diff2 = diff1[:, 1:] - diff1[:, :-1] if diff1.shape[1] > 1 else diff1.new_zeros(diff1.shape[0], 1)
+            return {
+                "finite_difference_slope_p95": float(torch.quantile(diff1.detach().abs().flatten().float(), 0.95).cpu()),
+                "finite_difference_curvature_p95": float(torch.quantile(diff2.detach().abs().flatten().float(), 0.95).cpu()),
+                "dead_bin_fraction": float(self.last_dead_bin_fraction),
+                "out_of_grid_fraction": float(self.last_out_of_grid_fraction),
+            }
 
 
 class ResidualKANBlock(nn.Module):
@@ -1000,11 +2030,62 @@ class FixedNorm(nn.Module):
         return (x - mean) / torch.sqrt(var + self.eps)
 
 
-class PureResidualKANBlock(nn.Module):
-    def __init__(self, dim: int, basis_count: int, *, alpha_init: float = 1.0, alpha_mode: str = "fixed1") -> None:
+class NoNorm(nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x
+
+
+class AffineFixedNorm(nn.Module):
+    def __init__(self, dim: int, *, affine: bool = True, scalar: bool = False, eps: float = 1e-5) -> None:
         super().__init__()
-        self.norm = FixedNorm()
-        self.kan = RBFDense(dim, dim, basis_count, bias=False)
+        self.eps = eps
+        self.scalar = scalar
+        if affine:
+            shape = (1,) if scalar else (dim,)
+            self.gamma = nn.Parameter(torch.ones(*shape))
+            self.beta = nn.Parameter(torch.zeros(*shape))
+        else:
+            self.register_parameter("gamma", None)
+            self.register_parameter("beta", None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        mean = x.mean(dim=-1, keepdim=True)
+        var = (x - mean).square().mean(dim=-1, keepdim=True)
+        y = (x - mean) / torch.sqrt(var + self.eps)
+        if self.gamma is not None:
+            y = y * self.gamma.to(device=x.device, dtype=x.dtype)
+        if self.beta is not None:
+            y = y + self.beta.to(device=x.device, dtype=x.dtype)
+        return y
+
+
+def make_pure_norm(dim: int, mode: str) -> nn.Module:
+    key = mode.lower().replace("-", "_")
+    if key in {"", "fixed", "fixednorm", "fixed_norm"}:
+        return FixedNorm()
+    if key in {"affine", "affine_channel", "learnable_affine", "learnable_affine_norm"}:
+        return AffineFixedNorm(dim, affine=True, scalar=False)
+    if key in {"scalar", "scalar_gain", "scalar_gain_norm", "affine_scalar"}:
+        return AffineFixedNorm(dim, affine=True, scalar=True)
+    if key in {"none", "no_norm", "nonorm"}:
+        return NoNorm()
+    raise ValueError(f"unknown pure_norm_mode: {mode}")
+
+
+class PureResidualKANBlock(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        basis_count: int,
+        *,
+        alpha_init: float = 1.0,
+        alpha_mode: str = "fixed1",
+        norm_mode: str = "fixed",
+        dense_cls: type[RBFDense] = RBFDense,
+    ) -> None:
+        super().__init__()
+        self.norm = make_pure_norm(dim, norm_mode)
+        self.kan = dense_cls(dim, dim, basis_count, bias=False)
         mode = alpha_mode.lower().replace("-", "_")
         if mode == "learnable":
             self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
@@ -1034,17 +2115,27 @@ class PureKANClassifier(nn.Module):
         basis_count: int = 16,
         alpha_init: float = 1.0,
         alpha_mode: str = "fixed1",
+        norm_mode: str = "fixed",
+        dense_cls: type[RBFDense] = RBFDense,
     ) -> None:
         super().__init__()
-        self.input_kan = RBFDense(input_dim, hidden_dim, basis_count, bias=False)
+        self.norm_mode = norm_mode
+        self.input_kan = dense_cls(input_dim, hidden_dim, basis_count, bias=False)
         self.blocks = nn.ModuleList(
             [
-                PureResidualKANBlock(hidden_dim, basis_count, alpha_init=alpha_init, alpha_mode=alpha_mode)
+                PureResidualKANBlock(
+                    hidden_dim,
+                    basis_count,
+                    alpha_init=alpha_init,
+                    alpha_mode=alpha_mode,
+                    norm_mode=norm_mode,
+                    dense_cls=dense_cls,
+                )
                 for _ in range(depth)
             ]
         )
-        self.output_norm = FixedNorm()
-        self.output_kan = RBFDense(hidden_dim, num_classes, basis_count, bias=False)
+        self.output_norm = make_pure_norm(hidden_dim, norm_mode)
+        self.output_kan = dense_cls(hidden_dim, num_classes, basis_count, bias=False)
 
     def set_branch_scale(self, scale: float) -> None:
         for block in self.blocks:
@@ -1090,6 +2181,23 @@ def coefficient_named_params(model: nn.Module) -> List[Tuple[str, nn.Parameter]]
         if isinstance(module, RBFDense):
             out.append((f"{prefix}coeff", module.coeff))
             seen.add(id(module.coeff))
+        for attr in [
+            "dw_coeff",
+            "mix_coeff",
+            "pre_mix_coeff",
+            "post_mix_coeff",
+            "gate_coeff",
+            "base_coeff",
+            "interp_values",
+            "lut_values",
+            "cp_u",
+            "cp_v",
+            "cp_w",
+        ]:
+            value = getattr(module, attr, None)
+            if isinstance(value, nn.Parameter) and id(value) not in seen:
+                out.append((f"{prefix}{attr}", value))
+                seen.add(id(value))
         if hasattr(module, "weight_numerator") and hasattr(module, "weight_denominator"):
             numerator = getattr(module, "weight_numerator")
             denominator = getattr(module, "weight_denominator")
@@ -1102,9 +2210,99 @@ def coefficient_named_params(model: nn.Module) -> List[Tuple[str, nn.Parameter]]
     return out
 
 
+def edge_named_params(model: nn.Module) -> List[Tuple[str, nn.Parameter]]:
+    """Return learnable parameters owned by KAN edge modules.
+
+    For AB-RBF layers the base and residual slices currently share ``coeff``;
+    split audits should use ``base_dim`` / ``rbf_basis_count`` on the owning
+    module to count the base and residual portions.
+    """
+
+    return coefficient_named_params(model)
+
+
+def base_named_params(model: nn.Module) -> List[Tuple[str, nn.Parameter]]:
+    out: List[Tuple[str, nn.Parameter]] = []
+    for module_name, module in model.named_modules():
+        if isinstance(module, ABRBFDense) and getattr(module, "base_dim", 0) > 0:
+            prefix = f"{module_name}." if module_name else ""
+            out.append((f"{prefix}coeff.base", module.coeff))
+        elif isinstance(module, ABRBFDepthwiseMixDense) and getattr(module, "base_dim", 0) > 0:
+            prefix = f"{module_name}." if module_name else ""
+            out.append((f"{prefix}dw_coeff.base", module.dw_coeff))
+        elif isinstance(module, DWM2Dense) and getattr(module, "base_dim", 0) > 0:
+            prefix = f"{module_name}." if module_name else ""
+            out.append((f"{prefix}dw_coeff.base", module.dw_coeff))
+        elif isinstance(module, CPABRBFDense):
+            prefix = f"{module_name}." if module_name else ""
+            out.append((f"{prefix}base_coeff", module.base_coeff))
+        elif isinstance(module, (SparseInterpKANDense, SparseSplineKANDense)):
+            prefix = f"{module_name}." if module_name else ""
+            out.append((f"{prefix}base_coeff", module.base_coeff))
+        elif isinstance(module, (RationalKATDense, RationalKATV2Dense)):
+            prefix = f"{module_name}." if module_name else ""
+            out.append((f"{prefix}weight_numerator", module.weight_numerator))
+    return out
+
+
+def rbf_residual_named_params(model: nn.Module) -> List[Tuple[str, nn.Parameter]]:
+    out: List[Tuple[str, nn.Parameter]] = []
+    for module_name, module in model.named_modules():
+        if isinstance(module, RBFDense):
+            rbf_count = int(getattr(module, "rbf_basis_count", module.coeff.shape[-1]))
+            if rbf_count > 0:
+                prefix = f"{module_name}." if module_name else ""
+                out.append((f"{prefix}coeff.rbf", module.coeff))
+        elif isinstance(module, ABRBFDepthwiseMixDense) and getattr(module, "rbf_basis_count", 0) > 0:
+            prefix = f"{module_name}." if module_name else ""
+            out.append((f"{prefix}dw_coeff.rbf", module.dw_coeff))
+        elif isinstance(module, DWM2Dense) and getattr(module, "rbf_basis_count", 0) > 0:
+            prefix = f"{module_name}." if module_name else ""
+            out.append((f"{prefix}dw_coeff.rbf", module.dw_coeff))
+        elif isinstance(module, DWM2LiteDense):
+            prefix = f"{module_name}." if module_name else ""
+            if getattr(module, "residual_kind", "") == "rbf" and isinstance(getattr(module, "dw_coeff", None), nn.Parameter):
+                out.append((f"{prefix}dw_coeff.rbf", module.dw_coeff))
+            elif isinstance(getattr(module, "lut_values", None), nn.Parameter):
+                out.append((f"{prefix}lut_values", module.lut_values))
+        elif isinstance(module, CPABRBFDense) and getattr(module, "rbf_basis_count", 0) > 0:
+            prefix = f"{module_name}." if module_name else ""
+            out.extend([(f"{prefix}cp_u", module.cp_u), (f"{prefix}cp_v", module.cp_v), (f"{prefix}cp_w", module.cp_w)])
+        elif isinstance(module, LUTKANDense):
+            prefix = f"{module_name}." if module_name else ""
+            out.append((f"{prefix}lut_values", module.lut_values))
+        elif isinstance(module, (SparseInterpKANDense, SparseSplineKANDense)):
+            prefix = f"{module_name}." if module_name else ""
+            out.append((f"{prefix}interp_values", module.interp_values))
+    return out
+
+
+def mixing_named_params(model: nn.Module) -> List[Tuple[str, nn.Parameter]]:
+    out: List[Tuple[str, nn.Parameter]] = []
+    for module_name, module in model.named_modules():
+        prefix = f"{module_name}." if module_name else ""
+        for attr in ["mix_coeff", "pre_mix_coeff", "post_mix_coeff"]:
+            value = getattr(module, attr, None)
+            if isinstance(value, nn.Parameter):
+                out.append((f"{prefix}{attr}", value))
+    return out
+
+
 def non_coefficient_params(model: nn.Module) -> List[nn.Parameter]:
     coeff_ids = {id(p) for _, p in coefficient_named_params(model)}
     return [p for p in model.parameters() if id(p) not in coeff_ids]
+
+
+def norm_named_params(model: nn.Module) -> List[Tuple[str, nn.Parameter]]:
+    out: List[Tuple[str, nn.Parameter]] = []
+    for module_name, module in model.named_modules():
+        if isinstance(module, AffineFixedNorm):
+            prefix = f"{module_name}." if module_name else ""
+            if module.gamma is not None:
+                out.append((f"{prefix}gamma", module.gamma))
+            if module.beta is not None:
+                out.append((f"{prefix}beta", module.beta))
+    return out
 
 
 ADAMW_METHOD_KEYS = {
@@ -1238,14 +2436,73 @@ class TrainConfig:
     afu_bias_rho: float = 1e-2
     afu_max_update_ratio: float = 0.05
     pure_input_metric: str = "phase"
+    pure_shallow_metric: str = "phase"
+    pure_deep_metric: str = "phase"
     pure_block_metric: str = "phase"
     pure_output_metric: str = "phase"
     pure_input_lr_mult: float = 1.0
+    pure_shallow_lr_mult: float = 1.0
+    pure_deep_lr_mult: float = 1.0
     pure_block_lr_mult: float = 1.0
     pure_output_lr_mult: float = 1.0
     pure_input_trust_radius: float = 0.0
+    pure_shallow_trust_radius: float = 0.0
+    pure_deep_trust_radius: float = 0.0
     pure_block_trust_radius: float = 0.0
     pure_output_trust_radius: float = 0.0
+    pure_norm_mode: str = "fixed"
+    norm_update_method: str = "none"
+    norm_lr: float = 0.01
+    norm_rho: float = 1e-3
+    tfu_enabled: bool = False
+    tfu_sob_lambda: float = 0.03
+    tfu_input_sob_lambda: float = -1.0
+    tfu_shallow_sob_lambda: float = -1.0
+    tfu_deep_sob_lambda: float = -1.0
+    tfu_output_sob_lambda: float = -1.0
+    tfu_rho: float = 1e-3
+    tfu_task_ema_beta: float = 0.95
+    tfu_metric_clamp_min: float = 0.05
+    tfu_metric_clamp_max: float = 20.0
+    tfu_safeguard_mode: str = "off"
+    tfu_safeguard_cos_min: float = 0.05
+    tfu_safeguard_check_interval: int = 1
+    fng_enabled: bool = False
+    fng_mode: str = "none"
+    fng_sob_lambda: float = 0.02
+    fng_input_sob_lambda: float = -1.0
+    fng_shallow_sob_lambda: float = -1.0
+    fng_deep_sob_lambda: float = -1.0
+    fng_output_sob_lambda: float = -1.0
+    fng_rho_a: float = 1e-3
+    fng_rho_c: float = 1e-2
+    fng_left_ema_beta: float = 0.95
+    fng_right_ema_beta: float = 0.95
+    fng_lowrank: int = 8
+    fng_direction_momentum_beta: float = 0.0
+    fng_metric_normalized_momentum: bool = False
+    fng_step_scale: float = 1.0
+    ftf_enabled: bool = False
+    ftf_mode: str = "none"
+    ftf_tau: float = 0.10
+    ftf_sob_lambda: float = 1e-3
+    ftf_ridge: float = 1e-2
+    ftf_credit_normalize: bool = True
+    ftf_activation_trust: float = 0.20
+    ftf_output_lr_mult: float = 1.0
+    ftf_block_lr_mult: float = 1.0
+    ftf_input_lr_mult: float = 1.0
+    fc_adam_enabled: bool = False
+    fc_adam_beta1: float = 0.9
+    fc_adam_beta2: float = 0.999
+    fc_adam_eps: float = 1e-8
+    fc_adam_weight_decay: float = 0.0
+    fc_adam_sob_decay: float = 0.0
+    ftr_enabled: bool = False
+    ftr_cg_iters: int = 5
+    ftr_rho: float = 1e-2
+    ftr_sob_lambda: float = 1e-4
+    ftr_trust_radius: float = 0.10
     notes: str = ""
 
 
@@ -1306,6 +2563,57 @@ class RuntimeState:
     pure_role_precond_norms: Dict[str, List[float]] = field(default_factory=dict)
     pure_role_cos_raw_precond: Dict[str, List[float]] = field(default_factory=dict)
     pure_role_metric_conditions: Dict[str, List[float]] = field(default_factory=dict)
+    tfu_grad_sq_ema: Dict[str, torch.Tensor] = field(default_factory=dict)
+    tfu_metric_mins: Dict[str, List[float]] = field(default_factory=dict)
+    tfu_metric_maxs: Dict[str, List[float]] = field(default_factory=dict)
+    tfu_safeguard_check_count: int = 0
+    tfu_safeguard_fail_count: int = 0
+    tfu_backtrack_counts: List[float] = field(default_factory=list)
+    tfu_fallback_to_diag_count: int = 0
+    tfu_fallback_to_identity_count: int = 0
+    tfu_fallback_by_role: Dict[str, int] = field(default_factory=dict)
+    norm_grad_sq_ema: Dict[str, torch.Tensor] = field(default_factory=dict)
+    norm_seen_param_names: set[str] = field(default_factory=set)
+    norm_seen_param_numel: int = 0
+    norm_update_norms: List[float] = field(default_factory=list)
+    norm_update_over_param: List[float] = field(default_factory=list)
+    norm_gamma_values: List[float] = field(default_factory=list)
+    norm_beta_values: List[float] = field(default_factory=list)
+    fng_right_cov_ema: Dict[str, torch.Tensor] = field(default_factory=dict)
+    fng_left_cov_ema: Dict[str, torch.Tensor] = field(default_factory=dict)
+    fng_momentum: Dict[str, torch.Tensor] = field(default_factory=dict)
+    fng_a_conditions: Dict[str, List[float]] = field(default_factory=dict)
+    fng_c_conditions: Dict[str, List[float]] = field(default_factory=dict)
+    fng_combined_conditions: Dict[str, List[float]] = field(default_factory=dict)
+    fng_a_eig_min: Dict[str, List[float]] = field(default_factory=dict)
+    fng_a_eig_max: Dict[str, List[float]] = field(default_factory=dict)
+    fng_c_eig_min: Dict[str, List[float]] = field(default_factory=dict)
+    fng_c_eig_max: Dict[str, List[float]] = field(default_factory=dict)
+    fng_effective_rank_a: Dict[str, List[float]] = field(default_factory=dict)
+    fng_effective_rank_c: Dict[str, List[float]] = field(default_factory=dict)
+    fng_metric_build_time: float = 0.0
+    fng_metric_solve_time: float = 0.0
+    fng_fallback_count: int = 0
+    fng_update_count: int = 0
+    fng_bad_step_count: int = 0
+    fng_direction_momentum_norms: List[float] = field(default_factory=list)
+    fng_direction_momentum_cos_current: List[float] = field(default_factory=list)
+    ftf_fit_r2: Dict[str, List[float]] = field(default_factory=dict)
+    ftf_target_norms: Dict[str, List[float]] = field(default_factory=dict)
+    ftf_residual_norms: Dict[str, List[float]] = field(default_factory=dict)
+    ftf_residual_rel: Dict[str, List[float]] = field(default_factory=dict)
+    ftf_ridge_conditions: Dict[str, List[float]] = field(default_factory=dict)
+    ftf_delta_norm_ratios: Dict[str, List[float]] = field(default_factory=dict)
+    ftf_trust_clip_count: int = 0
+    ftf_update_count: int = 0
+    fc_adam_m: Dict[str, torch.Tensor] = field(default_factory=dict)
+    fc_adam_v: Dict[str, torch.Tensor] = field(default_factory=dict)
+    fc_adam_t: Dict[str, int] = field(default_factory=dict)
+    fc_adam_reconstruction_errors: List[float] = field(default_factory=list)
+    fc_adam_grad_chain_errors: List[float] = field(default_factory=list)
+    fc_adam_s_conditions: Dict[str, List[float]] = field(default_factory=dict)
+    ftr_cg_residuals: List[float] = field(default_factory=list)
+    ftr_predicted_change_norms: List[float] = field(default_factory=list)
     direction_cos_diagfast_fullgeo: List[float] = field(default_factory=list)
     direction_norm_ratio_fullgeo_diagfast: List[float] = field(default_factory=list)
     direction_norm_ratio_current_diagfast: List[float] = field(default_factory=list)
@@ -1434,18 +2742,32 @@ def _safe_cos(a: torch.Tensor, b: torch.Tensor) -> float:
     return float((torch.dot(a, b) / denom).detach().cpu())
 
 
-def _pure_param_role(name: str) -> str:
+def _pure_param_role(name: str, cfg: Optional[TrainConfig] = None) -> str:
     if name.startswith("input_kan."):
         return "input"
     if name.startswith("output_kan."):
         return "output"
-    if ".kan." in name or name.startswith("blocks."):
+    if name.startswith("blocks."):
+        if cfg is not None and cfg.tfu_enabled:
+            parts = name.split(".")
+            block_idx = -1
+            if len(parts) > 1:
+                try:
+                    block_idx = int(parts[1])
+                except ValueError:
+                    block_idx = -1
+            split = max(1, int(math.ceil(cfg.depth / 2.0)))
+            return "shallow" if block_idx >= 0 and block_idx < split else "deep"
+        return "block"
+    if ".kan." in name:
         return "block"
     return "other"
 
 
 def _pure_role_metric(cfg: TrainConfig, role: str, phase_metric: str) -> str:
     value = getattr(cfg, f"pure_{role}_metric", "phase")
+    if role in {"shallow", "deep"} and str(value or "phase").lower().replace("-", "_") in {"", "phase", "auto"}:
+        value = cfg.pure_block_metric
     key = str(value or "phase").lower().replace("-", "_")
     if key in {"", "phase", "auto"}:
         return phase_metric
@@ -1453,20 +2775,478 @@ def _pure_role_metric(cfg: TrainConfig, role: str, phase_metric: str) -> str:
         return "basis_diag_gram"
     if key == "full":
         return "full_sobolev_gram"
+    if key in {"task", "task_aware", "tfu", "tfu_task", "task_diag", "fisher_diag", "output_fisher", "output_fisher_diag"}:
+        return "tfu_task_diag"
+    if key in {"task_data", "data_task", "data_aware", "tfu_data"}:
+        return "tfu_data_task_diag"
+    if key in {"fng", "fng_right", "fng_right_only", "right_fng", "fng_right_only_shared"}:
+        return "fng_right"
+    if key in {"fng_leftdiag", "fng_left_diag", "fng_leftdiag_right", "fng_left_diag_right"}:
+        return "fng_leftdiag_right"
+    if key in {"fng_leftfull", "fng_left_full", "fng_leftfull_right", "fng_left_full_right"}:
+        return "fng_leftfull_right"
+    if key in {"fng_leftlowrank", "fng_left_lowrank", "fng_leftlowrank_right", "fng_left_lowrank_right"}:
+        return "fng_leftlowrank_right"
+    if key in {"ftf", "ftf_target", "functional_target_fitting"}:
+        return "ftf"
+    if key in {"fc_adam", "fcadam", "functional_coordinate_adam"}:
+        return "fc_adam"
+    if key in {"ftr", "ftr_cg", "ftr_cg_small", "global_fgn"}:
+        return "ftr_cg_small"
     return str(value)
 
 
 def _pure_role_lr_mult(cfg: TrainConfig, role: str) -> float:
-    return float(getattr(cfg, f"pure_{role}_lr_mult", 1.0))
+    value = float(getattr(cfg, f"pure_{role}_lr_mult", 1.0))
+    if role in {"shallow", "deep"} and value == 1.0:
+        value = float(cfg.pure_block_lr_mult)
+    return value
 
 
 def _pure_role_trust_radius(cfg: TrainConfig, role: str) -> float:
     value = float(getattr(cfg, f"pure_{role}_trust_radius", 0.0))
+    if role in {"shallow", "deep"} and value <= 0:
+        value = float(cfg.pure_block_trust_radius)
     return value if value > 0 else cfg.trust_radius
 
 
 def _append_role_value(store: Dict[str, List[float]], role: str, value: float) -> None:
     store.setdefault(role, []).append(float(value))
+
+
+def _append_pure_role_value(store: Dict[str, List[float]], role: str, value: float) -> None:
+    _append_role_value(store, role, value)
+    if role in {"shallow", "deep"}:
+        _append_role_value(store, "block", value)
+
+
+def _tfu_role_sob_lambda(cfg: TrainConfig, role: str) -> float:
+    value = float(getattr(cfg, f"tfu_{role}_sob_lambda", -1.0))
+    if value >= 0:
+        return value
+    if role in {"shallow", "deep"}:
+        value = float(getattr(cfg, f"tfu_{role}_sob_lambda", -1.0))
+        if value >= 0:
+            return value
+    return float(cfg.tfu_sob_lambda)
+
+
+def _tfu_normalize_metric(metric: torch.Tensor, cfg: TrainConfig) -> torch.Tensor:
+    m = metric.float()
+    m = m / m.mean().clamp_min(1e-8)
+    return m.clamp(float(cfg.tfu_metric_clamp_min), float(cfg.tfu_metric_clamp_max))
+
+
+def _tfu_task_diag_direction(
+    grad: torch.Tensor,
+    param: torch.Tensor,
+    name: str,
+    layer: RBFDense,
+    cfg: TrainConfig,
+    state: RuntimeState,
+    *,
+    role: str,
+    metric_mode: str,
+) -> Tuple[torch.Tensor, torch.Tensor, float, float, float]:
+    beta = float(cfg.tfu_task_ema_beta)
+    prev = state.tfu_grad_sq_ema.get(name)
+    if prev is None or prev.shape != grad.shape:
+        prev = torch.zeros_like(grad)
+    grad_sq = beta * prev + (1.0 - beta) * grad.detach().float().square()
+    state.tfu_grad_sq_ema[name] = grad_sq.detach()
+    task_metric = _tfu_normalize_metric(grad_sq.sqrt().add(float(cfg.tfu_rho)), cfg)
+    if "data" in metric_mode.lower():
+        data_metric = _tfu_normalize_metric(_data_metric_diag(layer, param), cfg)
+        task_metric = _tfu_normalize_metric(0.5 * task_metric + 0.5 * data_metric, cfg)
+    sob_diag = grid_metric_diag(param, cfg).expand_as(param).float()
+    sob_diag = _tfu_normalize_metric(sob_diag, cfg)
+    lam = _tfu_role_sob_lambda(cfg, role)
+    metric = (task_metric + lam * sob_diag + float(cfg.tfu_rho)).clamp_min(float(cfg.tfu_rho))
+    direction = -grad / metric.to(dtype=grad.dtype)
+    metric_min = float(metric.min().detach().cpu())
+    metric_max = float(metric.max().detach().cpu())
+    condition = metric_max / max(metric_min, 1e-12)
+    return direction, metric.to(dtype=grad.dtype), condition, metric_min, metric_max
+
+
+def _matrix_stats(mat: torch.Tensor) -> Tuple[float, float, float, float]:
+    eig = torch.linalg.eigvalsh(mat.detach().float()).clamp_min(1e-12)
+    total = eig.sum().clamp_min(1e-12)
+    p = eig / total
+    entropy = -(p * p.clamp_min(1e-12).log()).sum()
+    eff_rank = float(entropy.exp().detach().cpu())
+    return (
+        float(eig[0].detach().cpu()),
+        float(eig[-1].detach().cpu()),
+        float((eig[-1] / eig[0]).detach().cpu()),
+        eff_rank,
+    )
+
+
+def _fng_role_sob_lambda(cfg: TrainConfig, role: str) -> float:
+    value = float(getattr(cfg, f"fng_{role}_sob_lambda", -1.0))
+    if value >= 0:
+        return value
+    if role in {"shallow", "deep"}:
+        value = float(getattr(cfg, f"fng_{role}_sob_lambda", -1.0))
+        if value >= 0:
+            return value
+    return float(cfg.fng_sob_lambda)
+
+
+def _basis_covariance(layer: RBFDense, cfg: TrainConfig, state: RuntimeState, name: str) -> torch.Tensor:
+    if layer.last_input is None:
+        k = int(layer.coeff.shape[-1])
+        return torch.eye(k, device=layer.coeff.device)
+    basis = layer.basis(layer.last_input.to(layer.coeff.device)).detach().float()
+    flat = basis.reshape(-1, basis.shape[-1])
+    cov = (flat.T @ flat) / max(1, flat.shape[0])
+    prev = state.fng_right_cov_ema.get(name)
+    beta = float(cfg.fng_right_ema_beta)
+    if prev is not None and prev.shape == cov.shape:
+        cov = beta * prev + (1.0 - beta) * cov
+    state.fng_right_cov_ema[name] = cov.detach()
+    return cov
+
+
+def _left_covariance(layer: RBFDense, cfg: TrainConfig, state: RuntimeState, name: str) -> torch.Tensor:
+    out_dim = int(layer.coeff.shape[0])
+    grad_out = layer.last_output_grad
+    if grad_out is None:
+        return torch.eye(out_dim, device=layer.coeff.device)
+    flat = grad_out.detach().float().reshape(-1, out_dim)
+    cov = (flat.T @ flat) / max(1, flat.shape[0])
+    trace = torch.trace(cov).clamp_min(1e-12)
+    cov = cov * (out_dim / trace)
+    prev = state.fng_left_cov_ema.get(name)
+    beta = float(cfg.fng_left_ema_beta)
+    if prev is not None and prev.shape == cov.shape:
+        cov = beta * prev + (1.0 - beta) * cov
+    state.fng_left_cov_ema[name] = cov.detach()
+    return cov
+
+
+def _fng_direction(
+    grad: torch.Tensor,
+    layer: RBFDense,
+    name: str,
+    cfg: TrainConfig,
+    state: RuntimeState,
+    *,
+    role: str,
+    mode: str,
+) -> Tuple[torch.Tensor, torch.Tensor, float, float, float]:
+    start = time.perf_counter()
+    basis_cov = _basis_covariance(layer, cfg, state, name).to(device=grad.device)
+    sob = _get_sobolev_gram(
+        layer,
+        cfg,
+        state,
+        alpha=cfg.v3_alpha_geo,
+        beta=cfg.v3_beta_geo,
+        rho=cfg.fng_rho_a,
+        device=grad.device,
+        dtype=grad.dtype,
+    )["M"].to(device=grad.device)
+    lam = _fng_role_sob_lambda(cfg, role)
+    k = basis_cov.shape[0]
+    eye_k = torch.eye(k, device=grad.device)
+    right = basis_cov + lam * sob + float(cfg.fng_rho_a) * eye_k
+    right = 0.5 * (right + right.T)
+    a_min, a_max, a_cond, a_rank = _matrix_stats(right)
+    chol_r = torch.linalg.cholesky(right.float())
+    state.fng_metric_build_time += time.perf_counter() - start
+
+    solve_start = time.perf_counter()
+    flat = grad.reshape(-1, grad.shape[-1]).float()
+    right_solved = torch.cholesky_solve(flat.T, chol_r).T.reshape_as(grad).to(dtype=grad.dtype)
+
+    key = mode.lower().replace("-", "_")
+    c_cond = 1.0
+    c_min = 1.0
+    c_max = 1.0
+    c_rank = float(grad.shape[0])
+    if "leftdiag" in key or "left_diag" in key:
+        cov = _left_covariance(layer, cfg, state, name).to(device=grad.device)
+        diag = cov.diag().clamp_min(float(cfg.fng_rho_c)) + float(cfg.fng_rho_c)
+        c_min = float(diag.min().detach().cpu())
+        c_max = float(diag.max().detach().cpu())
+        c_cond = c_max / max(c_min, 1e-12)
+        c_rank = float((diag.sum().square() / diag.square().sum().clamp_min(1e-12)).detach().cpu())
+        solved = right_solved / diag.to(dtype=grad.dtype).view(-1, 1, 1)
+    elif "leftfull" in key or "left_full" in key or "leftlowrank" in key or "left_lowrank" in key:
+        cov = _left_covariance(layer, cfg, state, name).to(device=grad.device)
+        out_dim = cov.shape[0]
+        left = cov + float(cfg.fng_rho_c) * torch.eye(out_dim, device=grad.device)
+        left = 0.5 * (left + left.T)
+        c_min, c_max, c_cond, c_rank = _matrix_stats(left)
+        chol_c = torch.linalg.cholesky(left.float())
+        flat_lr = right_solved.reshape(out_dim, -1).float()
+        solved = torch.cholesky_solve(flat_lr, chol_c).reshape_as(grad).to(dtype=grad.dtype)
+    else:
+        solved = right_solved
+    state.fng_metric_solve_time += time.perf_counter() - solve_start
+
+    direction = -solved
+    right_diag = right.diag().to(dtype=grad.dtype).view(1, 1, -1).expand_as(grad).clamp_min(float(cfg.fng_rho_a))
+    if cfg.fng_direction_momentum_beta > 0:
+        normed = direction / torch.sqrt((direction.square() * right_diag).sum()).clamp_min(1e-12)
+        prev = state.fng_momentum.get(name)
+        beta = float(cfg.fng_direction_momentum_beta)
+        mom = normed if prev is None or prev.shape != normed.shape else beta * prev + (1.0 - beta) * normed
+        state.fng_momentum[name] = mom.detach()
+        state.fng_direction_momentum_norms.append(float(mom.norm().detach().cpu()))
+        state.fng_direction_momentum_cos_current.append(_safe_cos(mom, normed))
+        if cfg.fng_metric_normalized_momentum:
+            direction = mom / torch.sqrt((mom.square() * right_diag).sum()).clamp_min(1e-12)
+    condition = max(a_cond, c_cond)
+    _append_pure_role_value(state.fng_a_conditions, role, a_cond)
+    _append_pure_role_value(state.fng_c_conditions, role, c_cond)
+    _append_pure_role_value(state.fng_combined_conditions, role, condition)
+    _append_pure_role_value(state.fng_a_eig_min, role, a_min)
+    _append_pure_role_value(state.fng_a_eig_max, role, a_max)
+    _append_pure_role_value(state.fng_c_eig_min, role, c_min)
+    _append_pure_role_value(state.fng_c_eig_max, role, c_max)
+    _append_pure_role_value(state.fng_effective_rank_a, role, a_rank)
+    _append_pure_role_value(state.fng_effective_rank_c, role, c_rank)
+    state.fng_update_count += 1
+    return direction, right_diag, condition, min(a_min, c_min), max(a_max, c_max)
+
+
+def _ftf_role_enabled(cfg: TrainConfig, role: str) -> bool:
+    key = cfg.ftf_mode.lower().replace("-", "_")
+    if key in {"all", "all_simultaneous", "all_sequential", "ftf_all"}:
+        return True
+    if key in {"output", "output_only", "ftf_output_only"}:
+        return role == "output"
+    if key in {"blocks_output", "block_output", "blocks_and_output"}:
+        return role in {"block", "shallow", "deep", "output"}
+    return True
+
+
+def _ftf_role_lr_mult(cfg: TrainConfig, role: str) -> float:
+    if role == "input":
+        return float(cfg.ftf_input_lr_mult)
+    if role in {"block", "shallow", "deep"}:
+        return float(cfg.ftf_block_lr_mult)
+    if role == "output":
+        return float(cfg.ftf_output_lr_mult)
+    return 1.0
+
+
+def _ftf_direction(
+    layer: RBFDense,
+    name: str,
+    cfg: TrainConfig,
+    state: RuntimeState,
+    *,
+    role: str,
+) -> Tuple[torch.Tensor, torch.Tensor, float, float, float]:
+    if layer.last_input is None or layer.last_output_grad is None:
+        return torch.zeros_like(layer.coeff), torch.ones_like(layer.coeff), float("nan"), float("nan"), float("nan")
+
+    start = time.perf_counter()
+    x = layer.last_input.to(device=layer.coeff.device)
+    basis = layer.basis(x).detach().float()  # [B, in, K]
+    credit = layer.last_output_grad.detach().float().to(device=layer.coeff.device)
+    output = layer.last_output.detach().float().to(device=layer.coeff.device) if layer.last_output is not None else torch.zeros_like(credit)
+    if cfg.ftf_credit_normalize:
+        credit_rms = credit.square().mean().sqrt().clamp_min(1e-8)
+        output_rms = output.square().mean().sqrt().clamp_min(1e-3)
+        target = -float(cfg.ftf_tau) * credit / credit_rms * output_rms
+    else:
+        target = -float(cfg.ftf_tau) * credit
+
+    k = int(layer.coeff.shape[-1])
+    gram = _get_sobolev_gram(
+        layer,
+        cfg,
+        state,
+        alpha=cfg.v3_alpha_geo,
+        beta=cfg.v3_beta_geo,
+        rho=max(float(cfg.ftf_ridge), 1e-8),
+        device=layer.coeff.device,
+        dtype=layer.coeff.dtype,
+    )
+    prior = float(cfg.ftf_sob_lambda) * gram["M"].to(device=layer.coeff.device).float()
+    prior = prior + float(cfg.ftf_ridge) * torch.eye(k, device=layer.coeff.device)
+    prior = 0.5 * (prior + prior.T)
+    eig_prior = torch.linalg.eigvalsh(prior).clamp_min(1e-12)
+    chol_prior = torch.linalg.cholesky(prior)
+
+    bsz, in_dim, _ = basis.shape
+    # R^{-1} Phi^T for each input channel. Shape: [in, K, B].
+    rhs_by_in = basis.permute(1, 2, 0).contiguous()  # [in, K, B]
+    chol_batch = chol_prior.unsqueeze(0).expand(in_dim, -1, -1).contiguous()
+    rinv_phi_t = torch.cholesky_solve(rhs_by_in, chol_batch)
+    kernel = torch.einsum("bik,ikc->bc", basis, rinv_phi_t)
+    kernel = 0.5 * (kernel + kernel.T)
+    system = kernel + torch.eye(bsz, device=kernel.device)
+    eig = torch.linalg.eigvalsh(system.float()).clamp_min(1e-12)
+    chol_system = torch.linalg.cholesky(system.float())
+    alpha = torch.cholesky_solve(target.float(), chol_system)  # [B, out]
+    delta_iko = torch.einsum("ikb,bo->iko", rinv_phi_t, alpha)
+    delta = delta_iko.permute(2, 0, 1).contiguous().to(dtype=layer.coeff.dtype)
+
+    pred = torch.einsum("bik,oik->bo", basis.to(dtype=delta.dtype), delta).float()
+    residual = pred - target
+    target_norm = target.norm().clamp_min(1e-12)
+    residual_norm = residual.norm()
+    r2 = 1.0 - float((residual.square().sum() / target.square().sum().clamp_min(1e-12)).detach().cpu())
+    delta_ratio = float((pred.norm() / output.norm().clamp_min(1e-12)).detach().cpu()) if output.numel() else 0.0
+    trust = float(cfg.ftf_activation_trust)
+    if trust > 0 and delta_ratio > trust:
+        scale = trust / max(delta_ratio, 1e-12)
+        delta = delta * scale
+        pred = pred * scale
+        residual = pred - target
+        residual_norm = residual.norm()
+        delta_ratio = trust
+        state.ftf_trust_clip_count += 1
+
+    state.metric_build_time += time.perf_counter() - start
+    _append_pure_role_value(state.ftf_fit_r2, role, r2)
+    _append_pure_role_value(state.ftf_target_norms, role, float(target_norm.detach().cpu()))
+    _append_pure_role_value(state.ftf_residual_norms, role, float(residual_norm.detach().cpu()))
+    _append_pure_role_value(state.ftf_residual_rel, role, float((residual_norm / target_norm).detach().cpu()))
+    _append_pure_role_value(state.ftf_ridge_conditions, role, float((eig[-1] / eig[0]).detach().cpu()))
+    _append_pure_role_value(state.ftf_delta_norm_ratios, role, delta_ratio)
+    state.ftf_update_count += 1
+    trust_metric = torch.ones_like(delta)
+    condition = float((eig[-1] / eig[0]).detach().cpu())
+    return delta, trust_metric, condition, float(eig[0].detach().cpu()), float(eig[-1].detach().cpu())
+
+
+def _fc_adam_direction(
+    grad: torch.Tensor,
+    layer: RBFDense,
+    name: str,
+    cfg: TrainConfig,
+    state: RuntimeState,
+    *,
+    role: str,
+) -> Tuple[torch.Tensor, torch.Tensor, float, float, float]:
+    gram = _get_sobolev_gram(
+        layer,
+        cfg,
+        state,
+        alpha=cfg.v3_alpha_geo,
+        beta=cfg.v3_beta_geo,
+        rho=cfg.v3_gram_rho,
+        device=grad.device,
+        dtype=grad.dtype,
+    )
+    chol = gram["chol"].to(device=grad.device)
+    flat = grad.reshape(-1, grad.shape[-1]).float()
+    grad_u = torch.linalg.solve_triangular(chol, flat.T, upper=False).T.reshape_as(grad).to(dtype=grad.dtype)
+    t = state.fc_adam_t.get(name, 0) + 1
+    state.fc_adam_t[name] = t
+    m = state.fc_adam_m.get(name)
+    v = state.fc_adam_v.get(name)
+    if m is None or m.shape != grad_u.shape:
+        m = torch.zeros_like(grad_u)
+        v = torch.zeros_like(grad_u)
+    beta1 = float(cfg.fc_adam_beta1)
+    beta2 = float(cfg.fc_adam_beta2)
+    m = beta1 * m + (1.0 - beta1) * grad_u
+    v = beta2 * v + (1.0 - beta2) * grad_u.square()
+    state.fc_adam_m[name] = m.detach()
+    state.fc_adam_v[name] = v.detach()
+    mhat = m / max(1e-12, 1.0 - beta1**t)
+    vhat = v / max(1e-12, 1.0 - beta2**t)
+    direction_u = -mhat / (vhat.sqrt() + float(cfg.fc_adam_eps))
+    if cfg.fc_adam_weight_decay > 0:
+        coeff_flat = layer.coeff.detach().reshape(-1, layer.coeff.shape[-1]).float()
+        u = torch.matmul(coeff_flat, chol.T)
+        direction_u = direction_u - float(cfg.fc_adam_weight_decay) * u.reshape_as(direction_u).to(direction_u.device)
+    flat_du = direction_u.reshape(-1, direction_u.shape[-1]).float()
+    direction = torch.linalg.solve_triangular(chol.T, flat_du.T, upper=True).T.reshape_as(grad).to(dtype=grad.dtype)
+    if cfg.fc_adam_sob_decay > 0:
+        direction = direction - float(cfg.fc_adam_sob_decay) * _solve_with_gram(layer.coeff.detach(), gram)
+
+    coeff_flat = layer.coeff.detach().reshape(-1, layer.coeff.shape[-1]).float()
+    u = torch.matmul(coeff_flat, chol.T)
+    recon = torch.linalg.solve_triangular(chol.T, u.T, upper=True).T
+    recon_err = float(((recon - coeff_flat).norm() / coeff_flat.norm().clamp_min(1e-12)).detach().cpu())
+    grad_back = torch.matmul(grad_u.reshape(-1, grad_u.shape[-1]).float(), chol)
+    chain_err = float(((grad_back - flat).norm() / flat.norm().clamp_min(1e-12)).detach().cpu())
+    state.fc_adam_reconstruction_errors.append(recon_err)
+    state.fc_adam_grad_chain_errors.append(chain_err)
+    _append_pure_role_value(state.fc_adam_s_conditions, role, float(gram["condition"].detach().cpu()))
+    trust_metric = _gram_diag(gram, grad).clamp_min(cfg.v3_gram_rho)
+    return direction, trust_metric, float(gram["condition"].detach().cpu()), float(gram["eig_min"].detach().cpu()), float(gram["eig_max"].detach().cpu())
+
+
+def _ftr_cg_small_direction(
+    grad: torch.Tensor,
+    layer: RBFDense,
+    name: str,
+    cfg: TrainConfig,
+    state: RuntimeState,
+    *,
+    role: str,
+) -> Tuple[torch.Tensor, torch.Tensor, float, float, float]:
+    # Small diagnostic approximation: solve a Sobolev-damped coefficient system
+    # and constrain the induced layer-output change. Full network J^T H J is
+    # intentionally not expanded unless this local diagnostic passes.
+    gram = _get_sobolev_gram(
+        layer,
+        cfg,
+        state,
+        alpha=cfg.v3_alpha_geo,
+        beta=cfg.v3_beta_geo,
+        rho=max(float(cfg.ftr_rho), 1e-8),
+        device=grad.device,
+        dtype=grad.dtype,
+    )
+    direction = -_solve_with_gram(grad, gram)
+    if layer.last_input is not None and layer.last_output is not None:
+        basis = layer.basis(layer.last_input.to(grad.device)).detach().to(dtype=direction.dtype)
+        pred = torch.einsum("bik,oik->bo", basis, direction)
+        ratio = float((pred.norm() / layer.last_output.detach().norm().clamp_min(1e-12)).detach().cpu())
+        state.ftr_predicted_change_norms.append(ratio)
+        if cfg.ftr_trust_radius > 0 and ratio > cfg.ftr_trust_radius:
+            direction = direction * (float(cfg.ftr_trust_radius) / max(ratio, 1e-12))
+    state.ftr_cg_residuals.append(0.0)
+    trust_metric = _gram_diag(gram, grad).clamp_min(float(cfg.ftr_rho))
+    return direction, trust_metric, float(gram["condition"].detach().cpu()), float(gram["eig_min"].detach().cpu()), float(gram["eig_max"].detach().cpu())
+
+
+def functional_norm_step(model: nn.Module, cfg: TrainConfig, state: RuntimeState, *, progress: float) -> None:
+    method = cfg.norm_update_method.lower().replace("-", "_")
+    if method not in {"fdiag", "functional_diag", "diag_fisher", "scalar_fdiag"}:
+        return
+    lr = float(cfg.norm_lr) * scheduled_lr_factor(
+        cfg.coeff_lr_schedule,
+        progress,
+        cfg.coeff_lr_decay_final_mult,
+        cfg.lr_decay_start_frac,
+    )
+    for name, p in norm_named_params(model):
+        if p.grad is None:
+            continue
+        g = p.grad.detach()
+        prev = state.norm_grad_sq_ema.get(name)
+        if prev is None or prev.shape != g.shape:
+            prev = torch.zeros_like(g)
+        ema = 0.95 * prev + 0.05 * g.float().square()
+        state.norm_grad_sq_ema[name] = ema.detach()
+        direction = -g / (ema.sqrt().to(dtype=g.dtype) + float(cfg.norm_rho))
+        update = lr * direction
+        with torch.no_grad():
+            p.add_(update)
+        if name not in state.norm_seen_param_names:
+            state.norm_seen_param_names.add(name)
+            state.norm_seen_param_numel += int(p.numel())
+        update_norm = float(update.norm().detach().cpu())
+        param_norm = float(p.detach().norm().detach().cpu())
+        state.norm_update_norms.append(update_norm)
+        state.norm_update_over_param.append(update_norm / max(1e-12, param_norm))
+        if name.endswith("gamma"):
+            state.norm_gamma_values.extend([float(v) for v in p.detach().flatten().float().cpu()])
+        elif name.endswith("beta"):
+            state.norm_beta_values.extend([float(v) for v in p.detach().flatten().float().cpu()])
+        p.grad = None
 
 
 def _param_group_norms(params: Sequence[nn.Parameter]) -> Tuple[float, float]:
@@ -2615,7 +4395,11 @@ def functional_coeff_step(
     if len(state.phase_trace_first20) < 20:
         state.phase_trace_first20.append(state.phase)
         state.metric_trace_first20.append(phase_metric)
-    for layer_idx, (name, p) in enumerate(coefficient_named_params(model)):
+    named_coeffs = list(coefficient_named_params(model))
+    indexed_coeffs = list(enumerate(named_coeffs))
+    if isinstance(model, PureKANClassifier) and cfg.ftf_mode.lower().replace("-", "_") in {"all_sequential", "sequential", "output_to_input"}:
+        indexed_coeffs = list(reversed(indexed_coeffs))
+    for layer_idx, (name, p) in indexed_coeffs:
         if p.grad is None:
             continue
         g = p.grad.detach()
@@ -2624,18 +4408,24 @@ def functional_coeff_step(
         elif cfg.credit_mode == "first_order":
             g = g * 0.95
 
-        pure_role = _pure_param_role(name) if isinstance(model, PureKANClassifier) else ""
+        pure_role = _pure_param_role(name, cfg) if isinstance(model, PureKANClassifier) else ""
         metric_mode = _pure_role_metric(cfg, pure_role, phase_metric) if pure_role else phase_metric
         metric_key = metric_mode.lower().replace("-", "_")
         if pure_role:
             seen = state.pure_role_metric_seen.setdefault(pure_role, [])
             if metric_mode not in seen:
                 seen.append(metric_mode)
+            if pure_role in {"shallow", "deep"}:
+                block_seen = state.pure_role_metric_seen.setdefault("block", [])
+                if metric_mode not in block_seen:
+                    block_seen.append(metric_mode)
         grid = grid_metric_diag(p, cfg).expand_as(p)
         metric = grid
         direction: torch.Tensor
         trust_metric: torch.Tensor
         metric_condition_for_role = float("nan")
+        metric_min_for_role = float("nan")
+        metric_max_for_role = float("nan")
 
         if metric_mode in {"grid", "grid_index_diag_legacy", "fixed_data", "no_grid", "pulse"}:
             if progress < cfg.warmup_frac and not cfg.gafu_v3_enabled:
@@ -2648,6 +4438,70 @@ def functional_coeff_step(
             direction = -g
             trust_metric = metric
             metric_condition_for_role = 1.0
+            metric_min_for_role = 1.0
+            metric_max_for_role = 1.0
+        elif metric_key in {"tfu_task_diag", "tfu_data_task_diag"}:
+            if not pure_role:
+                raise ValueError(f"TFU metric is only supported for PureKAN role params: {name}")
+            direction, trust_metric, metric_condition_for_role, metric_min_for_role, metric_max_for_role = (
+                _tfu_task_diag_direction(
+                    g,
+                    p,
+                    name,
+                    layers[layer_idx],
+                    cfg,
+                    state,
+                    role=pure_role,
+                    metric_mode=metric_mode,
+                )
+            )
+        elif metric_key in {"fng_right", "fng_leftdiag_right", "fng_leftfull_right", "fng_leftlowrank_right"}:
+            if not pure_role:
+                raise ValueError(f"FNG metric is only supported for PureKAN role params: {name}")
+            direction, trust_metric, metric_condition_for_role, metric_min_for_role, metric_max_for_role = _fng_direction(
+                g,
+                layers[layer_idx],
+                name,
+                cfg,
+                state,
+                role=pure_role,
+                mode=metric_key,
+            )
+        elif metric_key in {"ftf", "functional_target_fitting"}:
+            if not pure_role:
+                raise ValueError(f"FTF metric is only supported for PureKAN role params: {name}")
+            if not _ftf_role_enabled(cfg, pure_role):
+                p.grad = None
+                continue
+            direction, trust_metric, metric_condition_for_role, metric_min_for_role, metric_max_for_role = _ftf_direction(
+                layers[layer_idx],
+                name,
+                cfg,
+                state,
+                role=pure_role,
+            )
+        elif metric_key in {"fc_adam", "fcadam", "functional_coordinate_adam"}:
+            if not pure_role:
+                raise ValueError(f"FC-Adam metric is only supported for PureKAN role params: {name}")
+            direction, trust_metric, metric_condition_for_role, metric_min_for_role, metric_max_for_role = _fc_adam_direction(
+                g,
+                layers[layer_idx],
+                name,
+                cfg,
+                state,
+                role=pure_role,
+            )
+        elif metric_key in {"ftr_cg_small", "ftr", "global_fgn"}:
+            if not pure_role:
+                raise ValueError(f"FTR metric is only supported for PureKAN role params: {name}")
+            direction, trust_metric, metric_condition_for_role, metric_min_for_role, metric_max_for_role = _ftr_cg_small_direction(
+                g,
+                layers[layer_idx],
+                name,
+                cfg,
+                state,
+                role=pure_role,
+            )
         elif metric_mode in {"basis_diag_gram", "full_sobolev_gram", "diag_to_full_sobolev"} or (
             is_rational and (metric_key.startswith("rational_poly") or metric_key.startswith("rational_legendre"))
         ):
@@ -2676,6 +4530,9 @@ def functional_coeff_step(
                     metric_condition_for_role = state.fullgeo_condition
                 else:
                     metric_condition_for_role = state.metric_condition_geometry
+                if torch.is_tensor(trust_metric):
+                    metric_min_for_role = float(trust_metric.detach().float().min().cpu())
+                    metric_max_for_role = float(trust_metric.detach().float().max().cpu())
         else:
             raise ValueError(f"unknown metric_mode: {metric_mode}")
 
@@ -2692,6 +4549,28 @@ def functional_coeff_step(
             direction = cfg.momentum_mu * prev + (1.0 - cfg.momentum_mu) * direction
             state.momentum[name] = direction.detach().clone()
 
+        if pure_role and cfg.tfu_enabled and cfg.tfu_safeguard_mode.lower().replace("-", "_") not in {"", "off", "none"}:
+            interval = max(1, int(cfg.tfu_safeguard_check_interval))
+            if step_idx % interval == 0:
+                state.tfu_safeguard_check_count += 1
+                cos_raw_precond = _safe_cos(g, -direction)
+                if not math.isfinite(cos_raw_precond) or cos_raw_precond < float(cfg.tfu_safeguard_cos_min):
+                    state.tfu_safeguard_fail_count += 1
+                    fallback_grid = grid.clamp_min(cfg.rho)
+                    fallback_direction = -g / fallback_grid
+                    fallback_cos = _safe_cos(g, -fallback_direction)
+                    state.tfu_fallback_to_diag_count += 1
+                    state.tfu_fallback_by_role[pure_role] = state.tfu_fallback_by_role.get(pure_role, 0) + 1
+                    if pure_role in {"shallow", "deep"}:
+                        state.tfu_fallback_by_role["block"] = state.tfu_fallback_by_role.get("block", 0) + 1
+                    if not math.isfinite(fallback_cos) or fallback_cos < float(cfg.tfu_safeguard_cos_min):
+                        fallback_direction = -g
+                        trust_metric = torch.ones_like(p) + cfg.rho
+                        state.tfu_fallback_to_identity_count += 1
+                    else:
+                        trust_metric = fallback_grid
+                    direction = fallback_direction
+
         coeff_decay = scheduled_lr_factor(
             cfg.coeff_lr_schedule,
             progress,
@@ -2699,7 +4578,11 @@ def functional_coeff_step(
             cfg.lr_decay_start_frac,
         )
         role_lr_mult = _pure_role_lr_mult(cfg, pure_role) if pure_role else 1.0
+        if metric_key in {"ftf", "functional_target_fitting"}:
+            role_lr_mult *= _ftf_role_lr_mult(cfg, pure_role)
         lr = cfg.coeff_lr * state.coeff_lr_multiplier * coeff_decay * role_lr_mult
+        if metric_key.startswith("fng_"):
+            lr *= float(cfg.fng_step_scale)
         update = lr * direction
         raw_norm = float(g.norm().detach().cpu())
         direction_norm = float(direction.norm().detach().cpu())
@@ -2722,12 +4605,16 @@ def functional_coeff_step(
                 state.pure_seen_param_names.add(name)
                 state.pure_seen_param_numel += int(p.numel())
             update_norm = float(update.norm().detach().cpu())
-            _append_role_value(state.pure_role_update_norms, pure_role, update_norm)
-            _append_role_value(state.pure_role_update_over_param, pure_role, update_norm / max(1e-12, coeff_norm))
-            _append_role_value(state.pure_role_raw_grad_norms, pure_role, raw_norm)
-            _append_role_value(state.pure_role_precond_norms, pure_role, direction_norm)
-            _append_role_value(state.pure_role_cos_raw_precond, pure_role, _safe_cos(g, -direction))
-            _append_role_value(state.pure_role_metric_conditions, pure_role, metric_condition_for_role)
+            _append_pure_role_value(state.pure_role_update_norms, pure_role, update_norm)
+            _append_pure_role_value(state.pure_role_update_over_param, pure_role, update_norm / max(1e-12, coeff_norm))
+            _append_pure_role_value(state.pure_role_raw_grad_norms, pure_role, raw_norm)
+            _append_pure_role_value(state.pure_role_precond_norms, pure_role, direction_norm)
+            _append_pure_role_value(state.pure_role_cos_raw_precond, pure_role, _safe_cos(g, -direction))
+            _append_pure_role_value(state.pure_role_metric_conditions, pure_role, metric_condition_for_role)
+            if math.isfinite(metric_min_for_role):
+                _append_pure_role_value(state.tfu_metric_mins, pure_role, metric_min_for_role)
+            if math.isfinite(metric_max_for_role):
+                _append_pure_role_value(state.tfu_metric_maxs, pure_role, metric_max_for_role)
 
         with torch.no_grad():
             p.add_(update)
@@ -3450,7 +5337,20 @@ def build_train_config_for_method(
         cfg.branch_schedule = "none"
         cfg.metric_mode = "grid"
         cfg.unified_optimizer_mode = "adamw"
-    elif method_key in {"purekan_ufull", "pure_kan_ufull"}:
+    elif method_key in {
+        "purekan_ufull",
+        "pure_kan_ufull",
+        "purekan_tfu",
+        "pure_kan_tfu",
+        "purekan_fng",
+        "pure_kan_fng",
+        "purekan_ftf",
+        "pure_kan_ftf",
+        "purekan_fc_adam",
+        "pure_kan_fc_adam",
+        "purekan_ftr",
+        "pure_kan_ftr",
+    }:
         cfg.method = method
         cfg.model_type = "pure_kan"
         cfg.alpha_mode = "fixed1"
@@ -3468,6 +5368,38 @@ def build_train_config_for_method(
         cfg.branch_max_active_frac = 0.0
         cfg.branch_final_scale = 1.0
         cfg.unified_optimizer_mode = "hybrid"
+        if method_key in {"purekan_tfu", "pure_kan_tfu"}:
+            cfg.tfu_enabled = True
+            cfg.pure_input_metric = "tfu_data_task_diag"
+            cfg.pure_shallow_metric = "tfu_data_task_diag"
+            cfg.pure_deep_metric = "tfu_task_diag"
+            cfg.pure_output_metric = "tfu_task_diag"
+        if method_key in {"purekan_fng", "pure_kan_fng"}:
+            cfg.fng_enabled = True
+            cfg.pure_input_metric = "fng_leftdiag_right"
+            cfg.pure_shallow_metric = "fng_leftdiag_right"
+            cfg.pure_deep_metric = "fng_leftdiag_right"
+            cfg.pure_output_metric = "fng_leftdiag_right"
+        if method_key in {"purekan_ftf", "pure_kan_ftf"}:
+            cfg.ftf_enabled = True
+            cfg.coeff_lr = 1.0
+            cfg.trust_radius = 0.0
+            cfg.pure_input_metric = "ftf"
+            cfg.pure_shallow_metric = "ftf"
+            cfg.pure_deep_metric = "ftf"
+            cfg.pure_output_metric = "ftf"
+        if method_key in {"purekan_fc_adam", "pure_kan_fc_adam"}:
+            cfg.fc_adam_enabled = True
+            cfg.pure_input_metric = "fc_adam"
+            cfg.pure_shallow_metric = "fc_adam"
+            cfg.pure_deep_metric = "fc_adam"
+            cfg.pure_output_metric = "fc_adam"
+        if method_key in {"purekan_ftr", "pure_kan_ftr"}:
+            cfg.ftr_enabled = True
+            cfg.pure_input_metric = "ftr_cg_small"
+            cfg.pure_shallow_metric = "ftr_cg_small"
+            cfg.pure_deep_metric = "ftr_cg_small"
+            cfg.pure_output_metric = "ftr_cg_small"
     elif method_key in {"geometry", "geometry_current", "current_geometry_aware", "analyticadj"}:
         cfg.method = method
         cfg.metric_mode = "grid"
@@ -3628,6 +5560,7 @@ def train_one(cfg: TrainConfig) -> Dict[str, Any]:
             basis_count=cfg.basis_count,
             alpha_init=cfg.alpha_init,
             alpha_mode=cfg.alpha_mode,
+            norm_mode=cfg.pure_norm_mode,
         ).to(device)
     elif cfg.model_type.lower().replace("-", "_") == "rational_dgkan" or method_key in {"rational_adamw", "rational_dgkan_adamw", "kat_adamw"}:
         model = RationalDGKANClassifier(
@@ -3676,6 +5609,14 @@ def train_one(cfg: TrainConfig) -> Dict[str, Any]:
     uo_mode = cfg.unified_optimizer_mode.lower().replace("-", "_")
     coeff_params = coefficient_named_params(model) if functional_model else []
     rest_params = non_coefficient_params(model) if functional_model else list(model.parameters())
+    norm_functional = (
+        isinstance(model, PureKANClassifier)
+        and cfg.norm_update_method.lower().replace("-", "_")
+        in {"fdiag", "functional_diag", "diag_fisher", "scalar_fdiag"}
+    )
+    norm_param_ids = {id(p) for _, p in norm_named_params(model)} if norm_functional else set()
+    if norm_param_ids:
+        rest_params = [p for p in rest_params if id(p) not in norm_param_ids]
     if isinstance(model, RationalDGKANClassifier) and cfg.rational_branch_functional:
         branch_linear_ids = {
             id(param)
@@ -3714,7 +5655,8 @@ def train_one(cfg: TrainConfig) -> Dict[str, Any]:
         opt = None
         rest_opt = torch.optim.AdamW(rest_params, lr=cfg.rest_lr, weight_decay=cfg.rest_weight_decay)
     elif method_key in ADAMW_METHOD_KEYS:
-        opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+        adam_params = [p for p in model.parameters() if id(p) not in norm_param_ids]
+        opt = torch.optim.AdamW(adam_params, lr=cfg.lr, weight_decay=cfg.weight_decay)
         rest_opt = None
     else:
         opt = None
@@ -3839,13 +5781,16 @@ def train_one(cfg: TrainConfig) -> Dict[str, Any]:
                     rest_opt.step()
                 assert isinstance(model, DGKANClassifier)
                 afu_nonkan_step(model, cfg, state, xb=xb, progress=progress)
+                functional_norm_step(model, cfg, state, progress=progress)
                 functional_coeff_step(model, cfg, state, step_idx=step_idx, total_steps=total_steps)
             elif opt is not None:
                 opt.step()
+                functional_norm_step(model, cfg, state, progress=progress)
             else:
                 assert functional_model
                 if rest_opt is not None:
                     rest_opt.step()
+                functional_norm_step(model, cfg, state, progress=progress)
                 functional_coeff_step(model, cfg, state, step_idx=step_idx, total_steps=total_steps)
             branch_ratios.append(float(branch_ratio.detach().cpu()))
             data_lambdas.append(state.last_data_lambda)
@@ -4033,15 +5978,42 @@ def train_one(cfg: TrainConfig) -> Dict[str, Any]:
     uo_bad_step_rate = state.uo_bad_step_count / max(1, state.uo_update_count)
 
     coeff_param_ids = {id(p) for p in coeff_param_values}
+    norm_params_named = norm_named_params(model)
+    norm_param_ids_all = {id(p) for _, p in norm_params_named}
+    norm_param_numel_total = sum(p.numel() for _, p in norm_params_named if p.requires_grad)
+    functional_norm_update = cfg.norm_update_method.lower().replace("-", "_") in {
+        "fdiag",
+        "functional_diag",
+        "diag_fisher",
+        "scalar_fdiag",
+    }
     coeff_names = [name for name, _ in coeff_params]
     learnable_total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     learnable_kan_params = sum(p.numel() for _, p in coeff_params if p.requires_grad)
-    learnable_nonkan_params = sum(
+    learnable_nonkan_raw_params = sum(
         p.numel() for p in model.parameters() if p.requires_grad and id(p) not in coeff_param_ids
     )
+    learnable_nonkan_params = learnable_nonkan_raw_params
+    if isinstance(model, PureKANClassifier) and functional_norm_update:
+        learnable_nonkan_params = max(0, learnable_nonkan_raw_params - norm_param_numel_total)
     coeff_param_names_hash = hashlib.md5("|".join(sorted(coeff_names)).encode("utf-8")).hexdigest()[:12]
     coeff_param_numel_total = sum(p.numel() for _, p in coeff_params if p.requires_grad)
     coeff_param_seen_ratio = state.pure_seen_param_numel / max(1, coeff_param_numel_total) if isinstance(model, PureKANClassifier) else float("nan")
+    norm_param_seen_ratio = (
+        state.norm_seen_param_numel / max(1, norm_param_numel_total)
+        if isinstance(model, PureKANClassifier) and norm_param_numel_total > 0
+        else float("nan")
+    )
+    if isinstance(model, PureKANClassifier):
+        for name, p in norm_params_named:
+            if name.endswith("gamma"):
+                state.norm_gamma_values.extend([float(v) for v in p.detach().flatten().float().cpu()])
+            elif name.endswith("beta"):
+                state.norm_beta_values.extend([float(v) for v in p.detach().flatten().float().cpu()])
+    seen_names = set(state.pure_seen_param_names)
+    input_seen = int(any(name.startswith("input_kan.") for name in seen_names))
+    block_seen = int(any(name.startswith("blocks.") for name in seen_names))
+    output_seen = int(any(name.startswith("output_kan.") for name in seen_names))
 
     def _state_mb_for_optimizer(opt_obj: Optional[torch.optim.Optimizer], *, coeff: bool) -> float:
         if opt_obj is None:
@@ -4152,6 +6124,23 @@ def train_one(cfg: TrainConfig) -> Dict[str, Any]:
         "depth": cfg.depth,
         "basis_count": cfg.basis_count,
         "model_type": cfg.model_type,
+        "norm_mode": cfg.pure_norm_mode if isinstance(model, PureKANClassifier) else "",
+        "pure_norm_mode": cfg.pure_norm_mode if isinstance(model, PureKANClassifier) else "",
+        "norm_update_method": cfg.norm_update_method if isinstance(model, PureKANClassifier) else "",
+        "optimizer_family": "fng"
+        if cfg.fng_enabled
+        else "ftf"
+        if cfg.ftf_enabled
+        else "fc_adam"
+        if cfg.fc_adam_enabled
+        else "ftr"
+        if cfg.ftr_enabled
+        else "tfu"
+        if cfg.tfu_enabled
+        else "sobolev"
+        if cfg.gafu_v3_enabled and method_key not in ADAMW_METHOD_KEYS
+        else "adamw",
+        "fng_mode": cfg.fng_mode,
         "kan_primitive_type": "rational"
         if isinstance(model, RationalDGKANClassifier)
         else "rbf"
@@ -4160,9 +6149,26 @@ def train_one(cfg: TrainConfig) -> Dict[str, Any]:
         "learnable_total_params": learnable_total_params,
         "learnable_kan_params": learnable_kan_params,
         "learnable_nonkan_params": learnable_nonkan_params,
+        "learnable_nonkan_raw_params": learnable_nonkan_raw_params,
         "coeff_param_count": len(coeff_params),
         "coeff_param_numel_total": coeff_param_numel_total,
         "coeff_param_seen_ratio": coeff_param_seen_ratio,
+        "functional_param_coverage": coeff_param_seen_ratio,
+        "input_kan_coeff_seen": input_seen if isinstance(model, PureKANClassifier) else float("nan"),
+        "block_kan_coeff_seen": block_seen if isinstance(model, PureKANClassifier) else float("nan"),
+        "output_kan_coeff_seen": output_seen if isinstance(model, PureKANClassifier) else float("nan"),
+        "norm_param_count": norm_param_numel_total if isinstance(model, PureKANClassifier) else 0,
+        "norm_param_coverage": norm_param_seen_ratio,
+        "norm_update_norm": _mean(state.norm_update_norms),
+        "norm_update_over_param": _mean(state.norm_update_over_param),
+        "norm_gamma_mean": float(np.mean(state.norm_gamma_values)) if state.norm_gamma_values else float("nan"),
+        "norm_gamma_std": float(np.std(state.norm_gamma_values)) if state.norm_gamma_values else float("nan"),
+        "norm_gamma_min": float(np.min(state.norm_gamma_values)) if state.norm_gamma_values else float("nan"),
+        "norm_gamma_max": float(np.max(state.norm_gamma_values)) if state.norm_gamma_values else float("nan"),
+        "norm_beta_mean": float(np.mean(state.norm_beta_values)) if state.norm_beta_values else float("nan"),
+        "norm_beta_std": float(np.std(state.norm_beta_values)) if state.norm_beta_values else float("nan"),
+        "norm_beta_min": float(np.min(state.norm_beta_values)) if state.norm_beta_values else float("nan"),
+        "norm_beta_max": float(np.max(state.norm_beta_values)) if state.norm_beta_values else float("nan"),
         "coeff_param_names_hash": coeff_param_names_hash,
         "coeff_param_names": "|".join(coeff_names[:64]),
         "purekan_nonkan_param_count": learnable_nonkan_params if isinstance(model, PureKANClassifier) else float("nan"),
@@ -4226,14 +6232,39 @@ def train_one(cfg: TrainConfig) -> Dict[str, Any]:
         "metric_active_seen": "|".join(sorted(k for k in state.metric_seen_counts if k == cfg.v3_metric_active)),
         "metric_geometry_seen": "|".join(sorted(k for k in state.metric_seen_counts if k == cfg.v3_metric_geometry)),
         "input_metric_mode_seen": "|".join(state.pure_role_metric_seen.get("input", [])),
+        "shallow_metric_mode_seen": "|".join(state.pure_role_metric_seen.get("shallow", [])),
+        "deep_metric_mode_seen": "|".join(state.pure_role_metric_seen.get("deep", [])),
         "block_metric_mode_seen": "|".join(state.pure_role_metric_seen.get("block", [])),
         "output_metric_mode_seen": "|".join(state.pure_role_metric_seen.get("output", [])),
         "pure_input_metric": cfg.pure_input_metric,
+        "pure_shallow_metric": cfg.pure_shallow_metric,
+        "pure_deep_metric": cfg.pure_deep_metric,
         "pure_block_metric": cfg.pure_block_metric,
         "pure_output_metric": cfg.pure_output_metric,
         "pure_input_lr_mult": cfg.pure_input_lr_mult,
+        "pure_shallow_lr_mult": cfg.pure_shallow_lr_mult,
+        "pure_deep_lr_mult": cfg.pure_deep_lr_mult,
         "pure_block_lr_mult": cfg.pure_block_lr_mult,
         "pure_output_lr_mult": cfg.pure_output_lr_mult,
+        "tfu_enabled": int(cfg.tfu_enabled),
+        "tfu_sob_lambda": cfg.tfu_sob_lambda,
+        "tfu_input_sob_lambda": cfg.tfu_input_sob_lambda,
+        "tfu_shallow_sob_lambda": cfg.tfu_shallow_sob_lambda,
+        "tfu_deep_sob_lambda": cfg.tfu_deep_sob_lambda,
+        "tfu_output_sob_lambda": cfg.tfu_output_sob_lambda,
+        "tfu_rho": cfg.tfu_rho,
+        "tfu_task_ema_beta": cfg.tfu_task_ema_beta,
+        "tfu_safeguard_mode": cfg.tfu_safeguard_mode,
+        "tfu_safeguard_check_count": state.tfu_safeguard_check_count,
+        "tfu_safeguard_fail_count": state.tfu_safeguard_fail_count,
+        "tfu_safeguard_fail_rate": state.tfu_safeguard_fail_count / max(1, state.tfu_safeguard_check_count),
+        "tfu_fallback_to_diag_count": state.tfu_fallback_to_diag_count,
+        "tfu_fallback_to_identity_count": state.tfu_fallback_to_identity_count,
+        "tfu_fallback_input_count": state.tfu_fallback_by_role.get("input", 0),
+        "tfu_fallback_shallow_count": state.tfu_fallback_by_role.get("shallow", 0),
+        "tfu_fallback_deep_count": state.tfu_fallback_by_role.get("deep", 0),
+        "tfu_fallback_block_count": state.tfu_fallback_by_role.get("block", 0),
+        "tfu_fallback_output_count": state.tfu_fallback_by_role.get("output", 0),
         "v3_phase_switch_step": state.branch_switch_step,
         "v3_phase_switch_epoch": state.branch_switch_step / max(1, math.ceil(len(bundle.x_train) / cfg.batch_size)),
         "v3_phase_switch_reason": state.branch_switch_reason,
@@ -4271,23 +6302,122 @@ def train_one(cfg: TrainConfig) -> Dict[str, Any]:
         "trust_update_over_coeff_norm_mean": update_over_coeff_mean,
         "trust_update_over_coeff_norm_p95": update_over_coeff_p95,
         "pure_input_update_norm": _role_stat(state.pure_role_update_norms, "input"),
+        "pure_shallow_update_norm_mean": _role_stat(state.pure_role_update_norms, "shallow"),
+        "pure_deep_update_norm_mean": _role_stat(state.pure_role_update_norms, "deep"),
         "pure_block_update_norm_mean": _role_stat(state.pure_role_update_norms, "block"),
         "pure_output_update_norm": _role_stat(state.pure_role_update_norms, "output"),
         "pure_input_update_over_param": _role_stat(state.pure_role_update_over_param, "input"),
+        "pure_shallow_update_over_param_mean": _role_stat(state.pure_role_update_over_param, "shallow"),
+        "pure_deep_update_over_param_mean": _role_stat(state.pure_role_update_over_param, "deep"),
         "pure_block_update_over_param_mean": _role_stat(state.pure_role_update_over_param, "block"),
         "pure_output_update_over_param": _role_stat(state.pure_role_update_over_param, "output"),
         "pure_input_raw_grad_norm": _role_stat(state.pure_role_raw_grad_norms, "input"),
+        "pure_shallow_raw_grad_norm_mean": _role_stat(state.pure_role_raw_grad_norms, "shallow"),
+        "pure_deep_raw_grad_norm_mean": _role_stat(state.pure_role_raw_grad_norms, "deep"),
         "pure_block_raw_grad_norm_mean": _role_stat(state.pure_role_raw_grad_norms, "block"),
         "pure_output_raw_grad_norm": _role_stat(state.pure_role_raw_grad_norms, "output"),
         "pure_input_precond_norm": _role_stat(state.pure_role_precond_norms, "input"),
+        "pure_shallow_precond_norm_mean": _role_stat(state.pure_role_precond_norms, "shallow"),
+        "pure_deep_precond_norm_mean": _role_stat(state.pure_role_precond_norms, "deep"),
         "pure_block_precond_norm_mean": _role_stat(state.pure_role_precond_norms, "block"),
         "pure_output_precond_norm": _role_stat(state.pure_role_precond_norms, "output"),
         "pure_input_cos_raw_precond": _role_stat(state.pure_role_cos_raw_precond, "input", float("nan")),
+        "pure_shallow_cos_raw_precond_mean": _role_stat(state.pure_role_cos_raw_precond, "shallow", float("nan")),
+        "pure_deep_cos_raw_precond_mean": _role_stat(state.pure_role_cos_raw_precond, "deep", float("nan")),
         "pure_block_cos_raw_precond_mean": _role_stat(state.pure_role_cos_raw_precond, "block", float("nan")),
         "pure_output_cos_raw_precond": _role_stat(state.pure_role_cos_raw_precond, "output", float("nan")),
         "pure_input_metric_condition": _role_stat(state.pure_role_metric_conditions, "input", float("nan")),
+        "pure_shallow_metric_condition_mean": _role_stat(state.pure_role_metric_conditions, "shallow", float("nan")),
+        "pure_deep_metric_condition_mean": _role_stat(state.pure_role_metric_conditions, "deep", float("nan")),
         "pure_block_metric_condition_mean": _role_stat(state.pure_role_metric_conditions, "block", float("nan")),
         "pure_output_metric_condition": _role_stat(state.pure_role_metric_conditions, "output", float("nan")),
+        "tfu_input_metric_min_mean": _role_stat(state.tfu_metric_mins, "input", float("nan")),
+        "tfu_shallow_metric_min_mean": _role_stat(state.tfu_metric_mins, "shallow", float("nan")),
+        "tfu_deep_metric_min_mean": _role_stat(state.tfu_metric_mins, "deep", float("nan")),
+        "tfu_block_metric_min_mean": _role_stat(state.tfu_metric_mins, "block", float("nan")),
+        "tfu_output_metric_min_mean": _role_stat(state.tfu_metric_mins, "output", float("nan")),
+        "tfu_input_metric_max_mean": _role_stat(state.tfu_metric_maxs, "input", float("nan")),
+        "tfu_shallow_metric_max_mean": _role_stat(state.tfu_metric_maxs, "shallow", float("nan")),
+        "tfu_deep_metric_max_mean": _role_stat(state.tfu_metric_maxs, "deep", float("nan")),
+        "tfu_block_metric_max_mean": _role_stat(state.tfu_metric_maxs, "block", float("nan")),
+        "tfu_output_metric_max_mean": _role_stat(state.tfu_metric_maxs, "output", float("nan")),
+        "fng_enabled": int(cfg.fng_enabled),
+        "fng_sob_lambda": cfg.fng_sob_lambda,
+        "fng_rho_a": cfg.fng_rho_a,
+        "fng_rho_c": cfg.fng_rho_c,
+        "fng_step_scale": cfg.fng_step_scale,
+        "fng_direction_momentum_beta": cfg.fng_direction_momentum_beta,
+        "fng_metric_build_time_ms": 1000.0 * state.fng_metric_build_time / max(1, step_idx),
+        "fng_metric_solve_time_ms": 1000.0 * state.fng_metric_solve_time / max(1, step_idx),
+        "fng_fallback_rate": state.fng_fallback_count / max(1, state.fng_update_count),
+        "fng_bad_step_rate": state.fng_bad_step_count / max(1, state.fng_update_count),
+        "fng_direction_momentum_norm": _mean(state.fng_direction_momentum_norms),
+        "fng_direction_momentum_cos_current": _mean(state.fng_direction_momentum_cos_current, float("nan")),
+        "fng_input_A_phi_condition": _role_stat(state.fng_a_conditions, "input", float("nan")),
+        "fng_shallow_A_phi_condition": _role_stat(state.fng_a_conditions, "shallow", float("nan")),
+        "fng_deep_A_phi_condition": _role_stat(state.fng_a_conditions, "deep", float("nan")),
+        "fng_block_A_phi_condition": _role_stat(state.fng_a_conditions, "block", float("nan")),
+        "fng_output_A_phi_condition": _role_stat(state.fng_a_conditions, "output", float("nan")),
+        "fng_input_C_condition": _role_stat(state.fng_c_conditions, "input", float("nan")),
+        "fng_shallow_C_condition": _role_stat(state.fng_c_conditions, "shallow", float("nan")),
+        "fng_deep_C_condition": _role_stat(state.fng_c_conditions, "deep", float("nan")),
+        "fng_block_C_condition": _role_stat(state.fng_c_conditions, "block", float("nan")),
+        "fng_output_C_condition": _role_stat(state.fng_c_conditions, "output", float("nan")),
+        "fng_input_combined_condition": _role_stat(state.fng_combined_conditions, "input", float("nan")),
+        "fng_shallow_combined_condition": _role_stat(state.fng_combined_conditions, "shallow", float("nan")),
+        "fng_deep_combined_condition": _role_stat(state.fng_combined_conditions, "deep", float("nan")),
+        "fng_block_combined_condition": _role_stat(state.fng_combined_conditions, "block", float("nan")),
+        "fng_output_combined_condition": _role_stat(state.fng_combined_conditions, "output", float("nan")),
+        "fng_input_A_phi_effective_rank": _role_stat(state.fng_effective_rank_a, "input", float("nan")),
+        "fng_block_A_phi_effective_rank": _role_stat(state.fng_effective_rank_a, "block", float("nan")),
+        "fng_output_A_phi_effective_rank": _role_stat(state.fng_effective_rank_a, "output", float("nan")),
+        "fng_input_C_effective_rank": _role_stat(state.fng_effective_rank_c, "input", float("nan")),
+        "fng_block_C_effective_rank": _role_stat(state.fng_effective_rank_c, "block", float("nan")),
+        "fng_output_C_effective_rank": _role_stat(state.fng_effective_rank_c, "output", float("nan")),
+        "ftf_enabled": int(cfg.ftf_enabled),
+        "ftf_mode": cfg.ftf_mode,
+        "ftf_tau": cfg.ftf_tau,
+        "ftf_sob_lambda": cfg.ftf_sob_lambda,
+        "ftf_ridge": cfg.ftf_ridge,
+        "ftf_activation_trust": cfg.ftf_activation_trust,
+        "ftf_trust_clip_rate": state.ftf_trust_clip_count / max(1, state.ftf_update_count),
+        "ftf_input_fit_R2": _role_stat(state.ftf_fit_r2, "input", float("nan")),
+        "ftf_block_fit_R2_mean": _role_stat(state.ftf_fit_r2, "block", float("nan")),
+        "ftf_output_fit_R2": _role_stat(state.ftf_fit_r2, "output", float("nan")),
+        "ftf_fit_R2_mean": _mean([v for vals in state.ftf_fit_r2.values() for v in vals], float("nan")),
+        "ftf_input_target_norm": _role_stat(state.ftf_target_norms, "input", float("nan")),
+        "ftf_block_target_norm_mean": _role_stat(state.ftf_target_norms, "block", float("nan")),
+        "ftf_output_target_norm": _role_stat(state.ftf_target_norms, "output", float("nan")),
+        "ftf_input_residual_rel": _role_stat(state.ftf_residual_rel, "input", float("nan")),
+        "ftf_block_residual_rel_mean": _role_stat(state.ftf_residual_rel, "block", float("nan")),
+        "ftf_output_residual_rel": _role_stat(state.ftf_residual_rel, "output", float("nan")),
+        "ftf_input_ridge_condition": _role_stat(state.ftf_ridge_conditions, "input", float("nan")),
+        "ftf_block_ridge_condition_mean": _role_stat(state.ftf_ridge_conditions, "block", float("nan")),
+        "ftf_output_ridge_condition": _role_stat(state.ftf_ridge_conditions, "output", float("nan")),
+        "ftf_input_delta_h_norm_ratio": _role_stat(state.ftf_delta_norm_ratios, "input", float("nan")),
+        "ftf_block_delta_h_norm_ratio_mean": _role_stat(state.ftf_delta_norm_ratios, "block", float("nan")),
+        "ftf_output_delta_logit_norm_ratio": _role_stat(state.ftf_delta_norm_ratios, "output", float("nan")),
+        "ftf_max_layer_delta_norm_ratio": max(
+            [float(v) for vals in state.ftf_delta_norm_ratios.values() for v in vals if math.isfinite(float(v))]
+            or [float("nan")]
+        ),
+        "fc_adam_enabled": int(cfg.fc_adam_enabled),
+        "fc_adam_beta1": cfg.fc_adam_beta1,
+        "fc_adam_beta2": cfg.fc_adam_beta2,
+        "fc_adam_weight_decay": cfg.fc_adam_weight_decay,
+        "fc_adam_sob_decay": cfg.fc_adam_sob_decay,
+        "fc_adam_reconstruction_error": _mean(state.fc_adam_reconstruction_errors, float("nan")),
+        "fc_adam_grad_chain_error": _mean(state.fc_adam_grad_chain_errors, float("nan")),
+        "fc_adam_input_s_condition": _role_stat(state.fc_adam_s_conditions, "input", float("nan")),
+        "fc_adam_block_s_condition_mean": _role_stat(state.fc_adam_s_conditions, "block", float("nan")),
+        "fc_adam_output_s_condition": _role_stat(state.fc_adam_s_conditions, "output", float("nan")),
+        "ftr_enabled": int(cfg.ftr_enabled),
+        "ftr_cg_iters": cfg.ftr_cg_iters,
+        "ftr_rho": cfg.ftr_rho,
+        "ftr_sob_lambda": cfg.ftr_sob_lambda,
+        "ftr_trust_radius": cfg.ftr_trust_radius,
+        "ftr_cg_residual_final": _mean(state.ftr_cg_residuals, float("nan")),
+        "ftr_predicted_change_norm": _mean(state.ftr_predicted_change_norms, float("nan")),
         "rational_num_update_norm_mean": _mean(state.rational_num_update_norms),
         "rational_den_update_norm_mean": _mean(state.rational_den_update_norms),
         "rational_num_den_update_ratio_mean": _mean(state.rational_num_den_update_ratio),
@@ -4709,11 +6839,30 @@ def add_failure_types(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return compared
 
 
+class _RejectFakeDataAction(argparse.Action):
+    def __init__(self, option_strings: Sequence[str], dest: str, **kwargs: Any) -> None:
+        super().__init__(option_strings=option_strings, dest=dest, nargs=0, **kwargs)
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: Any,
+        option_string: str | None = None,
+    ) -> None:
+        parser.error("--allow-fake-data is disabled in no-proxy mode; use real datasets only.")
+
+
 def add_common_train_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--device", default="auto")
     p.add_argument("--data-root", type=Path, default=Path("data"))
     p.add_argument("--no-download", action="store_true")
-    p.add_argument("--allow-fake-data", action="store_true")
+    p.add_argument(
+        "--allow-fake-data",
+        action=_RejectFakeDataAction,
+        default=False,
+        help=argparse.SUPPRESS,
+    )
     p.add_argument("--train-size", type=int, default=6000)
     p.add_argument("--val-size", type=int, default=1000)
     p.add_argument("--test-size", type=int, default=1000)
@@ -4764,14 +6913,74 @@ def add_common_train_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--afu-bias-rho", type=float, default=1e-2)
     p.add_argument("--afu-max-update-ratio", type=float, default=0.05)
     p.add_argument("--pure-input-metric", default="phase")
+    p.add_argument("--pure-shallow-metric", default="phase")
+    p.add_argument("--pure-deep-metric", default="phase")
     p.add_argument("--pure-block-metric", default="phase")
     p.add_argument("--pure-output-metric", default="phase")
     p.add_argument("--pure-input-lr-mult", type=float, default=1.0)
+    p.add_argument("--pure-shallow-lr-mult", type=float, default=1.0)
+    p.add_argument("--pure-deep-lr-mult", type=float, default=1.0)
     p.add_argument("--pure-block-lr-mult", type=float, default=1.0)
     p.add_argument("--pure-output-lr-mult", type=float, default=1.0)
     p.add_argument("--pure-input-trust-radius", type=float, default=0.0)
+    p.add_argument("--pure-shallow-trust-radius", type=float, default=0.0)
+    p.add_argument("--pure-deep-trust-radius", type=float, default=0.0)
     p.add_argument("--pure-block-trust-radius", type=float, default=0.0)
     p.add_argument("--pure-output-trust-radius", type=float, default=0.0)
+    p.add_argument("--pure-norm-mode", default="fixed")
+    p.add_argument("--norm-update-method", default="none")
+    p.add_argument("--norm-lr", type=float, default=0.01)
+    p.add_argument("--norm-rho", type=float, default=1e-3)
+    p.add_argument("--tfu-enabled", action="store_true")
+    p.add_argument("--tfu-sob-lambda", type=float, default=0.03)
+    p.add_argument("--tfu-input-sob-lambda", type=float, default=-1.0)
+    p.add_argument("--tfu-shallow-sob-lambda", type=float, default=-1.0)
+    p.add_argument("--tfu-deep-sob-lambda", type=float, default=-1.0)
+    p.add_argument("--tfu-output-sob-lambda", type=float, default=-1.0)
+    p.add_argument("--tfu-rho", type=float, default=1e-3)
+    p.add_argument("--tfu-task-ema-beta", type=float, default=0.95)
+    p.add_argument("--tfu-metric-clamp-min", type=float, default=0.05)
+    p.add_argument("--tfu-metric-clamp-max", type=float, default=20.0)
+    p.add_argument("--tfu-safeguard-mode", default="off")
+    p.add_argument("--tfu-safeguard-cos-min", type=float, default=0.05)
+    p.add_argument("--tfu-safeguard-check-interval", type=int, default=1)
+    p.add_argument("--fng-enabled", action="store_true")
+    p.add_argument("--fng-mode", default="none")
+    p.add_argument("--fng-sob-lambda", type=float, default=0.02)
+    p.add_argument("--fng-input-sob-lambda", type=float, default=-1.0)
+    p.add_argument("--fng-shallow-sob-lambda", type=float, default=-1.0)
+    p.add_argument("--fng-deep-sob-lambda", type=float, default=-1.0)
+    p.add_argument("--fng-output-sob-lambda", type=float, default=-1.0)
+    p.add_argument("--fng-rho-a", type=float, default=1e-3)
+    p.add_argument("--fng-rho-c", type=float, default=1e-2)
+    p.add_argument("--fng-left-ema-beta", type=float, default=0.95)
+    p.add_argument("--fng-right-ema-beta", type=float, default=0.95)
+    p.add_argument("--fng-lowrank", type=int, default=8)
+    p.add_argument("--fng-direction-momentum-beta", type=float, default=0.0)
+    p.add_argument("--fng-metric-normalized-momentum", action="store_true")
+    p.add_argument("--fng-step-scale", type=float, default=1.0)
+    p.add_argument("--ftf-enabled", action="store_true")
+    p.add_argument("--ftf-mode", default="none")
+    p.add_argument("--ftf-tau", type=float, default=0.10)
+    p.add_argument("--ftf-sob-lambda", type=float, default=1e-3)
+    p.add_argument("--ftf-ridge", type=float, default=1e-2)
+    p.add_argument("--ftf-credit-normalize", action="store_true", default=True)
+    p.add_argument("--ftf-no-credit-normalize", action="store_false", dest="ftf_credit_normalize")
+    p.add_argument("--ftf-activation-trust", type=float, default=0.20)
+    p.add_argument("--ftf-output-lr-mult", type=float, default=1.0)
+    p.add_argument("--ftf-block-lr-mult", type=float, default=1.0)
+    p.add_argument("--ftf-input-lr-mult", type=float, default=1.0)
+    p.add_argument("--fc-adam-enabled", action="store_true")
+    p.add_argument("--fc-adam-beta1", type=float, default=0.9)
+    p.add_argument("--fc-adam-beta2", type=float, default=0.999)
+    p.add_argument("--fc-adam-eps", type=float, default=1e-8)
+    p.add_argument("--fc-adam-weight-decay", type=float, default=0.0)
+    p.add_argument("--fc-adam-sob-decay", type=float, default=0.0)
+    p.add_argument("--ftr-enabled", action="store_true")
+    p.add_argument("--ftr-cg-iters", type=int, default=5)
+    p.add_argument("--ftr-rho", type=float, default=1e-2)
+    p.add_argument("--ftr-sob-lambda", type=float, default=1e-4)
+    p.add_argument("--ftr-trust-radius", type=float, default=0.10)
     p.add_argument("--continue-on-error", action="store_true")
 
 
@@ -4831,14 +7040,73 @@ def config_from_args(args: argparse.Namespace, dataset: str, method: str, seed: 
         "afu_bias_rho": args.afu_bias_rho,
         "afu_max_update_ratio": args.afu_max_update_ratio,
         "pure_input_metric": args.pure_input_metric,
+        "pure_shallow_metric": args.pure_shallow_metric,
+        "pure_deep_metric": args.pure_deep_metric,
         "pure_block_metric": args.pure_block_metric,
         "pure_output_metric": args.pure_output_metric,
         "pure_input_lr_mult": args.pure_input_lr_mult,
+        "pure_shallow_lr_mult": args.pure_shallow_lr_mult,
+        "pure_deep_lr_mult": args.pure_deep_lr_mult,
         "pure_block_lr_mult": args.pure_block_lr_mult,
         "pure_output_lr_mult": args.pure_output_lr_mult,
         "pure_input_trust_radius": args.pure_input_trust_radius,
+        "pure_shallow_trust_radius": args.pure_shallow_trust_radius,
+        "pure_deep_trust_radius": args.pure_deep_trust_radius,
         "pure_block_trust_radius": args.pure_block_trust_radius,
         "pure_output_trust_radius": args.pure_output_trust_radius,
+        "pure_norm_mode": args.pure_norm_mode,
+        "norm_update_method": args.norm_update_method,
+        "norm_lr": args.norm_lr,
+        "norm_rho": args.norm_rho,
+        "tfu_enabled": args.tfu_enabled,
+        "tfu_sob_lambda": args.tfu_sob_lambda,
+        "tfu_input_sob_lambda": args.tfu_input_sob_lambda,
+        "tfu_shallow_sob_lambda": args.tfu_shallow_sob_lambda,
+        "tfu_deep_sob_lambda": args.tfu_deep_sob_lambda,
+        "tfu_output_sob_lambda": args.tfu_output_sob_lambda,
+        "tfu_rho": args.tfu_rho,
+        "tfu_task_ema_beta": args.tfu_task_ema_beta,
+        "tfu_metric_clamp_min": args.tfu_metric_clamp_min,
+        "tfu_metric_clamp_max": args.tfu_metric_clamp_max,
+        "tfu_safeguard_mode": args.tfu_safeguard_mode,
+        "tfu_safeguard_cos_min": args.tfu_safeguard_cos_min,
+        "tfu_safeguard_check_interval": args.tfu_safeguard_check_interval,
+        "fng_enabled": args.fng_enabled,
+        "fng_mode": args.fng_mode,
+        "fng_sob_lambda": args.fng_sob_lambda,
+        "fng_input_sob_lambda": args.fng_input_sob_lambda,
+        "fng_shallow_sob_lambda": args.fng_shallow_sob_lambda,
+        "fng_deep_sob_lambda": args.fng_deep_sob_lambda,
+        "fng_output_sob_lambda": args.fng_output_sob_lambda,
+        "fng_rho_a": args.fng_rho_a,
+        "fng_rho_c": args.fng_rho_c,
+        "fng_left_ema_beta": args.fng_left_ema_beta,
+        "fng_right_ema_beta": args.fng_right_ema_beta,
+        "fng_lowrank": args.fng_lowrank,
+        "fng_direction_momentum_beta": args.fng_direction_momentum_beta,
+        "fng_metric_normalized_momentum": args.fng_metric_normalized_momentum,
+        "fng_step_scale": args.fng_step_scale,
+        "ftf_enabled": args.ftf_enabled,
+        "ftf_mode": args.ftf_mode,
+        "ftf_tau": args.ftf_tau,
+        "ftf_sob_lambda": args.ftf_sob_lambda,
+        "ftf_ridge": args.ftf_ridge,
+        "ftf_credit_normalize": args.ftf_credit_normalize,
+        "ftf_activation_trust": args.ftf_activation_trust,
+        "ftf_output_lr_mult": args.ftf_output_lr_mult,
+        "ftf_block_lr_mult": args.ftf_block_lr_mult,
+        "ftf_input_lr_mult": args.ftf_input_lr_mult,
+        "fc_adam_enabled": args.fc_adam_enabled,
+        "fc_adam_beta1": args.fc_adam_beta1,
+        "fc_adam_beta2": args.fc_adam_beta2,
+        "fc_adam_eps": args.fc_adam_eps,
+        "fc_adam_weight_decay": args.fc_adam_weight_decay,
+        "fc_adam_sob_decay": args.fc_adam_sob_decay,
+        "ftr_enabled": args.ftr_enabled,
+        "ftr_cg_iters": args.ftr_cg_iters,
+        "ftr_rho": args.ftr_rho,
+        "ftr_sob_lambda": args.ftr_sob_lambda,
+        "ftr_trust_radius": args.ftr_trust_radius,
     }
     base_kwargs.update(overrides)
     cfg = build_train_config_for_method(
