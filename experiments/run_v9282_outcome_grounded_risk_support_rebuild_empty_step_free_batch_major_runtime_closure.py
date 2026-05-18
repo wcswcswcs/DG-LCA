@@ -79,8 +79,6 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-
-
 def main() -> None:
     args = parse_args()
     out_dir = Path(args.out_dir)
