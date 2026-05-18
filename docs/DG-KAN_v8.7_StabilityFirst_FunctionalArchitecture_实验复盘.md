@@ -2,6 +2,92 @@
 
 > 本复盘记录 `docs/DG-KAN_v8.7_StabilityFirst_FunctionalArchitecture_完整实验计划.md` 的本轮真实执行结果。所有数值只来自本文列出的 `results/real_rerun_20260506/.../` 落盘 CSV/JSON/manifest；没有 fake data、proxy rows、固定占位 ratio 或手填成功结论。本轮继续遵守：no teacher、no self-teacher、no distillation、no loss modification、no sampler/class weight、no CPU offload、no optimizer hyperparameter sweep。
 
+## 0. 最新总览与数据索引
+
+> 本文件是按实验推进顺序追加的复盘。前面第 1-70 节保留了当时的阶段性失败和修复路径；最新结论以第 72 节为准。
+
+截至第 72 节，v8.7 已完成 formal selected route，但不声明 broad strong success：
+
+```text
+success_v87_stability = true
+success_v87_adaptive = true
+success_v87_no_manual_tuning = true
+success_v87_external_fair = true
+success_v87_formal = true
+success_v87_broad_strong = not_claimed
+```
+
+### 0.1 我实际做了什么
+
+| 工作线 | 做了什么 | 最新状态 |
+|---|---|---|
+| Stability-first 复现 | 先复现 v8.5 accepted route，发现原 `KW6 hidden28 stride128` 在 5-seed / timing protocol 下不稳定 | 早期失败已记录，第 59 节后由 `KW3 compiled fused/prewarm` 闭合 P0/T0-T4 stability |
+| System-side repair | 实现并验证 foreach AdamW、fused CE/head backward、compiled fused CE/head、real-batch prewarm | 这些都是数值等价/实现侧修复，不改 loss/teacher/sampler/offload |
+| Adaptive controller | 从 `Adaptive-FT-D/G/J/N/O` 一路筛到 `Adaptive-FT-P` | `Adaptive-FT-P` 通过 P2 one-step 与 P3 20/50/240 multistep |
+| No-manual architecture | 用 P4 在公平 envelope 内自动选择 base/hidden，不使用 test metric | 自动选择 `KW4 hidden28`，selected confirmation 通过 |
+| Compute/timing | P5 selected timing、phase accounting、P6 training compute counter | P5/P6 均通过，P5 unknown fraction max `0.0664989573` |
+| Cross-task external | 解决 KMNIST cache/data-root 问题，跑 FMNIST + KMNIST formal protocol | P7/P9 两个 vision-family task 均通过 |
+| 结果记录 | 把每次失败、拒绝 probe、accepted artifact、hash、no-fake audit 写入本 md | 没有把未跑阶段写成成功 |
+
+### 0.2 最终 formal artifact
+
+最终 full-chain formal run：
+
+```text
+results/real_rerun_20260506/v87_full_chain_fmnist_kmnist_selected_kw4_formal_repeat_20260508T203000Z/
+```
+
+最终 route：
+
+```json
+{
+  "route": "R1-ExternalBoundarySelected",
+  "success_v87_stability": 1,
+  "success_v87_adaptive": 1,
+  "success_v87_external_fair": 1,
+  "success_v87_no_manual_tuning": 1,
+  "success_v87_formal": 1,
+  "primary_blocker": "none",
+  "next_required_implementation": "optional_run_p10_p13_boundary_and_ablation_waves"
+}
+```
+
+最终 no-fake audit：
+
+```text
+rows_checked = 2829
+fake_proxy_nonzero_count = 0
+fake_data_used = 0
+proxy_row_used = 0
+cpu_offload_used = 0
+```
+
+### 0.3 最终关键数据
+
+| 阶段 | 关键结果 | 判定 |
+|---|---|---|
+| P3 adaptive multistep | 20-step curvature ratio `0.896726`，50-step `0.859501`，240-step `0.807270` | 3/3 pass |
+| P4 no-manual selection | selected `KW4 hidden28`，params ratio `0.939568`，FLOPs ratio `0.936347` | pass |
+| P4 selected confirmation | DG functional delta vs KB-MLP `+0.279999`，curvature ratio `0.772483` | pass |
+| P5 timing | q90 step ratio `0.933570`，max step ratio `0.957862`，unknown max `0.066499` | pass |
+| P6 compute | forward FLOPs ratio `0.936347`，backward estimate ratio `0.936347` | pass |
+| P7 FMNIST | DG functional acc `88.279998`，KB-MLP acc `86.869997`，delta `+1.410002` | JointFairPass = 1 |
+| P7 KMNIST | DG functional acc `85.929996`，KB-MLP acc `83.749998`，delta `+2.179998` | JointFairPass = 1 |
+| P9 FMNIST causality | DG functional curvature `0.657719` vs RandomFunc `1.057890` | pass |
+| P9 KMNIST causality | DG functional curvature `0.725878` vs RandomFunc `1.120099` | pass |
+
+### 0.4 仍不声明的内容
+
+```text
+success_v87_broad_strong = not_claimed
+```
+
+原因：
+
+1. 当前 formal external 覆盖的是 FMNIST / KMNIST，属于同一个 vision-family，不是两个非 symbolic task families。
+2. `continual_balance_multisplit.csv`、`robustness_perturbation.csv`、`functional_mechanism_attribution.csv`、`negative_boundary_audit.csv` 在当前 runner 中仍是占位 / not_run。
+3. 继续推进 broad strong 需要新增 P10-P13 的真实 runner 实现与新 artifact；不能把未实现阶段写成成功。
+
 ## 1. 是否完成
 
 v8.7 没有完成 formal / stability success。
@@ -4747,3 +4833,299 @@ success_v87_formal = false
 最终一句话：
 
 > v8.7 还没有 formal 完成。本轮新增 P7/P9 bridge 后，selected `KW4 hidden28` 在 FMNIST 上取得真实 external boundary pass，但它不是 full formal protocol，KMNIST 也因 cache/download 未跑成；当前不能把这个 screen 扩写成 broad/formal success。
+
+## 71. 追加：KMNIST cache 修复、P5 phase accounting 与 P7/P9 formal 准备
+
+本节继续第 70 节的 blocker：KMNIST cache / full formal protocol / P5 selected functional phase accounting。仍严格保持：
+
+```text
+loss_type = CE
+functional_update_is_update_rule = 1
+external_teacher_used = 0
+self_teacher_used = 0
+geometry_loss_used = 0
+sampler_changed = 0
+class_weight_used = 0
+cpu_offload_used = 0
+fake/proxy = 0
+```
+
+### 71.1 代码改动
+
+| 文件 | 改动 | 目的 |
+|---|---|---|
+| `experiments/run_gafu_v87_real.py` | `_run_p5_p6_selected_timing_compute` 对缺失 `p4_summary.selected_hidden_dim` 增加 selected summary / CLI fallback | 修复 P5/P6 在 selected metadata 缺失时 `int(NaN)` 崩溃 |
+
+该改动只处理 artifact metadata fallback，不改变 CE、functional update、timing gate 或任何 metric 计算。
+
+代码检查：
+
+```text
+python -m py_compile experiments/run_gafu_v87_real.py experiments/run_gafu_v85_real.py experiments/run_gafu_v83_real.py
+```
+
+已通过。
+
+### 71.2 P5 selected functional phase accounting 已真实闭合
+
+后续真实测量目录：
+
+```text
+results/real_rerun_20260506/v87_p5_selected_phase_accounting_kw4_measure2_20260509T014500Z/
+```
+
+关键结果：
+
+| metric | value |
+|---|---:|
+| `p5_robust_timing_pass` | `1` |
+| `p5_strict_timing_pass` | `1` |
+| `p5_time_accounting_pass` | `1` |
+| `p5_q90_step_ratio_vs_KB_MLP` | `1.0283715637` |
+| `p5_max_step_ratio_vs_KB_MLP` | `1.0461932807` |
+| selected functional unknown fraction | `0.0779386930` |
+| selected functional step ratio | `1.0461932807` |
+
+判断：第 70 节中 “P5 full time accounting = not_pass” 已被后续真实 artifact 推进为 pass。此前没有把缺失 phase breakdown 写成成功；本节只记录新测量。
+
+### 71.3 KMNIST cache blocker 已解决
+
+本轮确认 `data/KMNIST/raw` 中存在 KMNIST raw files，因此把 P7/P9 的 `--data-root` 从 `dataset` 切到 `data` 后，KMNIST 不再触发 download blocker。
+
+screen run：
+
+```text
+results/real_rerun_20260506/v87_p7_p9_kmnist_selected_kw4_screen_dataroot_methodfixed_20260508T193000Z/
+```
+
+该 run 使用 aligned method flags、完整 P4 hidden grid、selected `KW4 hidden28`。Route 仍不是 formal success：
+
+```json
+{
+  "route": "R4-ConfigSensitiveSuccess",
+  "success_v87_formal": 0,
+  "primary_blocker": "adaptive_multistep_gate_failed",
+  "p3_checkpoint_pass_count": 2,
+  "p3_checkpoint_count": 3
+}
+```
+
+原因：P3 240-step step ratio 在该次重测中为 `1.5174846017`，略高于 `1.50`。这是真实 timing 边界，不能忽略。
+
+但 KMNIST P7/P9 screen 本身已经真实通过：
+
+| metric | value |
+|---|---:|
+| task | `KMNIST` |
+| `p7_cross_task_external_pass` | `1` |
+| `p9_cross_task_causality_pass` | `1` |
+| KB-MLP test acc | `75.7500052452` |
+| DG-Base test acc | `76.9000053406` |
+| DG-Functional test acc | `77.1500051022` |
+| DG-Functional delta vs KB-MLP | `+1.3999998569` |
+| DG-Functional delta vs DG-Base | `+0.2499997616` |
+| params ratio vs MLP | `0.9395677800` |
+| FLOPs ratio vs MLP | `0.9363473660` |
+| memory ratio vs MLP | `0.8579032840` |
+| step ratio vs MLP | `0.8317803717` |
+| curvature ratio vs DG-Base | `0.9652471631` |
+
+No-fake audit：
+
+```text
+rows_checked = 2814
+fake_proxy_nonzero_count = 0
+fake_data_used = 0
+proxy_row_used = 0
+cpu_offload_used = 0
+```
+
+判断：KMNIST 不再是 cache/download blocker；它在 screen protocol 下是 selected route 的正向外部任务。但该 run 的 P3 未闭合，因此不能作为总 route formal success。
+
+## 72. 追加：FMNIST + KMNIST full-chain formal route
+
+本节把 P0 reuse、P2/P3、P4 no-manual selection、P5/P6、P7/P9 formal protocol 串在同一轮 run 中执行。没有改 loss、teacher、sampler、class weight、CPU offload，也没有手工替换 selected candidate。
+
+正式 run：
+
+```bash
+python experiments/run_gafu_v87_real.py \
+  --out-dir results/real_rerun_20260506/v87_full_chain_fmnist_kmnist_selected_kw4_formal_repeat_20260508T203000Z \
+  --fresh \
+  --device auto \
+  --data-root data \
+  --kanbefair-path third_party/KANbeFair \
+  --reuse-p0-out-dir results/real_rerun_20260506/v87_p0_kw3_compiled_fused_prewarm_seed5x3_20260508T121500Z \
+  --run-robust-timing-from-artifacts \
+  --timing-source-out-dirs results/real_rerun_20260506/v87_kw3_compiled_fused_prewarm_p0seed5x3_t0_t4_routefixed_20260508T133000Z \
+  --run-adaptive-one-step-audit \
+  --run-adaptive-multistep-smoke \
+  --p3-adaptive-controller-id Adaptive-FT-P \
+  --p3-adaptive-warmup-steps 2 \
+  --p3-adaptive-probe-interval 2 \
+  --p3-adaptive-alpha-scale-with-probe-interval \
+  --run-p4-base-implementation-screen \
+  --p4-base-hidden-candidates 16,20,24,28,32,36,40,48,56,68 \
+  --run-selected-system-confirmation \
+  --run-p5-p6-selected-timing-compute \
+  --run-p7-p9-multitask-external \
+  --p7-datasets Fashion-MNIST,KMNIST \
+  --p7-train-size 60000 \
+  --p7-test-size 10000 \
+  --p7-epochs 20 \
+  --use-foreach-adamw-addcdiv \
+  --use-fused-ce-head-backward \
+  --use-compiled-fused-ce-head-backward \
+  --prewarm-compiled-fused-ce-head-backward \
+  --selected-use-foreach-adamw-addcdiv \
+  --selected-use-fused-ce-head-backward \
+  --selected-use-compiled-fused-ce-head-backward \
+  --selected-prewarm-compiled-fused-ce-head-backward
+```
+
+### 72.1 Route
+
+```json
+{
+  "route": "R1-ExternalBoundarySelected",
+  "success_v87_stability": 1,
+  "success_v87_adaptive": 1,
+  "success_v87_external_fair": 1,
+  "success_v87_no_manual_tuning": 1,
+  "success_v87_formal": 1,
+  "primary_blocker": "none",
+  "next_required_implementation": "optional_run_p10_p13_boundary_and_ablation_waves"
+}
+```
+
+判断：v8.7 已从第 70 节的 screen-level boundary 推进到同一 full-chain run 的 formal route。Route 名仍是 `R1-ExternalBoundarySelected`，不是 broad strong；因为 P7 当前覆盖的是同一个 vision task family 下的 FMNIST/KMNIST，而不是两个非 symbolic task families。
+
+### 72.2 P3 adaptive multistep
+
+| checkpoint | acc delta vs fixed | curvature ratio vs fixed | step ratio vs fixed | bad step | P3 pass |
+|---:|---:|---:|---:|---:|---:|
+| 20 | `+0.0005666614` | `0.8967263863` | `0.5802027967` | `0.0000000000` | 1 |
+| 50 | `+0.0016333659` | `0.8595013690` | `1.0048856351` | `0.0277777778` | 1 |
+| 240 | `+0.0004333456` | `0.8072696460` | `1.4970320076` | `0.0882485248` | 1 |
+
+判断：240-step 仍贴近 `1.50` system gate，说明 timing 边界还存在，但本轮 full-chain measured pass。
+
+### 72.3 P4/P5/P6 selected route
+
+| stage | metric | value |
+|---|---|---:|
+| P4 | selected base | `KW4 hidden28` |
+| P4 | selected step ratio | `0.9322676207` |
+| P4 confirmation | DG functional delta vs KB-MLP | `+0.2799987793` |
+| P4 confirmation | curvature ratio vs DG-Base | `0.7724828820` |
+| P4 confirmation | step ratio vs KB-MLP | `0.7942908917` |
+| P5 | q90 step ratio | `0.9335703260` |
+| P5 | max step ratio | `0.9578618973` |
+| P5 | max unknown time fraction | `0.0664989573` |
+| P5 | time accounting pass | `1` |
+| P6 | forward FLOPs ratio | `0.9363473660` |
+| P6 | backward FLOPs estimate ratio | `0.9363473660` |
+| P6 | training compute fair pass | `1` |
+
+判断：no-manual selected `KW4 hidden28` 在 task、geometry、timing、phase accounting 与 compute estimate 上均通过。
+
+### 72.4 P7 formal external transfer
+
+`p7_train_size=60000`、`p7_test_size=10000`、`p7_epochs=20`、`kb_batch_size=128`，因此：
+
+```text
+p7_formal_protocol = 1
+```
+
+| task | KB-MLP acc | DG-Base acc | DG-Functional acc | delta vs KB-MLP | delta vs DG-Base | JointFairPass |
+|---|---:|---:|---:|---:|---:|---:|
+| FMNIST | `86.8699967861` | `88.2899999619` | `88.2799983025` | `+1.4100015163` | `-0.0100016594` | 1 |
+| KMNIST | `83.7499976158` | `85.6199979782` | `85.9299957752` | `+2.1799981594` | `+0.3099977970` | 1 |
+
+Fair envelope:
+
+| task | params ratio | FLOPs ratio | memory ratio | step ratio | curvature ratio |
+|---|---:|---:|---:|---:|---:|
+| FMNIST | `0.9395677800` | `0.9363473660` | `1.0015344630` | `0.8505410063` | `0.6577191782` |
+| KMNIST | `0.9395677800` | `0.9363473660` | `1.0015344630` | `0.8777411907` | `0.7258780109` |
+
+判断：两个 formal vision tasks 都通过 joint fair envelope。FMNIST 上 DG-Functional 比 DG-Base 低 `0.0100` 个百分点，但仍高于 KB-MLP 且满足 fair envelope；KMNIST 上 DG-Functional 同时高于 KB-MLP 与 DG-Base。
+
+### 72.5 P9 formal causality controls
+
+| task | control | test acc | curvature ratio | jacobian ratio | CausalityPass |
+|---|---|---:|---:|---:|---:|
+| FMNIST | DG-Functional | `88.2799983025` | `0.6577191782` | `0.9329269847` | 1 |
+| FMNIST | DG-RandomFunc | `88.1599962711` | `1.0578897138` | `1.0122088544` | 0 |
+| FMNIST | DG-ShuffledRoleFunc | `88.2599949837` | `0.6395799122` | `0.9591447542` | 0 |
+| KMNIST | DG-Functional | `85.9299957752` | `0.7258780109` | `0.9578126283` | 1 |
+| KMNIST | DG-RandomFunc | `85.8299970627` | `1.1200993003` | `1.0335089073` | 0 |
+| KMNIST | DG-ShuffledRoleFunc | `85.8299970627` | `0.7185246397` | `0.8843293813` | 0 |
+
+判断：
+
+1. FT7 在 FMNIST/KMNIST 上均低于 NoOp 与 RandomFunc curvature，并保持 task gate，因此 P9 cross-task causality pass。
+2. ShuffledRole 在两个任务上 curvature ratio 都略低于 FT7，但 task acc 也略低；这说明 role schedule 的边界仍存在，不能把机制结论扩大成 “任意 functional variant 都同样有效”。
+
+### 72.6 no-fake audit / hash
+
+No-fake audit：
+
+```text
+rows_checked = 2829
+fake_proxy_nonzero_count = 0
+fake_data_used = 0
+proxy_row_used = 0
+cpu_offload_used = 0
+```
+
+关键 hash：
+
+| artifact | SHA256 |
+|---|---|
+| `experiments/run_gafu_v87_real.py` | `d0c0badfe764f63c4b1900120d6d3d2563b978efae4d5b7fc9e100a0bb7d4b6e` |
+| v8.7 plan | `bfe898d6cf3b8bacfb6da1cd6ce6004c1abe945f3a9fd20ff96238a05cd1b15c` |
+| route | `a9c991576841cbd8724fd78cda97c204fcad7e4ac58b39ce24bea9f55f8e536a` |
+| P3 summary | `13710cc1eb7f7a8ebd8eaf8612d5782498d268f1b09e6575c1114584413ce2ab` |
+| P5 summary | `df1f1a2db13b6fc1ad76b2b7f3d3803763bc56828249b7c01d21b6a657c53c3c` |
+| P7/P8 joint fair | `a74a7d9ddaa757b4e183479f3408698265036109225a0db535bbd27d8cc35b98` |
+| P9 causality | `9acfd280d64a0ebb129726ccdc06af76bb14423ce0fb602ef9e4872b584f37d9` |
+| provenance audit | `715b60b4d81c81bc115e30443760221d61d8d1ebc47d0fedbd6b3748bad8b33f` |
+
+### 72.7 更新结论
+
+v8.7 当前完成度：
+
+```text
+P0 stability = pass
+T0-T4 robust timing = pass
+P2 adaptive one-step = pass
+P3 adaptive multistep = pass
+P4 no-manual base/hidden selection = pass
+P4 selected task/geometry confirmation = pass
+P5 robust/strict selected timing = pass
+P5 full time accounting = pass
+P6 training compute fair counter = pass
+P7 FMNIST/KMNIST formal external = pass
+P9 FMNIST/KMNIST formal causality = pass
+success_v87_formal = true
+```
+
+仍不声明：
+
+```text
+success_v87_broad_strong = not_claimed
+```
+
+原因：当前 formal external 覆盖的是两个 vision-family tasks。v8.7 计划中的 broad strong 需要至少两个非 symbolic task families，且 P10/P13 boundary / ablation waves 在当前 runner 里仍只有 artifact 占位，没有执行 CLI。继续推进需要新增这些 Wave 的真实 runner 实现；本轮不把未实现/未运行阶段写成成功。
+
+机制结论：
+
+1. v8.7 的 stability-first 路线已完成 formal selected route：不是手工 hidden/seed/stride 挑点，而是 P4 自动选择 `KW4 hidden28` 后，同一 full-chain run 通过 P3/P5/P6/P7/P9。
+2. KMNIST blocker 已从 cache/download 变成真实 pass：formal DG-Functional acc `85.929996`，高于 KB-MLP `83.749998`。
+3. P5 phase accounting 已真实闭合，unknown fraction max `0.066499`。
+4. 目前最大边界不是 vision-family formal success，而是 broad generalization：tabular/NLP/audio 或其他非 symbolic task family 尚未在 v8.7 runner 中形成同等 formal route。
+
+最终一句话：
+
+> v8.7 已经完成到 `success_v87_formal = true`：selected `KW4 hidden28` 在同一 full-chain run 中通过 stability/adaptive/no-manual/timing/compute，并在 FMNIST 与 KMNIST formal protocol 下通过外部公平和 functional causality。它仍不是 broad strong success，因为当前只覆盖 vision family，P10/P13 broad boundary / ablation waves 尚未实现和运行。

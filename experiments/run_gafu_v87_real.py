@@ -2301,8 +2301,13 @@ def _run_p5_p6_selected_timing_compute(
     """
     p4_summary = p4_summary or {}
     selected_summary = selected_summary or {}
-    selected_candidate = str(p4_summary.get("selected_base_candidate_id", selected_summary.get("candidate_id", ""))).strip()
-    selected_hidden = int(_safe_float(p4_summary.get("selected_hidden_dim", selected_summary.get("hidden_dim", -1))))
+    selected_candidate = str(p4_summary.get("selected_base_candidate_id", "")).strip()
+    if not selected_candidate or selected_candidate == METRIC_UNAVAILABLE:
+        selected_candidate = str(selected_summary.get("candidate_id", args.selected_dg_candidate_id)).strip()
+    selected_hidden_value = _safe_float(p4_summary.get("selected_hidden_dim"))
+    if not math.isfinite(selected_hidden_value):
+        selected_hidden_value = _safe_float(selected_summary.get("hidden_dim"), float(args.selected_dg_hidden_dim))
+    selected_hidden = int(selected_hidden_value) if math.isfinite(selected_hidden_value) else int(args.selected_dg_hidden_dim)
     p4_rows = _read_csv(out_dir / "base_implementation_screen.csv")
     selected_p4_rows = [
         r for r in p4_rows
@@ -3197,8 +3202,10 @@ def _nullspace_project_rows_v87(delta: torch.Tensor, features: torch.Tensor) -> 
     gram = h @ h.t()
     ridge = 1.0e-3 * torch.mean(torch.diag(gram).detach().float()).clamp_min(1.0e-8)
     eye = torch.eye(int(gram.shape[0]), device=gram.device, dtype=gram.dtype)
+    mat = gram + ridge.to(gram.dtype) * eye
     rhs = h @ delta.t()
-    coeff = torch.linalg.solve(gram + ridge.to(gram.dtype) * eye, rhs)
+    chol = torch.linalg.cholesky(mat)
+    coeff = torch.cholesky_solve(rhs, chol)
     row_component = coeff.t() @ h
     return delta - row_component.to(delta.dtype)
 
@@ -3970,7 +3977,10 @@ def _run_adaptive_multistep_smoke(args: argparse.Namespace, out_dir: Path) -> Tu
     max_steps = max(checkpoints)
     adaptive_probe_interval = max(1, int(args.p3_adaptive_probe_interval))
     spec = v85.v83.v80._spec_map_v80().get(candidate_id, v85.v83.v80._spec_map_v80()["KW3"])
-    variants = ["Fixed-FT7-stride128", str(args.p3_adaptive_controller_id)]
+    variants = ["Fixed-FT7-stride128"]
+    if bool(getattr(args, "p3_include_fixed_probe_baseline", False)):
+        variants.append("Fixed-ProbeCadenceNoFunc")
+    variants.append(str(args.p3_adaptive_controller_id))
     old_stride = int(v85.v83.P5_FT7_EVENT_STRIDE)
     old_alpha = float(v85.v83.P5_FT7_EVENT_ALPHA_MULT)
     old_compiled = _V85_FUSED_USE_COMPILED_CORE
@@ -4045,13 +4055,16 @@ def _run_adaptive_multistep_smoke(args: argparse.Namespace, out_dir: Path) -> Tu
                     xb, yb = v85.v83.v72.v71._select_batch(x_train, y_train, batch_size, step)
                     xh, yh = v85.v83.v72.v71._select_batch(x_train, y_train, batch_size, step + 1009)
                     is_adaptive = str(variant).startswith("Adaptive")
+                    is_fixed_probe_baseline = str(variant) == "Fixed-ProbeCadenceNoFunc"
                     adaptive_probe_step = bool(is_adaptive and step % adaptive_probe_interval == 0)
+                    fixed_probe_step = bool(is_fixed_probe_baseline and step % adaptive_probe_interval == 0)
+                    probe_step = bool(adaptive_probe_step or fixed_probe_step)
                     fixed_event = bool(variant == "Fixed-FT7-stride128" and step % int(args.fixed_ft7_event_stride) == 0)
                     if torch.cuda.is_available() and device.type == "cuda":
                         torch.cuda.synchronize(device)
                     started = time.perf_counter()
                     v85.v83._zero_grad(stack, head)
-                    if adaptive_probe_step or fixed_event:
+                    if probe_step or fixed_event:
                         loss_before, holdout_loss_before = _manual_ce_backward_with_holdout_v85_fused(stack, head, xb, yb, xh, yh, spec)
                     else:
                         loss_value = _manual_ce_backward_v85_fused(stack, head, xb, yb, spec, need_loss_float=True)
@@ -4070,7 +4083,7 @@ def _run_adaptive_multistep_smoke(args: argparse.Namespace, out_dir: Path) -> Tu
                     role_budgets = dict(v85.v83.FT7_ROLE_BUDGETS)
                     trust_scale = 0.0
                     clip_rate = 0.0
-                    if adaptive_probe_step or fixed_event:
+                    if probe_step or fixed_event:
                         loss_after_task, holdout_loss_after_task, task_features_after, holdout_features_after = v85.v83._loss_pair_and_features_only(
                             stack,
                             head,
@@ -4080,7 +4093,7 @@ def _run_adaptive_multistep_smoke(args: argparse.Namespace, out_dir: Path) -> Tu
                             yh,
                             spec,
                         )
-                    if adaptive_probe_step:
+                    if probe_step:
                         smooth_before, curv_before = v85.v83._geometry_norms(v85.v83._param_entries(stack, head))
                         event_score, _descent_score, _geometry_pressure, bad_step_risk = _adaptive_event_score(
                             holdout_loss_before=holdout_loss_before,
@@ -4088,7 +4101,7 @@ def _run_adaptive_multistep_smoke(args: argparse.Namespace, out_dir: Path) -> Tu
                             smooth_before=smooth_before,
                             curv_before=curv_before,
                         )
-                        if len(event_score_window) >= int(args.p3_adaptive_warmup_steps):
+                        if is_adaptive and len(event_score_window) >= int(args.p3_adaptive_warmup_steps):
                             event_threshold = _quantile(
                                 event_score_window[-int(args.p3_adaptive_warmup_steps):],
                                 float(args.p3_adaptive_event_quantile),
@@ -4103,6 +4116,8 @@ def _run_adaptive_multistep_smoke(args: argparse.Namespace, out_dir: Path) -> Tu
                                 task_holdout_descent=holdout_loss_before - holdout_loss_after_task,
                             )
                         event_score_window.append(event_score)
+                        if is_fixed_probe_baseline:
+                            event_rule = "fixed_probe_cadence_no_functional_update"
                     else:
                         event_triggered = int(fixed_event)
                     if event_triggered:
@@ -4314,15 +4329,18 @@ def _run_adaptive_multistep_smoke(args: argparse.Namespace, out_dir: Path) -> Tu
     p3_pass_values: List[int] = []
     for step in checkpoints:
         fixed = [row for row in checkpoint_rows if int(_safe_float(row.get("checkpoint_step"), -1)) == int(step) and str(row.get("variant")) == "Fixed-FT7-stride128"]
+        fixed_probe = [row for row in checkpoint_rows if int(_safe_float(row.get("checkpoint_step"), -1)) == int(step) and str(row.get("variant")) == "Fixed-ProbeCadenceNoFunc"]
         adaptive = [row for row in checkpoint_rows if int(_safe_float(row.get("checkpoint_step"), -1)) == int(step) and str(row.get("variant")).startswith("Adaptive")]
         fixed_acc = _finite_mean([_safe_float(row.get("test_acc")) for row in fixed])
         adaptive_acc = _finite_mean([_safe_float(row.get("test_acc")) for row in adaptive])
         fixed_curv = _finite_mean([_safe_float(row.get("curvature")) for row in fixed])
         adaptive_curv = _finite_mean([_safe_float(row.get("curvature")) for row in adaptive])
         fixed_step = _finite_mean([_safe_float(row.get("step_time_ms_mean")) for row in fixed])
+        fixed_probe_step = _finite_mean([_safe_float(row.get("step_time_ms_mean")) for row in fixed_probe])
         adaptive_step = _finite_mean([_safe_float(row.get("step_time_ms_mean")) for row in adaptive])
         curvature_ratio = adaptive_curv / max(fixed_curv, 1.0e-12) if math.isfinite(adaptive_curv) and math.isfinite(fixed_curv) else float("nan")
         step_ratio = adaptive_step / max(fixed_step, 1.0e-12) if math.isfinite(adaptive_step) and math.isfinite(fixed_step) else float("nan")
+        paired_step_ratio = adaptive_step / max(fixed_probe_step, 1.0e-12) if math.isfinite(adaptive_step) and math.isfinite(fixed_probe_step) else float("nan")
         acc_delta = adaptive_acc - fixed_acc if math.isfinite(adaptive_acc) and math.isfinite(fixed_acc) else float("nan")
         pass_value = int(
             math.isfinite(acc_delta)
@@ -4344,8 +4362,11 @@ def _run_adaptive_multistep_smoke(args: argparse.Namespace, out_dir: Path) -> Tu
             "adaptive_curvature_mean": adaptive_curv if math.isfinite(adaptive_curv) else METRIC_UNAVAILABLE,
             "adaptive_curvature_ratio_vs_fixed": curvature_ratio if math.isfinite(curvature_ratio) else METRIC_UNAVAILABLE,
             "fixed_step_time_ms_mean": fixed_step if math.isfinite(fixed_step) else METRIC_UNAVAILABLE,
+            "fixed_probe_step_time_ms_mean": fixed_probe_step if math.isfinite(fixed_probe_step) else METRIC_UNAVAILABLE,
             "adaptive_step_time_ms_mean": adaptive_step if math.isfinite(adaptive_step) else METRIC_UNAVAILABLE,
             "adaptive_step_ratio_vs_fixed": step_ratio if math.isfinite(step_ratio) else METRIC_UNAVAILABLE,
+            "adaptive_step_ratio_vs_fixed_probe": paired_step_ratio if math.isfinite(paired_step_ratio) else METRIC_UNAVAILABLE,
+            "P3_paired_timing_checkpoint_pass": int(math.isfinite(paired_step_ratio) and paired_step_ratio <= 1.50),
             "adaptive_event_count_mean": _finite_mean([_safe_float(row.get("event_count")) for row in adaptive]),
             "adaptive_bad_step_rate_mean": _finite_mean([_safe_float(row.get("bad_step_rate")) for row in adaptive]),
             "adaptive_holdout_descent_ratio_mean": _finite_mean([_safe_float(row.get("holdout_descent_ratio_mean")) for row in adaptive]),
@@ -4373,6 +4394,8 @@ def _run_adaptive_multistep_smoke(args: argparse.Namespace, out_dir: Path) -> Tu
         "p3_checkpoint_count": len(p3_pass_values),
         "p3_adaptive_multistep_pass": int(bool(p3_pass_values) and all(p3_pass_values)),
         "p3_gate_rule": "adaptive_acc>=fixed-0.002_fraction_curvature_ratio_vs_fixed<=0.90_step_ratio_vs_fixed<=1.50_at_all_checkpoints",
+        "p3_fixed_probe_baseline_included": int(bool(getattr(args, "p3_include_fixed_probe_baseline", False))),
+        "p3_paired_timing_note": "diagnostic_only_fixed_probe_baseline_not_used_for_route_gate",
         "fake_data_used": 0,
         "proxy_row_used": 0,
         "cpu_offload_used": 0,
@@ -4921,6 +4944,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--p3-adaptive-probe-interval", type=int, default=1)
     parser.add_argument("--p3-adaptive-alpha-scale-with-probe-interval", action="store_true")
     parser.add_argument("--p3-adaptive-event-quantile", type=float, default=0.75)
+    parser.add_argument("--p3-include-fixed-probe-baseline", action="store_true")
     parser.add_argument("--run-robust-timing-from-artifacts", action="store_true")
     parser.add_argument("--timing-source-out-dirs", default="")
     parser.add_argument("--timing-dg-candidate-id", default="")
