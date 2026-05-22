@@ -1,7 +1,7 @@
 # DG-KAN v12.6：Lower-Level Fused Simple Hinge/Quadratic Kernel + Functional Geometry 双线计划
 
 > 版本：v12.6 execution draft
-> 执行状态：已继续推进到 lower-level FHQ classgain / h160 / quad030 系列 B106-B111，B112/B115-B118 `normabs`，B119-B121 `meanstat`，B122 `groupabs4` + gradopt，并追加完成 A5 protocol repair、B124/B125 `fixedbranch+fixedgain`、B126 `logitnorm150`、B127 `absquad`、B128 `absmixsq`、B129 `sqdiag025`、B130 `cubicdiag025`。当前 best 仍为 B109 protocolfix final075；B129 重新打开 A1/A4 但 A5 task/AUC 未过，B130 停在 R0。base 未合格，Functional official 关闭。真实结果与 hash/provenance 审计见 `DG-KAN_v12.6_LowerLevelFusedHingeQuadratic_FunctionalGeometry_结果复盘.md`。
+> 执行状态：已继续推进到 lower-level FHQ classgain / h160 / quad030 系列 B106-B111，B112/B115-B118 `normabs`，B119-B121 `meanstat`，B122 `groupabs4` + gradopt，并追加完成 A5 protocol repair、B124/B125 `fixedbranch+fixedgain`、B126 `logitnorm150`、B127 `absquad`、B128 `absmixsq`、B129 `sqdiag025`、B130 `cubicdiag025`、B131 `pairtraj`、B133/B135 `localdensepairtraj`。当前 best 仍为 B109 protocolfix final075；B131 的 F4 fixed-P workspace 实质降低 full-step/backward/update cost 但 A4 失败，B133/B135 A1/A4 打开但 task 坍塌。base 未合格，Functional official 关闭。真实结果与 hash/provenance 审计见 `DG-KAN_v12.6_LowerLevelFusedHingeQuadratic_FunctionalGeometry_结果复盘.md`。
 > 目标：基于 v12.5.2 真实结果，停止 temperature / epoch / optimizer wrapper 等小修，转入真正 lower-level fused simple hinge/quadratic forward+backward kernel，同时并行保持 functional update 与流形-信号通道几何诊断。
 > 公式格式：Typora 友好，只使用 `$...$` 与 `$$...$$`。
 > 原则：不降低 gate，不按数据集调参，不使用 teacher / distillation / loss modification / sampler / class weight，不把 diagnostic 写成 official success。
@@ -65,15 +65,15 @@ base 合格后：official re-entry；
 
 ## 0.1 当前执行更新
 
-本计划已经被执行到 B130；最新真实状态不是完成态：
+本计划已经被执行到 B135；最新真实状态不是完成态：
 
 ```text
 route = R2-AUCStepAndTaskFail
-latest_targeted_route = R0-FusedBackwardFullStepNotOfficial
+latest_targeted_route = R2-AUCStepAndTaskFail
 base_qualified = False
 functional_open = False
 best_current_candidate = B109b h160 absdiag050 classbranch classgain identitytailquad030 hingeamp025 protocolfix final075
-latest_targeted_candidate = B130b h160 cubicdiag025 classbranch classgain identitytailquad030 hingeamp025
+latest_targeted_candidate = B135b h160 localdensepairtraj absdiag050 classbranch classgain fixedbranch fixedgain identitytailquad020 hingeamp025
 ```
 
 已新增并验证的方向：
@@ -129,6 +129,23 @@ B130 cubicdiag025:
   FHQ correctness/smoke pass;
   F3 step = 1.2481101999833282, fixed-P F1 step = 1.1436047527375663;
   full-step official fail, A4/A5 合法关闭。
+
+B131 pairtraj:
+  F4 fixed-P workspace step = 0.685358064760707, memory = 0.13;
+  backward ratio = 0.4557250926585637, update ratio = 0.7320725649235357;
+  真实降低 fused backward/update cost，但 A4 expression fail，A5 合法关闭。
+
+B133 localdensepairtraj:
+  F4 fixed-P workspace step = 0.7942844867303934, memory = 0.13;
+  B133b/B133a A4 pass;
+  B133b task mean = -0.10026041666666667, worst = -0.333984375, near = 0.3333333333333333, ECE fail;
+  A5 fail。
+
+B135 localdensepairtraj + fixedbranch/fixedgain + quad020:
+  F4 fixed-P workspace step = 0.9283274262455713, memory = 0.12904761904761905;
+  A4 pass;
+  B135b task mean = -0.08550347222222222, worst = -0.26171875, near = 0.3333333333333333, ECE fail;
+  A5 fail，说明 B124 稳定 branch/gain 也救不回 dense pair trajectory。
 ```
 
 因此当前执行结论是：
@@ -137,8 +154,9 @@ B130 cubicdiag025:
 1. lower-level FHQ 主线有真实进展，但 v12.6 仍未完成 base。
 2. B109 protocolfix final075 仍是 best：accuracy/worst/near/ECE 均过，只剩 strict steady AUC-step/time hard gate。
 3. normabs、meanstat、groupabs4、fixed gain、logitnorm、direct-tail abs/square、mixed-tail、sqdiag energy-tail、signed cubic tail 这类 scalar / pooled / calibration / simple tail micro-primitive 已不值得继续小网格。
-4. 下一步应设计更强但 single-kernel-friendly 的 trajectory primitive，目标是降低 Fashion steady NLL AUC；若继续 B109，则必须是真正 trajectory/backward 优化。
-5. Functional official 仍关闭；base 未过 A5 前，Functional/Line C 只能 diagnostic。
+4. B131 证明 F4 fixed-P workspace 是真实 cost-reduction 路径；B133/B135 证明 dense random pair trajectory 会伤 task，不能继续小修。
+5. 下一步应保留 F4 fixed-P workspace 的 cost reduction，但回到 B109/B124 这类 task-stable trajectory，或设计更稀疏/局部且 task-stable 的 single-kernel-friendly primitive。
+6. Functional official 仍关闭；base 未过 A5 前，Functional/Line C 只能 diagnostic。
 ```
 
 本计划下面的设计目标仍保留为 v12.6 的历史执行依据；最新落盘结果以复盘文件为准。
@@ -2201,6 +2219,7 @@ logitnorm / post-hoc calibration；
 scalar normabs / meanstat 小网格；
 direct-tail abs/square / mixed abs-square / sqdiag energy-tail 小网格；
 signed cubic / signed polynomial tail 小网格；
+dense random pair trajectory 小修；
 dataset-specific threshold；
 functional full training。
 ```
@@ -2221,6 +2240,8 @@ functional full training。
 11. 排查 B109 final025、B110 quad020、B124/B125 fixedbranch+fixedgain、B126 logitnorm150。
 12. 排查 B127 absquad、B128 absmixsq、B129 sqdiag025；B127/B128 停在 R0，B129 过 A1/A4 但 A5 task/AUC 失败。
 13. 排查 B130 cubicdiag025；signed cubic tail correctness pass，但 full-step official fail，A4/A5 合法关闭。
+14. 实现 B131 pairtraj 与 F4 fixed-P workspace path；F4 step = 0.685358064760707、backward = 0.4557250926585637、update = 0.7320725649235357，证明 cost-reduction path 真实存在，但 A4 fail。
+15. 实现 B133/B135 localdensepairtraj；A1/A4 可打开，但 task 坍塌，B135 fixedbranch/fixedgain 也未救回，dense random pair trajectory 方向被排除。
 ```
 
 Codex 下一步要先做：
@@ -2229,10 +2250,11 @@ Codex 下一步要先做：
 1. 不再继续 LR/gain/logitnorm/scalar calibration。
 2. 不再继续 direct-tail arithmetic 或 square-energy tail 小网格。
 3. 不再继续 signed polynomial tail 小网格。
-4. 设计新的 single-kernel-friendly trajectory primitive，目标是降低 Fashion steady NLL AUC。
-5. 若继续 B109 h160，必须是真正 fused trajectory/backward 优化，而不是 optimizer wrapper 或 gate 小修。
-6. 新 primitive 必须先证明 A1/A4，再进入 A5。
-7. Functional 仍只做 diagnostic，直到 base qualified。
+4. 保留 F4 fixed-P workspace 这种真实 cost-reduction path，但不要继续 dense random pair trajectory。
+5. 设计新的 sparse/local/task-stable single-kernel-friendly trajectory primitive，目标是降低 Fashion steady NLL AUC。
+6. 若继续 B109 h160，必须实质降低 learnable-P backward/update cost，例如减少 `proj_grad` / 参数更新负担，而不是 optimizer wrapper 或 gate 小修。
+7. 新 primitive 必须先证明 A1/A4，再进入 A5。
+8. Functional 仍只做 diagnostic，直到 base qualified。
 ```
 
 最重要的判断纪律：
