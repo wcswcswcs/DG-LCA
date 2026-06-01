@@ -161,10 +161,10 @@ def _specs_for(input_dim: int, output_dim: int) -> Dict[str, prim.PrimitiveSpec]
     return {s.candidate_id: s for s in prim.primitive_specs(budget, input_dim, output_dim)}
 
 
-def _make_model(method_id: str, input_dim: int, output_dim: int, x_stats: torch.Tensor, device: torch.device, seed: int, specs: Mapping[str, prim.PrimitiveSpec]) -> torch.nn.Module:
+def _make_model(method_id: str, input_dim: int, output_dim: int, x_stats: torch.Tensor, device: torch.device, seed: int, specs: Mapping[str, prim.PrimitiveSpec], y_stats: torch.Tensor | None = None) -> torch.nn.Module:
     _, budget = v124._param_budget(input_dim, output_dim)
     spec = specs.get(method_id)
-    return v124._make_model(method_id, input_dim, output_dim, x_stats, device, int(seed), spec, budget)
+    return v124._make_model(method_id, input_dim, output_dim, x_stats, device, int(seed), spec, budget, y_stats)
 
 
 if TRITON_AVAILABLE:
@@ -888,7 +888,18 @@ def _ridge_coupling(delta_b: torch.Tensor, delta_q: torch.Tensor, ridge: float) 
     y = y - y.mean(dim=0, keepdim=True)
     c = int(x.shape[1])
     eye = torch.eye(c, device=x.device, dtype=torch.float32)
-    a = torch.linalg.solve(x.T @ x + float(ridge) * eye, x.T @ y)
+    lhs = x.T @ x + float(ridge) * eye
+    rhs = x.T @ y
+    try:
+        a = torch.linalg.solve(lhs, rhs)
+    except RuntimeError:
+        # Small diagnostic batches can produce rank-deficient update matrices.
+        # Keep the metric defined by solving the same ridge system with a
+        # numerically safer fallback rather than dropping or fabricating rows.
+        try:
+            a = torch.linalg.lstsq(lhs, rhs).solution
+        except RuntimeError:
+            a = torch.linalg.pinv(lhs) @ rhs
     pred = x @ a
     resid = y - pred
     r2 = 1.0 - float(resid.square().sum().item()) / max(EPS, float(y.square().sum().item()))
@@ -995,7 +1006,7 @@ def run_line_c(args: argparse.Namespace, out_dir: Path, device: torch.device, x_
     diag_rows: List[Dict[str, Any]] = []
     noise_rows: List[Dict[str, Any]] = []
     for cid in candidate_ids:
-        model = _make_model(cid, input_dim, output_dim, x_train, device, int(args.seed) + 401, specs).eval()
+        model = _make_model(cid, input_dim, output_dim, x_train, device, int(args.seed) + 401, specs, y_train).eval()
         before_b = model(xb).detach()
         before_q = model(xq).detach()
         updated = _take_adamw_window(model, xb, yb, float(args.lr), float(args.weight_decay)).eval()
@@ -1165,7 +1176,7 @@ def run_functional_diagnostic(args: argparse.Namespace, out_dir: Path, device: t
     any_positive = False
     for cid in candidate_ids:
         spec = specs.get(cid)
-        base = _make_model(cid, input_dim, output_dim, x_train, device, int(args.seed) + 501, specs)
+        base = _make_model(cid, input_dim, output_dim, x_train, device, int(args.seed) + 501, specs, y_train)
         task_delta = _grad_delta(base, xb, yb, float(args.lr))
         dirs = {
             "C0-TaskOnlyAdamW": task_delta,
@@ -1423,7 +1434,7 @@ def run_task_qualification(
         total_steps = max(1, int(args.epochs) * int(math.ceil(float(x_train.shape[0]) / float(max(1, int(args.batch_size))))))
         for seed in seeds:
             for method_id in methods:
-                model = _make_model(method_id, int(input_dim), int(output_dim), x_train, device, int(seed) + 125520, local_specs)
+                model = _make_model(method_id, int(input_dim), int(output_dim), x_train, device, int(seed) + 125520, local_specs, y_train)
                 compiled_task_path = 0
                 compile_error = ""
                 if method_id != "MLP-same-param-AdamW" and hasattr(torch, "compile"):
@@ -1432,7 +1443,7 @@ def run_task_qualification(
                         compiled_task_path = 1
                     except Exception as exc:
                         compile_error = str(exc)
-                        model = _make_model(method_id, int(input_dim), int(output_dim), x_train, device, int(seed) + 125520, local_specs)
+                        model = _make_model(method_id, int(input_dim), int(output_dim), x_train, device, int(seed) + 125520, local_specs, y_train)
                 opt = _make_adamw(model.parameters(), args)
                 if compiled_task_path:
                     warm = min(int(args.batch_size), int(x_train.shape[0]))

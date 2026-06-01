@@ -114,6 +114,80 @@ def _make_adamw(params: Iterable[torch.nn.Parameter], args: argparse.Namespace) 
     return torch.optim.AdamW([p for p in params if p.requires_grad], lr=float(args.lr), weight_decay=float(args.weight_decay))
 
 
+def _variant_text(model: torch.nn.Module) -> str:
+    spec = getattr(model, "spec", None)
+    return f"{getattr(spec, 'candidate_id', '')} {getattr(spec, 'init_variant', '')}".lower()
+
+
+def _variant_uses_manual_adamw(args: argparse.Namespace, model: torch.nn.Module) -> bool:
+    text = _variant_text(model)
+    return "manualadamw" in text or _variant_uses_fused_quadproj_adamw(args, model)
+
+
+def _variant_uses_fused_quadproj_adamw(args: argparse.Namespace, model: torch.nn.Module) -> bool:
+    return "fusedprojgradadamw" in _variant_text(model) and isinstance(getattr(model, "quad_proj", None), torch.nn.Parameter)
+
+
+def _triton_adamw_params(args: argparse.Namespace, model: torch.nn.Module) -> List[torch.nn.Parameter]:
+    if _variant_uses_fused_quadproj_adamw(args, model):
+        quad_proj = getattr(model, "quad_proj", None)
+        if isinstance(quad_proj, torch.nn.Parameter) and quad_proj.requires_grad:
+            return [quad_proj]
+    return []
+
+
+def _quad_proj_group_hparams(opt: torch.optim.Optimizer, model: torch.nn.Module, args: argparse.Namespace) -> Tuple[float, float]:
+    quad_proj = getattr(model, "quad_proj", None)
+    for group in getattr(opt, "param_groups", []):
+        if any(p is quad_proj for p in group.get("params", [])):
+            return float(group.get("lr", getattr(args, "lr", 2.0e-3))), float(group.get("weight_decay", getattr(args, "weight_decay", 1.0e-3)))
+    return float(getattr(args, "lr", 2.0e-3)), float(getattr(args, "weight_decay", 1.0e-3))
+
+
+class _ManualForeachAdamW:
+    """Small loss-agnostic AdamW stepper for params with externally supplied grads."""
+
+    def __init__(self, param_groups: Sequence[Mapping[str, Any]], args: argparse.Namespace, triton_update_params: Sequence[torch.nn.Parameter] | None = None) -> None:
+        skip_ids = {id(p) for p in (triton_update_params or [])}
+        self.param_groups: List[Dict[str, Any]] = []
+        for group in param_groups:
+            params = [p for p in group.get("params", []) if isinstance(p, torch.nn.Parameter) and id(p) not in skip_ids]
+            if params:
+                copied = dict(group)
+                copied["params"] = params
+                self.param_groups.append(copied)
+        self.args = args
+        self.step_count = 0
+        self.state: Dict[torch.nn.Parameter, Dict[str, torch.Tensor]] = {}
+
+    @torch.no_grad()
+    def step(self) -> None:
+        self.step_count += 1
+        for group in self.param_groups:
+            lr = float(group.get("lr", getattr(self.args, "lr", 2.0e-3)))
+            weight_decay = float(group.get("weight_decay", getattr(self.args, "weight_decay", 1.0e-3)))
+            beta1, beta2 = group.get("betas", (0.9, 0.999))
+            eps = float(group.get("eps", 1.0e-8))
+            for p in group.get("params", []):
+                if p.grad is None:
+                    continue
+                grad = p.grad.detach()
+                state = self.state.setdefault(p, {})
+                if not state:
+                    state["exp_avg"] = torch.zeros_like(p)
+                    state["exp_avg_sq"] = torch.zeros_like(p)
+                exp_avg = state["exp_avg"]
+                exp_avg_sq = state["exp_avg_sq"]
+                if weight_decay != 0.0:
+                    p.mul_(1.0 - lr * weight_decay)
+                exp_avg.mul_(float(beta1)).add_(grad, alpha=1.0 - float(beta1))
+                exp_avg_sq.mul_(float(beta2)).addcmul_(grad, grad, value=1.0 - float(beta2))
+                bias_correction1 = 1.0 - float(beta1) ** self.step_count
+                bias_correction2 = 1.0 - float(beta2) ** self.step_count
+                step_size = lr * (bias_correction2 ** 0.5) / bias_correction1
+                p.addcdiv_(exp_avg, exp_avg_sq.sqrt().add_(eps), value=-step_size)
+
+
 def _load_mnist(args: argparse.Namespace) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
     data = v120._load_vision_split(
         args,
@@ -391,7 +465,24 @@ def _measure_step(args: argparse.Namespace, model: torch.nn.Module, cid: str, xb
             loss = logits.new_tensor(0.0)
             _sync(device)
             t1 = time.perf_counter()
-            fhq.backward_learnablep_workspace(model, xb, yb, logits, q_out, q2_sum, direct_logits, quad_logits, workspace)
+            if _variant_uses_fused_quadproj_adamw(args, model):
+                quad_lr, quad_weight_decay = _quad_proj_group_hparams(opt, model, args)
+                fhq.backward_learnablep_workspace_fused_quadproj_adamw(
+                    model,
+                    xb,
+                    yb,
+                    logits,
+                    q_out,
+                    q2_sum,
+                    direct_logits,
+                    quad_logits,
+                    workspace,
+                    lr=quad_lr,
+                    weight_decay=quad_weight_decay,
+                    step_count=idx + 1,
+                )
+            else:
+                fhq.backward_learnablep_workspace(model, xb, yb, logits, q_out, q2_sum, direct_logits, quad_logits, workspace)
         else:
             loss = F.cross_entropy(model(xb), yb)
             _sync(device)

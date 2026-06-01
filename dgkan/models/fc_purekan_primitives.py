@@ -1346,9 +1346,21 @@ class PrimitiveKAN(nn.Module):
                 * (0.10 / math.sqrt(max(1, self.cheby_cross_rank)))
             )
         self.cheby_input_cross_enabled = (
-            spec.basis_name == "chebyshev"
-            and int(spec.k) == 3
-            and "inputcross" in variant_lower
+            (
+                spec.basis_name == "chebyshev"
+                and int(spec.k) == 3
+                and "inputcross" in variant_lower
+            )
+            or (
+                spec.basis_name in {"compact_rbf", "fastkan_rbf"}
+                and int(spec.k) == 4
+                and "inputcross" in variant_lower
+            )
+            or (
+                spec.basis_name == "hat_wavelet"
+                and int(spec.k) == 4
+                and "inputcross" in variant_lower
+            )
         )
         self.cheby_input_localrot_enabled = self.cheby_input_cross_enabled and "localrot" in variant_lower
         self.cheby_input_localrot2_enabled = self.cheby_input_cross_enabled and "localrot2" in variant_lower
@@ -1377,13 +1389,26 @@ class PrimitiveKAN(nn.Module):
             self.cheby_input_pair_rank = min(int(local_rank), max(0, self.input_dim // 2))
             self.cheby_input_proj_rank = int(proj_rank)
             if self.cheby_input_proj_rank > 0:
-                left = torch.randn(self.input_dim, self.cheby_input_proj_rank, device=device, generator=gen)
-                left = left / left.norm(dim=0, keepdim=True).clamp_min(1.0e-6)
+                def make_projection_matrix() -> torch.Tensor:
+                    if "orthoproj" not in variant_lower:
+                        proj = torch.randn(self.input_dim, self.cheby_input_proj_rank, device=device, generator=gen)
+                        return proj / proj.norm(dim=0, keepdim=True).clamp_min(1.0e-6)
+                    remaining = self.cheby_input_proj_rank
+                    blocks = []
+                    while remaining > 0:
+                        block_cols = min(max(1, self.input_dim), remaining)
+                        raw = torch.randn(self.input_dim, block_cols, device=device, generator=gen)
+                        q, _ = torch.linalg.qr(raw, mode="reduced")
+                        take = min(int(q.shape[1]), remaining)
+                        blocks.append(q[:, :take])
+                        remaining -= take
+                    return torch.cat(blocks, dim=1)
+
+                left = make_projection_matrix()
                 if "projsq" in variant_lower:
                     right = left.clone()
                 else:
-                    right = torch.randn(self.input_dim, self.cheby_input_proj_rank, device=device, generator=gen)
-                    right = right / right.norm(dim=0, keepdim=True).clamp_min(1.0e-6)
+                    right = make_projection_matrix()
                 self.register_buffer("cheby_input_proj_left", left)
                 self.register_buffer("cheby_input_proj_right", right)
             total_input_cross = self.cheby_input_pair_rank + self.cheby_input_proj_rank
@@ -1397,10 +1422,9 @@ class PrimitiveKAN(nn.Module):
             )
         if self.linear_residual_enabled:
             linear_scale = 0.10
-            if "linearres025" in variant_lower:
-                linear_scale = 0.25
-            elif "linearres050" in variant_lower:
-                linear_scale = 0.50
+            linear_scale_match = re.search(r"linearres(\d{3})", variant_lower)
+            if linear_scale_match is not None:
+                linear_scale = float(int(linear_scale_match.group(1))) / 100.0
             self.linear_readout = nn.Parameter(
                 torch.randn(self.input_dim, self.output_dim, device=device, generator=gen)
                 * (linear_scale / math.sqrt(max(1, self.input_dim)))
@@ -1613,7 +1637,7 @@ class PrimitiveKAN(nn.Module):
         return self.spec.basis_name in {"compact_rbf", "fastkan_rbf"} and int(self.k) in {2, 4} and str(self.spec.init_variant).startswith("rbf_k")
 
     def _manual_hat_wavelet_triton_l3_matmul(self) -> bool:
-        return self.spec.basis_name == "hat_wavelet" and int(self.k) == 4 and self.spec.init_variant == "hat_wavelet_k4_triton_l3_matmul"
+        return self.spec.basis_name == "hat_wavelet" and int(self.k) == 4 and str(self.spec.init_variant).startswith("hat_wavelet_k4_triton_l3_matmul")
 
     def _manual_stream_recompute(self) -> bool:
         return int(self.spec.uses_dense_basis_tensor) == 0 and self.spec.basis_name in {
@@ -1624,8 +1648,16 @@ class PrimitiveKAN(nn.Module):
 
     def manual_kernel_variant(self) -> str:
         if self._manual_rbf_triton_l3_matmul():
+            if self.cheby_input_cross_enabled:
+                if self.linear_residual_enabled:
+                    return f"rbf_k{int(self.k)}_triton_l3_inputcross_linearres_gemm"
+                return f"rbf_k{int(self.k)}_triton_l3_inputcross_gemm"
             return f"rbf_k{int(self.k)}_triton_l3_matmul"
         if self._manual_hat_wavelet_triton_l3_matmul():
+            if self.cheby_input_cross_enabled:
+                if self.linear_residual_enabled:
+                    return "hat_wavelet_k4_triton_l3_inputcross_linearres_gemm"
+                return "hat_wavelet_k4_triton_l3_inputcross_gemm"
             return "hat_wavelet_k4_triton_l3_matmul"
         if self._manual_cheby_k4_triton_l3_matmul():
             return "cheby_k4_triton_l3_matmul"
@@ -1673,11 +1705,27 @@ class PrimitiveKAN(nn.Module):
                 from dgkan.kernels import fused_rbf
 
                 logits, h = fused_rbf.forward_matmul(self, x)
+                if self.cheby_input_cross_enabled:
+                    z = self._norm_input(x)
+                    input_feats = self._cheby_input_cross_features(z)
+                    logits = logits + input_feats @ self.cheby_input_cross_readout
+                    if self.linear_residual_enabled:
+                        logits = logits + (z @ self.linear_readout) / self._linear_residual_denominator()
+                        return logits, (f"rbf_k{int(self.k)}_triton_l3_inputcross_linearres_gemm", x, h, input_feats, z)
+                    return logits, (f"rbf_k{int(self.k)}_triton_l3_inputcross_gemm", x, h, input_feats)
                 return logits, (f"rbf_k{int(self.k)}_triton_l3_matmul", x, h)
             if self._manual_hat_wavelet_triton_l3_matmul():
                 from dgkan.kernels import fused_hat_wavelet
 
                 logits, h = fused_hat_wavelet.forward_matmul(self, x)
+                if self.cheby_input_cross_enabled:
+                    z = self._norm_input(x)
+                    input_feats = self._cheby_input_cross_features(z)
+                    logits = logits + input_feats @ self.cheby_input_cross_readout
+                    if self.linear_residual_enabled:
+                        logits = logits + (z @ self.linear_readout) / self._linear_residual_denominator()
+                        return logits, ("hat_wavelet_k4_triton_l3_inputcross_linearres_gemm", x, h, input_feats, z)
+                    return logits, ("hat_wavelet_k4_triton_l3_inputcross_gemm", x, h, input_feats)
                 return logits, ("hat_wavelet_k4_triton_l3_matmul", x, h)
             if self._manual_fourier_k4_linearres_triton_l3_matmul():
                 from dgkan.kernels import fused_fourier_k2
@@ -1974,11 +2022,41 @@ class PrimitiveKAN(nn.Module):
 
                 _variant, x, h = cache
                 return fused_rbf.backward(self, x, y, logits, h)
+            if cache and isinstance(cache[0], str) and str(cache[0]).startswith("rbf_k") and str(cache[0]).endswith("_triton_l3_inputcross_gemm"):
+                from dgkan.kernels import fused_rbf
+
+                _variant, x, h, input_feats = cache
+                loss = fused_rbf.backward(self, x, y, logits, h)
+                self.cheby_input_cross_readout.grad = input_feats.transpose(0, 1) @ grad_logits
+                return loss
+            if cache and isinstance(cache[0], str) and str(cache[0]).startswith("rbf_k") and str(cache[0]).endswith("_triton_l3_inputcross_linearres_gemm"):
+                from dgkan.kernels import fused_rbf
+
+                _variant, x, h, input_feats, z = cache
+                loss = fused_rbf.backward(self, x, y, logits, h)
+                self.cheby_input_cross_readout.grad = input_feats.transpose(0, 1) @ grad_logits
+                self.linear_readout.grad = (z.transpose(0, 1) @ grad_logits) / self._linear_residual_denominator()
+                return loss
             if cache and isinstance(cache[0], str) and cache[0] == "hat_wavelet_k4_triton_l3_matmul":
                 from dgkan.kernels import fused_hat_wavelet
 
                 _variant, x, h = cache
                 return fused_hat_wavelet.backward(self, x, y, logits, h)
+            if cache and isinstance(cache[0], str) and cache[0] == "hat_wavelet_k4_triton_l3_inputcross_gemm":
+                from dgkan.kernels import fused_hat_wavelet
+
+                _variant, x, h, input_feats = cache
+                loss = fused_hat_wavelet.backward(self, x, y, logits, h)
+                self.cheby_input_cross_readout.grad = input_feats.transpose(0, 1) @ grad_logits
+                return loss
+            if cache and isinstance(cache[0], str) and cache[0] == "hat_wavelet_k4_triton_l3_inputcross_linearres_gemm":
+                from dgkan.kernels import fused_hat_wavelet
+
+                _variant, x, h, input_feats, z = cache
+                loss = fused_hat_wavelet.backward(self, x, y, logits, h)
+                self.cheby_input_cross_readout.grad = input_feats.transpose(0, 1) @ grad_logits
+                self.linear_readout.grad = (z.transpose(0, 1) @ grad_logits) / self._linear_residual_denominator()
+                return loss
             if cache and isinstance(cache[0], str) and str(cache[0]).endswith("_stream_recompute"):
                 _variant, z, h = cache
                 sqrt_h = math.sqrt(max(1, self.hidden_dim))
@@ -4246,6 +4324,32 @@ class SimpleFastTaskGeometryKAN(nn.Module):
             direct_readout.mul_(float(direct_readout_init_scale))
         self.direct_readout = nn.Parameter(direct_readout)
         quad_proj = torch.randn(self.input_dim, self.hidden_dim, device=device, generator=gen) / math.sqrt(max(1, self.input_dim))
+
+        def _normalize_cols(mat: torch.Tensor) -> torch.Tensor:
+            mat = torch.nan_to_num(mat, nan=0.0, posinf=0.0, neginf=0.0)
+            mat = mat - mat.mean(dim=0, keepdim=True)
+            return mat / mat.norm(dim=0, keepdim=True).clamp_min(1.0e-6)
+
+        def _orthogonal_fill(base: torch.Tensor, start_col: int) -> None:
+            col = int(start_col)
+            while col < self.hidden_dim:
+                vec = torch.randn(self.input_dim, device=device, generator=gen)
+                if col > 0:
+                    comps = torch.nan_to_num(base[:, :col], nan=0.0, posinf=0.0, neginf=0.0)
+                    try:
+                        coeff = torch.linalg.lstsq(comps.float(), vec.float()).solution.to(device=device, dtype=vec.dtype)
+                        vec = vec - comps @ coeff
+                    except RuntimeError:
+                        vec = vec - comps @ (comps.transpose(0, 1) @ vec)
+                if (not bool(torch.isfinite(vec).all())) or float(vec.norm().item()) <= 1.0e-8:
+                    vec = torch.randn(self.input_dim, device=device, generator=gen)
+                vec = vec - vec.mean()
+                if (not bool(torch.isfinite(vec).all())) or float(vec.norm().item()) <= 1.0e-8:
+                    vec = torch.zeros(self.input_dim, device=device)
+                    vec[col % self.input_dim] = 1.0
+                base[:, col] = vec / vec.norm().clamp_min(1.0e-6)
+                col += 1
+
         if probe_dirs is not None and "trainprobep" in variant_lower:
             with torch.no_grad():
                 quad_proj.zero_()
@@ -4316,6 +4420,910 @@ class SimpleFastTaskGeometryKAN(nn.Module):
                     vec = vec - vec.mean()
                     quad_proj[:, col] = vec / vec.norm().clamp_min(1.0e-6)
                     col += 1
+        if "srhtp" in variant_lower or "lowcoherencep" in variant_lower or "blockframep" in variant_lower:
+            with torch.no_grad():
+                quad_proj.zero_()
+                col = 0
+
+                def _write_v1228_frame(frame: torch.Tensor, limit: int) -> None:
+                    nonlocal col
+                    if limit <= 0 or col >= self.hidden_dim:
+                        return
+                    frame = frame.to(device=device, dtype=quad_proj.dtype)
+                    frame = torch.nan_to_num(frame, nan=0.0, posinf=0.0, neginf=0.0)
+                    frame = frame - frame.mean(dim=0, keepdim=True)
+                    frame = frame / frame.norm(dim=0, keepdim=True).clamp_min(1.0e-6)
+                    take = min(int(limit), int(frame.shape[1]), self.hidden_dim - col)
+                    if take > 0:
+                        quad_proj[:, col : col + take] = frame[:, :take]
+                        col += take
+
+                if "srhtp" in variant_lower or "lowcoherencep" in variant_lower:
+                    quota = self.hidden_dim if "lowcoherencep" in variant_lower else max(4, self.hidden_dim // 2)
+                    signs = torch.where(
+                        torch.rand(self.input_dim, quota, device=device, generator=gen) > 0.5,
+                        torch.ones(self.input_dim, quota, device=device),
+                        -torch.ones(self.input_dim, quota, device=device),
+                    )
+                    signs = signs / math.sqrt(max(1, self.input_dim))
+                    if self.input_dim >= quota:
+                        try:
+                            q_frame, r_frame = torch.linalg.qr(signs, mode="reduced")
+                            diag = torch.sign(torch.diag(r_frame))
+                            diag = torch.where(diag == 0, torch.ones_like(diag), diag)
+                            signs = q_frame * diag.view(1, -1)
+                        except RuntimeError:
+                            pass
+                    _write_v1228_frame(signs, quota)
+                if "blockframep" in variant_lower:
+                    side = int(round(math.sqrt(float(self.input_dim))))
+                    if side * side == self.input_dim:
+                        tile = max(2, side // 4)
+                        modes = [(0, 0), (1, 0), (0, 1), (1, 1), (2, 0), (0, 2)]
+                        local_cols = []
+                        for y0 in range(0, side, tile):
+                            for x0 in range(0, side, tile):
+                                y1 = min(side, y0 + tile)
+                                x1 = min(side, x0 + tile)
+                                yy = torch.linspace(0.0, 1.0, max(1, y1 - y0), device=device)
+                                xx = torch.linspace(0.0, 1.0, max(1, x1 - x0), device=device)
+                                gy, gx = torch.meshgrid(yy, xx, indexing="ij")
+                                for fy, fx in modes:
+                                    basis = torch.zeros(side, side, device=device)
+                                    patch = torch.cos(math.pi * float(fy) * (gy + 0.5 / max(1, y1 - y0))) * torch.cos(
+                                        math.pi * float(fx) * (gx + 0.5 / max(1, x1 - x0))
+                                    )
+                                    basis[y0:y1, x0:x1] = patch
+                                    local_cols.append(basis.reshape(-1))
+                                    if len(local_cols) >= max(4, self.hidden_dim // 2):
+                                        break
+                                if len(local_cols) >= max(4, self.hidden_dim // 2):
+                                    break
+                            if len(local_cols) >= max(4, self.hidden_dim // 2):
+                                break
+                        if local_cols:
+                            _write_v1228_frame(torch.stack(local_cols, dim=1), max(4, self.hidden_dim // 2))
+                _orthogonal_fill(quad_proj, col)
+        if "pcaorthomixp" in variant_lower:
+            with torch.no_grad():
+                z_centered = z_stats - z_stats.mean(dim=0, keepdim=True)
+                try:
+                    _u_pca, _s_pca, vh_pca = torch.linalg.svd(z_centered, full_matrices=False)
+                    n_comp = min(max(1, self.hidden_dim // 2), int(vh_pca.shape[0]), self.hidden_dim)
+                    signs = torch.where(
+                        torch.rand(n_comp, device=device, generator=gen) > 0.5,
+                        torch.ones(n_comp, device=device),
+                        -torch.ones(n_comp, device=device),
+                    )
+                    quad_proj.zero_()
+                    quad_proj[:, :n_comp] = vh_pca[:n_comp].transpose(0, 1).contiguous() * signs.view(1, -1)
+                    _orthogonal_fill(quad_proj, n_comp)
+                except RuntimeError:
+                    pass
+        if "augstablep" in variant_lower and "blocklocalaugstablep" not in variant_lower:
+            with torch.no_grad():
+                z_centered = z_stats - z_stats.mean(dim=0, keepdim=True)
+                jitter = torch.randn(z_centered.shape, device=device, generator=gen) * 0.03
+                aug_a = z_centered + jitter
+                aug_b = z_centered - jitter
+                stable = 0.5 * (aug_a + aug_b)
+                try:
+                    _u_aug, _s_aug, vh_aug = torch.linalg.svd(stable, full_matrices=False)
+                    n_comp = min(int(vh_aug.shape[0]), self.hidden_dim)
+                    quad_proj.zero_()
+                    quad_proj[:, :n_comp] = vh_aug[:n_comp].transpose(0, 1).contiguous()
+                    _orthogonal_fill(quad_proj, n_comp)
+                except RuntimeError:
+                    pass
+        if "randomcotangentstablep" in variant_lower:
+            with torch.no_grad():
+                z_centered = z_stats - z_stats.mean(dim=0, keepdim=True)
+                cot_dim = min(32, max(4, self.output_dim * 4))
+                cot = torch.randn(self.input_dim, cot_dim, device=device, generator=gen) / math.sqrt(max(1, self.input_dim))
+                response = z_centered @ cot
+                stability_weight = response.float().square().mean(dim=0).clamp_min(1.0e-8)
+                weighted = z_centered.transpose(0, 1) @ (response * stability_weight.view(1, -1))
+                try:
+                    u_cot, _s_cot, _vh_cot = torch.linalg.svd(weighted, full_matrices=False)
+                    n_comp = min(int(u_cot.shape[1]), self.hidden_dim)
+                    quad_proj.zero_()
+                    quad_proj[:, :n_comp] = u_cot[:, :n_comp].contiguous()
+                    _orthogonal_fill(quad_proj, n_comp)
+                except RuntimeError:
+                    pass
+        if "covwhitenp" in variant_lower:
+            with torch.no_grad():
+                z_centered = z_stats - z_stats.mean(dim=0, keepdim=True)
+                cov = z_centered.transpose(0, 1) @ z_centered / float(max(1, int(z_centered.shape[0]) - 1))
+                try:
+                    evals, evecs = torch.linalg.eigh(cov.float())
+                    evals = evals.clamp_min(1.0e-5)
+                    frame = torch.randn(self.input_dim, self.hidden_dim, device=device, generator=gen)
+                    whitened = evecs.to(device=device) @ (frame / evals.sqrt().view(-1, 1).to(device=device))
+                    quad_proj = _normalize_cols(whitened).contiguous()
+                except RuntimeError:
+                    pass
+        if "blocklocalaugstablep" in variant_lower:
+            with torch.no_grad():
+                quad_proj.zero_()
+                side = int(round(math.sqrt(float(self.input_dim))))
+                col = 0
+                if side * side == self.input_dim:
+                    z_img = z_stats.reshape(int(z_stats.shape[0]), side, side)
+                    shifted = 0.25 * (
+                        torch.roll(z_img, shifts=1, dims=1)
+                        + torch.roll(z_img, shifts=-1, dims=1)
+                        + torch.roll(z_img, shifts=1, dims=2)
+                        + torch.roll(z_img, shifts=-1, dims=2)
+                    )
+                    stable_map = (z_img * shifted).mean(dim=0).abs()
+                    tile = max(2, side // 4)
+                    tiles: list[tuple[float, int, int, int, int]] = []
+                    for y0 in range(0, side, tile):
+                        for x0 in range(0, side, tile):
+                            y1 = min(side, y0 + tile)
+                            x1 = min(side, x0 + tile)
+                            tiles.append((float(stable_map[y0:y1, x0:x1].mean().item()), y0, y1, x0, x1))
+                    tiles.sort(reverse=True, key=lambda item: item[0])
+                    modes = [(0, 0), (1, 0), (0, 1), (1, 1)]
+                    for _score, y0, y1, x0, x1 in tiles:
+                        yy = torch.linspace(0.0, 1.0, max(1, y1 - y0), device=device)
+                        xx = torch.linspace(0.0, 1.0, max(1, x1 - x0), device=device)
+                        gy, gx = torch.meshgrid(yy, xx, indexing="ij")
+                        for fy, fx in modes:
+                            if col >= self.hidden_dim:
+                                break
+                            patch = torch.cos(math.pi * float(fy) * (gy + 0.5 / max(1, y1 - y0))) * torch.cos(
+                                math.pi * float(fx) * (gx + 0.5 / max(1, x1 - x0))
+                            )
+                            basis = torch.zeros(side, side, device=device)
+                            basis[y0:y1, x0:x1] = patch
+                            vec = basis.reshape(-1)
+                            vec = vec - vec.mean()
+                            quad_proj[:, col] = vec / vec.norm().clamp_min(1.0e-6)
+                            col += 1
+                        if col >= self.hidden_dim:
+                            break
+                _orthogonal_fill(quad_proj, col)
+        if "multiviewstablep" in variant_lower or "multiviewresidualp" in variant_lower or "multiviewblockp" in variant_lower:
+            with torch.no_grad():
+                z_centered = z_stats - z_stats.mean(dim=0, keepdim=True)
+                side = int(round(math.sqrt(float(self.input_dim))))
+                views = [z_centered]
+                if side * side == self.input_dim:
+                    z_img = z_centered.reshape(int(z_centered.shape[0]), side, side)
+                    low_pass = 0.25 * (
+                        torch.roll(z_img, shifts=1, dims=1)
+                        + torch.roll(z_img, shifts=-1, dims=1)
+                        + torch.roll(z_img, shifts=1, dims=2)
+                        + torch.roll(z_img, shifts=-1, dims=2)
+                    )
+                    high_pass = z_img - low_pass
+                    views.extend(
+                        [
+                            torch.roll(z_img, shifts=1, dims=1).reshape(int(z_img.shape[0]), -1),
+                            torch.roll(z_img, shifts=-1, dims=2).reshape(int(z_img.shape[0]), -1),
+                            low_pass.reshape(int(z_img.shape[0]), -1),
+                            high_pass.reshape(int(z_img.shape[0]), -1),
+                        ]
+                    )
+                jitter = torch.randn(z_centered.shape, device=device, generator=gen) * 0.035
+                dropout = (torch.rand(z_centered.shape, device=device, generator=gen) > 0.10).to(dtype=z_centered.dtype)
+                views.extend([z_centered + jitter, z_centered - jitter, z_centered * dropout])
+                stable = torch.stack(views, dim=0).mean(dim=0)
+                unstable = torch.stack([(view - stable).square() for view in views], dim=0).mean(dim=0)
+                quad_proj.zero_()
+                col = 0
+
+                def _write_mv_frame(frame: torch.Tensor, limit: int) -> None:
+                    nonlocal col
+                    if col >= self.hidden_dim or limit <= 0:
+                        return
+                    frame = frame.to(device=device, dtype=quad_proj.dtype)
+                    frame = torch.nan_to_num(frame, nan=0.0, posinf=0.0, neginf=0.0)
+                    frame = frame - frame.mean(dim=0, keepdim=True)
+                    frame = frame / frame.norm(dim=0, keepdim=True).clamp_min(1.0e-6)
+                    take = min(int(limit), int(frame.shape[1]), self.hidden_dim - col)
+                    if take > 0:
+                        quad_proj[:, col : col + take] = frame[:, :take]
+                        col += take
+
+                try:
+                    _u_mv, _s_mv, vh_mv = torch.linalg.svd((stable - stable.mean(dim=0, keepdim=True)).float(), full_matrices=False)
+                    _write_mv_frame(vh_mv.transpose(0, 1).contiguous(), max(2, self.hidden_dim // 2))
+                except RuntimeError:
+                    pass
+                if "multiviewresidualp" in variant_lower:
+                    try:
+                        _u_un, _s_un, vh_un = torch.linalg.svd((unstable - unstable.mean(dim=0, keepdim=True)).float(), full_matrices=False)
+                        _write_mv_frame(vh_un.transpose(0, 1).contiguous(), max(2, self.hidden_dim // 4))
+                    except RuntimeError:
+                        pass
+                if "multiviewblockp" in variant_lower and side * side == self.input_dim:
+                    stable_map = stable.reshape(int(stable.shape[0]), side, side).abs().mean(dim=0)
+                    tile = max(2, side // 4)
+                    tiles: list[tuple[float, int, int, int, int]] = []
+                    for y0 in range(0, side, tile):
+                        for x0 in range(0, side, tile):
+                            y1 = min(side, y0 + tile)
+                            x1 = min(side, x0 + tile)
+                            tiles.append((float(stable_map[y0:y1, x0:x1].mean().item()), y0, y1, x0, x1))
+                    tiles.sort(reverse=True, key=lambda item: item[0])
+                    local_cols = []
+                    for _score, y0, y1, x0, x1 in tiles:
+                        basis = torch.zeros(side, side, device=device)
+                        basis[y0:y1, x0:x1] = 1.0
+                        local_cols.append(basis.reshape(-1))
+                        if len(local_cols) >= max(2, self.hidden_dim // 4):
+                            break
+                    if local_cols:
+                        _write_mv_frame(torch.stack(local_cols, dim=1), max(2, self.hidden_dim // 4))
+                _orthogonal_fill(quad_proj, col)
+        if "temporaldriftstablep" in variant_lower or "temporaldriftresidualp" in variant_lower or "temporaldriftlowrankp" in variant_lower:
+            with torch.no_grad():
+                z_centered = z_stats - z_stats.mean(dim=0, keepdim=True)
+                cot_dim = min(64, max(8, self.output_dim * 6))
+                cot_a = torch.randn(self.input_dim, cot_dim, device=device, generator=gen) / math.sqrt(max(1, self.input_dim))
+                cot_b = torch.randn(self.input_dim, cot_dim, device=device, generator=gen) / math.sqrt(max(1, self.input_dim))
+                response_a = torch.tanh(z_centered @ cot_a)
+                response_b = torch.tanh((z_centered + 0.02 * torch.randn(z_centered.shape, device=device, generator=gen)) @ cot_b)
+                drift = response_b - response_a
+                stable_weight = drift.float().square().mean(dim=0).clamp_min(1.0e-8).rsqrt()
+                stable_weight = stable_weight / stable_weight.mean().clamp_min(1.0e-6)
+                weighted = z_centered.transpose(0, 1) @ (drift * stable_weight.view(1, -1))
+                quad_proj.zero_()
+                col = 0
+                try:
+                    u_td, _s_td, _vh_td = torch.linalg.svd(weighted.float(), full_matrices=False)
+                    take = min(int(u_td.shape[1]), max(2, self.hidden_dim // 2))
+                    quad_proj[:, :take] = u_td[:, :take].to(device=device, dtype=quad_proj.dtype)
+                    col = take
+                except RuntimeError:
+                    pass
+                if "temporaldriftresidualp" in variant_lower or "temporaldriftlowrankp" in variant_lower:
+                    try:
+                        _u_var, _s_var, vh_var = torch.linalg.svd((response_a - response_a.mean(dim=0, keepdim=True)).float(), full_matrices=False)
+                        back = cot_a @ vh_var.transpose(0, 1).to(device=device, dtype=cot_a.dtype)
+                        back = back - back.mean(dim=0, keepdim=True)
+                        back = back / back.norm(dim=0, keepdim=True).clamp_min(1.0e-6)
+                        take_res = min(int(back.shape[1]), self.hidden_dim - col, max(2, self.hidden_dim // 4))
+                        if take_res > 0:
+                            quad_proj[:, col : col + take_res] = back[:, :take_res]
+                            col += take_res
+                    except RuntimeError:
+                        pass
+                _orthogonal_fill(quad_proj, col)
+        if "blocklocalcovp" in variant_lower or "blocklocaledgep" in variant_lower or "blocklocalstableaugp" in variant_lower:
+            with torch.no_grad():
+                quad_proj.zero_()
+                col = 0
+                side = int(round(math.sqrt(float(self.input_dim))))
+                if side * side == self.input_dim:
+                    z_img = (z_stats - z_stats.mean(dim=0, keepdim=True)).reshape(int(z_stats.shape[0]), side, side)
+                    edge_x = z_img - torch.roll(z_img, shifts=1, dims=2)
+                    edge_y = z_img - torch.roll(z_img, shifts=1, dims=1)
+                    stable = 0.5 * (
+                        z_img
+                        + 0.25
+                        * (
+                            torch.roll(z_img, shifts=1, dims=1)
+                            + torch.roll(z_img, shifts=-1, dims=1)
+                            + torch.roll(z_img, shifts=1, dims=2)
+                            + torch.roll(z_img, shifts=-1, dims=2)
+                        )
+                    )
+                    score_map = z_img.square().mean(dim=0)
+                    if "blocklocaledgep" in variant_lower:
+                        score_map = edge_x.square().mean(dim=0) + edge_y.square().mean(dim=0)
+                    elif "blocklocalstableaugp" in variant_lower:
+                        score_map = stable.square().mean(dim=0)
+                    tile = max(2, side // 4)
+                    tiles: list[tuple[float, int, int, int, int]] = []
+                    for y0 in range(0, side, tile):
+                        for x0 in range(0, side, tile):
+                            y1 = min(side, y0 + tile)
+                            x1 = min(side, x0 + tile)
+                            tiles.append((float(score_map[y0:y1, x0:x1].mean().item()), y0, y1, x0, x1))
+                    tiles.sort(reverse=True, key=lambda item: item[0])
+                    modes = [(0, 0), (1, 0), (0, 1), (1, 1), (2, 0), (0, 2)]
+                    for _score, y0, y1, x0, x1 in tiles:
+                        yy = torch.linspace(0.0, 1.0, max(1, y1 - y0), device=device)
+                        xx = torch.linspace(0.0, 1.0, max(1, x1 - x0), device=device)
+                        gy, gx = torch.meshgrid(yy, xx, indexing="ij")
+                        for fy, fx in modes:
+                            if col >= self.hidden_dim:
+                                break
+                            patch = torch.cos(math.pi * float(fy) * (gy + 0.5 / max(1, y1 - y0))) * torch.cos(
+                                math.pi * float(fx) * (gx + 0.5 / max(1, x1 - x0))
+                            )
+                            if "blocklocaledgep" in variant_lower and (fy + fx) == 0:
+                                patch = patch * 0.25
+                            basis = torch.zeros(side, side, device=device)
+                            basis[y0:y1, x0:x1] = patch
+                            vec = basis.reshape(-1)
+                            vec = vec - vec.mean()
+                            quad_proj[:, col] = vec / vec.norm().clamp_min(1.0e-6)
+                            col += 1
+                        if col >= self.hidden_dim:
+                            break
+                _orthogonal_fill(quad_proj, col)
+        if "crossrandprojp" in variant_lower or "crossprojresidualp" in variant_lower:
+            with torch.no_grad():
+                z_centered = z_stats - z_stats.mean(dim=0, keepdim=True)
+                proj_dim = min(96, max(16, self.output_dim * 8))
+                r1 = torch.randn(self.input_dim, proj_dim, device=device, generator=gen) / math.sqrt(max(1, self.input_dim))
+                r2 = torch.randn(self.input_dim, proj_dim, device=device, generator=gen) / math.sqrt(max(1, self.input_dim))
+                z1 = torch.tanh(z_centered @ r1)
+                z2 = torch.tanh(z_centered @ r2)
+                cross = z1.transpose(0, 1) @ z2 / float(max(1, int(z_centered.shape[0]) - 1))
+                predictive = z_centered.transpose(0, 1) @ (z2 @ cross.transpose(0, 1))
+                quad_proj.zero_()
+                col = 0
+                try:
+                    u_cp, _s_cp, _vh_cp = torch.linalg.svd(predictive.float(), full_matrices=False)
+                    take = min(int(u_cp.shape[1]), max(2, self.hidden_dim // 2))
+                    quad_proj[:, :take] = u_cp[:, :take].to(device=device, dtype=quad_proj.dtype)
+                    col = take
+                except RuntimeError:
+                    pass
+                if "crossprojresidualp" in variant_lower:
+                    residual = r1 - r2
+                    residual = residual - residual.mean(dim=0, keepdim=True)
+                    residual = residual / residual.norm(dim=0, keepdim=True).clamp_min(1.0e-6)
+                    take_res = min(int(residual.shape[1]), self.hidden_dim - col, max(2, self.hidden_dim // 4))
+                    if take_res > 0:
+                        quad_proj[:, col : col + take_res] = residual[:, :take_res]
+                        col += take_res
+                _orthogonal_fill(quad_proj, col)
+        if "pseudopartitionp" in variant_lower or "affinityanchorp" in variant_lower or "rankconsensusp" in variant_lower:
+            with torch.no_grad():
+                z_centered = z_stats - z_stats.mean(dim=0, keepdim=True)
+                z_work = z_centered.float()
+                quad_proj.zero_()
+                col = 0
+
+                def _write_signal_frame(frame: torch.Tensor, limit: int) -> None:
+                    nonlocal col
+                    if limit <= 0 or col >= self.hidden_dim:
+                        return
+                    frame = torch.nan_to_num(frame.float(), nan=0.0, posinf=0.0, neginf=0.0)
+                    frame = frame - frame.mean(dim=0, keepdim=True)
+                    frame = frame / frame.norm(dim=0, keepdim=True).clamp_min(1.0e-6)
+                    take = min(int(limit), int(frame.shape[1]), self.hidden_dim - col)
+                    if take > 0:
+                        quad_proj[:, col : col + take] = frame[:, :take].to(device=device, dtype=quad_proj.dtype)
+                        col += take
+
+                if "pseudopartitionp" in variant_lower and int(z_work.shape[0]) >= 4:
+                    k = min(max(6, self.output_dim * 2), int(z_work.shape[0]), 32)
+                    perm = torch.randperm(int(z_work.shape[0]), device=device, generator=gen)[:k]
+                    centers = z_work[perm].clone()
+                    for _ in range(4):
+                        dist = torch.cdist(z_work, centers, p=2)
+                        assign = dist.argmin(dim=1)
+                        updated = []
+                        for c in range(k):
+                            mask = assign == c
+                            if bool(mask.any()):
+                                updated.append(z_work[mask].mean(dim=0))
+                            else:
+                                updated.append(centers[c])
+                        centers = torch.stack(updated, dim=0)
+                    counts = torch.stack([(assign == c).float().sum() for c in range(k)]).clamp_min(1.0)
+                    centers = centers - (counts.view(-1, 1) * centers).sum(dim=0, keepdim=True) / counts.sum().clamp_min(1.0)
+                    order = torch.argsort(counts, descending=True)
+                    center_frame = centers[order].transpose(0, 1).contiguous()
+                    _write_signal_frame(center_frame, max(2, self.hidden_dim // 2))
+                    if col < self.hidden_dim:
+                        one_hot = torch.zeros(int(z_work.shape[0]), k, device=device)
+                        one_hot.scatter_(1, assign.view(-1, 1), 1.0)
+                        one_hot = one_hot - one_hot.mean(dim=0, keepdim=True)
+                        try:
+                            response_frame = z_work.transpose(0, 1) @ one_hot / float(max(1, int(z_work.shape[0]) - 1))
+                            _write_signal_frame(response_frame[:, order], max(2, self.hidden_dim // 4))
+                        except RuntimeError:
+                            pass
+
+                if "affinityanchorp" in variant_lower and int(z_work.shape[0]) >= 4:
+                    m = min(64, max(8, self.output_dim * 8), int(z_work.shape[0]))
+                    perm = torch.randperm(int(z_work.shape[0]), device=device, generator=gen)[:m]
+                    landmarks = z_work[perm]
+                    dist2 = torch.cdist(z_work, landmarks, p=2).square()
+                    sigma = torch.median(dist2.detach()).clamp_min(1.0e-4)
+                    affinity = torch.exp(-dist2 / sigma)
+                    affinity = affinity / affinity.sum(dim=1, keepdim=True).clamp_min(1.0e-6)
+                    affinity = affinity - affinity.mean(dim=0, keepdim=True)
+                    try:
+                        anchor_frame = z_work.transpose(0, 1) @ affinity / float(max(1, int(z_work.shape[0]) - 1))
+                        _u_af, _s_af, vh_af = torch.linalg.svd(anchor_frame.float(), full_matrices=False)
+                        _write_signal_frame(_u_af, max(2, self.hidden_dim // 2))
+                        if col < self.hidden_dim:
+                            _write_signal_frame(anchor_frame @ vh_af.transpose(0, 1), max(2, self.hidden_dim // 4))
+                    except RuntimeError:
+                        pass
+
+                if "rankconsensusp" in variant_lower:
+                    proj_dim = min(96, max(16, self.output_dim * 8))
+                    random_proj = torch.randn(self.input_dim, proj_dim, device=device, generator=gen) / math.sqrt(max(1, self.input_dim))
+                    responses = torch.tanh(z_work @ random_proj)
+                    rank_center = responses - responses.mean(dim=0, keepdim=True)
+                    spread = rank_center.abs().mean(dim=0).clamp_min(1.0e-6)
+                    rank_center = rank_center / spread.view(1, -1)
+                    try:
+                        consensus = z_work.transpose(0, 1) @ rank_center / float(max(1, int(z_work.shape[0]) - 1))
+                        _u_rc, _s_rc, _vh_rc = torch.linalg.svd(consensus.float(), full_matrices=False)
+                        _write_signal_frame(_u_rc, max(2, self.hidden_dim // 2))
+                    except RuntimeError:
+                        pass
+                if "pseudoviewmixp" in variant_lower:
+                    side = int(round(math.sqrt(float(self.input_dim))))
+                    views = [z_work]
+                    if side * side == self.input_dim:
+                        z_img = z_work.reshape(int(z_work.shape[0]), side, side)
+                        low_pass = 0.25 * (
+                            torch.roll(z_img, shifts=1, dims=1)
+                            + torch.roll(z_img, shifts=-1, dims=1)
+                            + torch.roll(z_img, shifts=1, dims=2)
+                            + torch.roll(z_img, shifts=-1, dims=2)
+                        )
+                        views.extend(
+                            [
+                                torch.roll(z_img, shifts=1, dims=1).reshape(int(z_img.shape[0]), -1),
+                                torch.roll(z_img, shifts=-1, dims=2).reshape(int(z_img.shape[0]), -1),
+                                low_pass.reshape(int(z_img.shape[0]), -1),
+                            ]
+                        )
+                    stable = torch.stack(views, dim=0).mean(dim=0)
+                    try:
+                        _u_pv, _s_pv, vh_pv = torch.linalg.svd((stable - stable.mean(dim=0, keepdim=True)).float(), full_matrices=False)
+                        _write_signal_frame(vh_pv.transpose(0, 1).contiguous(), max(2, self.hidden_dim // 4))
+                    except RuntimeError:
+                        pass
+                if "pseudoblockguardp" in variant_lower:
+                    side = int(round(math.sqrt(float(self.input_dim))))
+                    if side * side == self.input_dim:
+                        z_img = z_work.reshape(int(z_work.shape[0]), side, side)
+                        low_pass = 0.25 * (
+                            torch.roll(z_img, shifts=1, dims=1)
+                            + torch.roll(z_img, shifts=-1, dims=1)
+                            + torch.roll(z_img, shifts=1, dims=2)
+                            + torch.roll(z_img, shifts=-1, dims=2)
+                        )
+                        stable_map = (z_img * low_pass).mean(dim=0).abs()
+                        tile = max(2, side // 4)
+                        tiles: list[tuple[float, int, int, int, int]] = []
+                        for y0 in range(0, side, tile):
+                            for x0 in range(0, side, tile):
+                                y1 = min(side, y0 + tile)
+                                x1 = min(side, x0 + tile)
+                                tiles.append((float(stable_map[y0:y1, x0:x1].mean().item()), y0, y1, x0, x1))
+                        tiles.sort(reverse=True, key=lambda item: item[0])
+                        local_cols = []
+                        for _score, y0, y1, x0, x1 in tiles[: max(2, self.hidden_dim // 4)]:
+                            basis = torch.zeros(side, side, device=device)
+                            basis[y0:y1, x0:x1] = 1.0
+                            local_cols.append(basis.reshape(-1))
+                        if local_cols:
+                            _write_signal_frame(torch.stack(local_cols, dim=1), max(2, self.hidden_dim // 4))
+                _orthogonal_fill(quad_proj, col)
+        if "augtangentp" in variant_lower:
+            with torch.no_grad():
+                quad_proj.zero_()
+                col = 0
+                z_centered = z_stats - z_stats.mean(dim=0, keepdim=True)
+                side = int(round(math.sqrt(float(self.input_dim))))
+                tangent_rows: list[torch.Tensor] = []
+                if side * side == self.input_dim:
+                    z_img = z_centered.reshape(int(z_centered.shape[0]), side, side)
+                    for shift in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
+                        rolled = torch.roll(z_img, shifts=shift, dims=(1, 2))
+                        tangent_rows.append((rolled - z_img).reshape(int(z_img.shape[0]), -1))
+                    blurred = 0.25 * (
+                        torch.roll(z_img, shifts=1, dims=1)
+                        + torch.roll(z_img, shifts=-1, dims=1)
+                        + torch.roll(z_img, shifts=1, dims=2)
+                        + torch.roll(z_img, shifts=-1, dims=2)
+                    )
+                    tangent_rows.append((blurred - z_img).reshape(int(z_img.shape[0]), -1))
+                else:
+                    jitter_a = torch.randn(z_centered.shape, device=device, generator=gen) * 0.04
+                    jitter_b = torch.randn(z_centered.shape, device=device, generator=gen) * 0.04
+                    tangent_rows.extend([jitter_a, jitter_b, z_centered * jitter_a.sign()])
+                tangent = torch.cat(tangent_rows, dim=0) if tangent_rows else z_centered
+                tangent = tangent - tangent.mean(dim=0, keepdim=True)
+                try:
+                    _u_tan, _s_tan, vh_tan = torch.linalg.svd(tangent.float(), full_matrices=False)
+                    take = min(int(vh_tan.shape[0]), self.hidden_dim)
+                    if take > 0:
+                        quad_proj[:, :take] = vh_tan[:take].transpose(0, 1).to(device=device, dtype=quad_proj.dtype)
+                        col = take
+                except RuntimeError:
+                    pass
+                _orthogonal_fill(quad_proj, col)
+        if "rolebalancedp" in variant_lower:
+            with torch.no_grad():
+                quad_proj.zero_()
+                col = 0
+
+                def _write_role_frame(frame: torch.Tensor, limit: int) -> None:
+                    nonlocal col
+                    if limit <= 0 or col >= self.hidden_dim:
+                        return
+                    frame = frame.to(device=device, dtype=quad_proj.dtype)
+                    frame = frame - frame.mean(dim=0, keepdim=True)
+                    frame = frame / frame.norm(dim=0, keepdim=True).clamp_min(1.0e-6)
+                    take = min(int(limit), int(frame.shape[1]), self.hidden_dim - col)
+                    if take > 0:
+                        quad_proj[:, col : col + take] = frame[:, :take]
+                        col += take
+
+                z_centered = z_stats - z_stats.mean(dim=0, keepdim=True)
+                quota = max(2, self.hidden_dim // 4)
+                try:
+                    _u_pca, _s_pca, vh_pca = torch.linalg.svd(z_centered.float(), full_matrices=False)
+                    _write_role_frame(vh_pca.transpose(0, 1).contiguous(), quota)
+                except RuntimeError:
+                    pass
+                side = int(round(math.sqrt(float(self.input_dim))))
+                if side * side == self.input_dim:
+                    yy = torch.linspace(0.0, 1.0, side, device=device)
+                    xx = torch.linspace(0.0, 1.0, side, device=device)
+                    gy, gx = torch.meshgrid(yy, xx, indexing="ij")
+                    low_cols = []
+                    for freq_sum in range(6):
+                        for fy in range(freq_sum + 1):
+                            fx = freq_sum - fy
+                            low_cols.append(
+                                (
+                                    torch.cos(math.pi * float(fy) * (gy + 0.5 / max(1, side)))
+                                    * torch.cos(math.pi * float(fx) * (gx + 0.5 / max(1, side)))
+                                ).reshape(-1)
+                            )
+                            if len(low_cols) >= quota:
+                                break
+                        if len(low_cols) >= quota:
+                            break
+                    if low_cols:
+                        _write_role_frame(torch.stack(low_cols, dim=1), quota)
+                    z_img = z_centered.reshape(int(z_centered.shape[0]), side, side)
+                    tangent = (
+                        torch.roll(z_img, shifts=1, dims=1)
+                        + torch.roll(z_img, shifts=-1, dims=1)
+                        + torch.roll(z_img, shifts=1, dims=2)
+                        + torch.roll(z_img, shifts=-1, dims=2)
+                        - 4.0 * z_img
+                    ).reshape(int(z_img.shape[0]), -1)
+                    try:
+                        _u_tan, _s_tan, vh_tan = torch.linalg.svd((tangent - tangent.mean(dim=0, keepdim=True)).float(), full_matrices=False)
+                        _write_role_frame(vh_tan.transpose(0, 1).contiguous(), quota)
+                    except RuntimeError:
+                        pass
+                srht = torch.where(
+                    torch.rand(self.input_dim, quota, device=device, generator=gen) > 0.5,
+                    torch.ones(self.input_dim, quota, device=device),
+                    -torch.ones(self.input_dim, quota, device=device),
+                )
+                _write_role_frame(srht, quota)
+                _orthogonal_fill(quad_proj, col)
+        if "reslowrankp" in variant_lower:
+            with torch.no_grad():
+                z_centered = z_stats - z_stats.mean(dim=0, keepdim=True)
+                residual = torch.zeros_like(quad_proj)
+                col = 0
+                try:
+                    _u_pca, _s_pca, vh_pca = torch.linalg.svd(z_centered.float(), full_matrices=False)
+                    take = min(max(2, self.hidden_dim // 4), int(vh_pca.shape[0]), self.hidden_dim)
+                    if take > 0:
+                        residual[:, :take] = vh_pca[:take].transpose(0, 1).to(device=device, dtype=residual.dtype)
+                        col = take
+                except RuntimeError:
+                    pass
+                cot_dim = min(32, max(4, self.output_dim * 4))
+                cot = torch.randn(self.input_dim, cot_dim, device=device, generator=gen) / math.sqrt(max(1, self.input_dim))
+                response = z_centered @ cot
+                weighted = z_centered.transpose(0, 1) @ response
+                try:
+                    u_cot, _s_cot, _vh_cot = torch.linalg.svd(weighted.float(), full_matrices=False)
+                    take = min(int(u_cot.shape[1]), self.hidden_dim - col)
+                    if take > 0:
+                        residual[:, col : col + take] = u_cot[:, :take].to(device=device, dtype=residual.dtype)
+                        col += take
+                except RuntimeError:
+                    pass
+                _orthogonal_fill(residual, col)
+                residual = residual - residual.mean(dim=0, keepdim=True)
+                residual = residual / residual.norm(dim=0, keepdim=True).clamp_min(1.0e-6)
+                rank_match = re.search(r"reslowrankr(\d+)", variant_lower)
+                if rank_match is not None:
+                    rank_limit = max(1, min(self.hidden_dim, int(rank_match.group(1))))
+                    if rank_limit < self.hidden_dim:
+                        residual[:, rank_limit:] = quad_proj.detach()[:, rank_limit:]
+                strength = 0.05
+                strength_match = re.search(r"reslowrank(?:r\d+)?p(\d{3})", variant_lower)
+                if strength_match is not None:
+                    strength = float(int(strength_match.group(1))) / 1000.0
+                mixed = quad_proj.detach().mul(1.0 - strength).add(residual, alpha=strength)
+                mixed = mixed - mixed.mean(dim=0, keepdim=True)
+                quad_proj.copy_(mixed / mixed.norm(dim=0, keepdim=True).clamp_min(1.0e-6))
+        if "convexmixp" in variant_lower:
+            with torch.no_grad():
+                z_centered = z_stats - z_stats.mean(dim=0, keepdim=True)
+                frames: list[torch.Tensor] = []
+                try:
+                    _u_pca, _s_pca, vh_pca = torch.linalg.svd(z_centered.float(), full_matrices=False)
+                    frames.append(vh_pca.transpose(0, 1).contiguous())
+                except RuntimeError:
+                    pass
+                frames.append(
+                    torch.where(
+                        torch.rand(self.input_dim, self.hidden_dim, device=device, generator=gen) > 0.5,
+                        torch.ones(self.input_dim, self.hidden_dim, device=device),
+                        -torch.ones(self.input_dim, self.hidden_dim, device=device),
+                    )
+                )
+                side = int(round(math.sqrt(float(self.input_dim))))
+                if side * side == self.input_dim:
+                    z_img = z_centered.reshape(int(z_centered.shape[0]), side, side)
+                    stable = 0.5 * (
+                        z_img
+                        + 0.25
+                        * (
+                            torch.roll(z_img, shifts=1, dims=1)
+                            + torch.roll(z_img, shifts=-1, dims=1)
+                            + torch.roll(z_img, shifts=1, dims=2)
+                            + torch.roll(z_img, shifts=-1, dims=2)
+                        )
+                    )
+                    try:
+                        _u_aug, _s_aug, vh_aug = torch.linalg.svd((stable.reshape(int(stable.shape[0]), -1) - stable.reshape(int(stable.shape[0]), -1).mean(dim=0, keepdim=True)).float(), full_matrices=False)
+                        frames.append(vh_aug.transpose(0, 1).contiguous())
+                    except RuntimeError:
+                        pass
+                    yy = torch.linspace(0.0, 1.0, side, device=device)
+                    xx = torch.linspace(0.0, 1.0, side, device=device)
+                    gy, gx = torch.meshgrid(yy, xx, indexing="ij")
+                    low_cols = []
+                    for freq_sum in range(6):
+                        for fy in range(freq_sum + 1):
+                            fx = freq_sum - fy
+                            low_cols.append(
+                                (
+                                    torch.cos(math.pi * float(fy) * (gy + 0.5 / max(1, side)))
+                                    * torch.cos(math.pi * float(fx) * (gx + 0.5 / max(1, side)))
+                                ).reshape(-1)
+                            )
+                            if len(low_cols) >= self.hidden_dim:
+                                break
+                        if len(low_cols) >= self.hidden_dim:
+                            break
+                    if low_cols:
+                        frames.append(torch.stack(low_cols, dim=1))
+                mixed = torch.zeros_like(quad_proj)
+                weight = 1.0 / float(max(1, len(frames)))
+                for frame in frames:
+                    target = torch.zeros_like(quad_proj)
+                    frame = frame.to(device=device, dtype=target.dtype)
+                    frame = torch.nan_to_num(frame, nan=0.0, posinf=0.0, neginf=0.0)
+                    frame = frame - frame.mean(dim=0, keepdim=True)
+                    frame = frame / frame.norm(dim=0, keepdim=True).clamp_min(1.0e-6)
+                    take = min(int(frame.shape[1]), self.hidden_dim)
+                    target[:, :take] = frame[:, :take]
+                    _orthogonal_fill(target, take)
+                    mixed.add_(target, alpha=weight)
+                mixed = mixed - mixed.mean(dim=0, keepdim=True)
+                quad_proj.copy_(mixed / mixed.norm(dim=0, keepdim=True).clamp_min(1.0e-6))
+        if "driftcotbankp" in variant_lower:
+            with torch.no_grad():
+                z_centered = z_stats - z_stats.mean(dim=0, keepdim=True)
+                cot_dim = min(64, max(8, self.output_dim * 6))
+                cot = torch.randn(self.input_dim, cot_dim, device=device, generator=gen) / math.sqrt(max(1, self.input_dim))
+                hidden = torch.tanh(z_centered @ cot)
+                drift = hidden[1:] - hidden[:-1] if int(hidden.shape[0]) > 1 else hidden
+                source = z_centered[1:] if int(z_centered.shape[0]) > 1 else z_centered
+                response = source.transpose(0, 1) @ drift
+                try:
+                    u_cot, _s_cot, _vh_cot = torch.linalg.svd(response.float(), full_matrices=False)
+                    quad_proj.zero_()
+                    take = min(int(u_cot.shape[1]), self.hidden_dim)
+                    if take > 0:
+                        quad_proj[:, :take] = u_cot[:, :take].to(device=device, dtype=quad_proj.dtype)
+                    _orthogonal_fill(quad_proj, take)
+                except RuntimeError:
+                    pass
+        if "rolecondp" in variant_lower:
+            with torch.no_grad():
+                quad_proj.zero_()
+                col = 0
+
+                def _write_frame(frame: torch.Tensor, limit: int) -> None:
+                    nonlocal col
+                    if col >= self.hidden_dim or limit <= 0:
+                        return
+                    frame = frame.to(device=device, dtype=quad_proj.dtype)
+                    frame = frame - frame.mean(dim=0, keepdim=True)
+                    frame = frame / frame.norm(dim=0, keepdim=True).clamp_min(1.0e-6)
+                    take = min(int(limit), int(frame.shape[1]), self.hidden_dim - col)
+                    if take > 0:
+                        quad_proj[:, col : col + take] = frame[:, :take]
+                        col += take
+
+                z_centered = z_stats - z_stats.mean(dim=0, keepdim=True)
+                quota = max(2, self.hidden_dim // 5)
+                try:
+                    _u_pca, _s_pca, vh_pca = torch.linalg.svd(z_centered.float(), full_matrices=False)
+                    _write_frame(vh_pca.transpose(0, 1).contiguous(), quota)
+                except RuntimeError:
+                    pass
+                abs_frame = torch.diag_embed(z_stats.abs().mean(dim=0)).sum(dim=0).unsqueeze(1)
+                _write_frame(abs_frame, 1)
+                cot = torch.randn(self.input_dim, quota, device=device, generator=gen)
+                _write_frame(cot, quota)
+                side = int(round(math.sqrt(float(self.input_dim))))
+                if side * side == self.input_dim:
+                    z_img = z_centered.reshape(int(z_centered.shape[0]), side, side)
+                    tangent = (
+                        torch.roll(z_img, shifts=1, dims=1)
+                        + torch.roll(z_img, shifts=-1, dims=1)
+                        + torch.roll(z_img, shifts=1, dims=2)
+                        + torch.roll(z_img, shifts=-1, dims=2)
+                        - 4.0 * z_img
+                    ).reshape(int(z_img.shape[0]), -1)
+                    try:
+                        _u_tan, _s_tan, vh_tan = torch.linalg.svd((tangent - tangent.mean(dim=0, keepdim=True)).float(), full_matrices=False)
+                        _write_frame(vh_tan.transpose(0, 1).contiguous(), quota)
+                    except RuntimeError:
+                        pass
+                _orthogonal_fill(quad_proj, col)
+        if "selfcondstopgradp" in variant_lower:
+            with torch.no_grad():
+                z_centered = z_stats - z_stats.mean(dim=0, keepdim=True)
+                quad_proj.zero_()
+                col = 0
+                cov = z_centered.transpose(0, 1) @ z_centered / float(max(1, int(z_centered.shape[0]) - 1))
+                try:
+                    evals, evecs = torch.linalg.eigh(cov.float())
+                    order = torch.argsort(evals, descending=True)
+                    evecs = evecs[:, order].to(device=device, dtype=quad_proj.dtype)
+                    take = min(max(1, self.hidden_dim // 2), int(evecs.shape[1]))
+                    if take > 0:
+                        quad_proj[:, :take] = evecs[:, :take]
+                        col = take
+                    cot_dim = min(64, max(8, self.output_dim * 6))
+                    cot = torch.randn(self.input_dim, cot_dim, device=device, generator=gen) / math.sqrt(max(1, self.input_dim))
+                    response = torch.tanh(z_centered @ cot)
+                    weighted = z_centered.transpose(0, 1) @ response
+                    u_cot, _s_cot, _vh_cot = torch.linalg.svd(weighted.float(), full_matrices=False)
+                    residual = u_cot.to(device=device, dtype=quad_proj.dtype)
+                    if col > 0:
+                        comps = quad_proj[:, :col]
+                        residual = residual - comps @ (comps.transpose(0, 1) @ residual)
+                    take_res = min(int(residual.shape[1]), self.hidden_dim - col)
+                    if take_res > 0:
+                        residual = residual[:, :take_res] - residual[:, :take_res].mean(dim=0, keepdim=True)
+                        residual = residual / residual.norm(dim=0, keepdim=True).clamp_min(1.0e-6)
+                        quad_proj[:, col : col + take_res] = residual
+                        col += take_res
+                except RuntimeError:
+                    pass
+                _orthogonal_fill(quad_proj, col)
+        if "multiframebankp" in variant_lower:
+            with torch.no_grad():
+                quad_proj.zero_()
+                col = 0
+
+                def _write_cols(frame: torch.Tensor, limit: int) -> None:
+                    nonlocal col
+                    if col >= self.hidden_dim or limit <= 0:
+                        return
+                    frame = frame.to(device=device, dtype=quad_proj.dtype)
+                    frame = frame - frame.mean(dim=0, keepdim=True)
+                    frame = frame / frame.norm(dim=0, keepdim=True).clamp_min(1.0e-6)
+                    take = min(int(limit), int(frame.shape[1]), self.hidden_dim - col)
+                    if take > 0:
+                        quad_proj[:, col : col + take] = frame[:, :take]
+                        col += take
+
+                z_centered = z_stats - z_stats.mean(dim=0, keepdim=True)
+                frame_quota = max(4, self.hidden_dim // 5)
+                try:
+                    _u_pca, _s_pca, vh_pca = torch.linalg.svd(z_centered, full_matrices=False)
+                    _write_cols(vh_pca.transpose(0, 1).contiguous(), frame_quota)
+                except RuntimeError:
+                    pass
+                srht = torch.where(
+                    torch.rand(self.input_dim, frame_quota, device=device, generator=gen) > 0.5,
+                    torch.ones(self.input_dim, frame_quota, device=device),
+                    -torch.ones(self.input_dim, frame_quota, device=device),
+                )
+                _write_cols(srht, frame_quota)
+                jitter = torch.randn(z_centered.shape, device=device, generator=gen) * 0.03
+                stable = 0.5 * ((z_centered + jitter) + (z_centered - jitter))
+                try:
+                    _u_aug, _s_aug, vh_aug = torch.linalg.svd(stable, full_matrices=False)
+                    _write_cols(vh_aug.transpose(0, 1).contiguous(), frame_quota)
+                except RuntimeError:
+                    pass
+                side = int(round(math.sqrt(float(self.input_dim))))
+                if side * side == self.input_dim:
+                    yy = torch.linspace(0.0, 1.0, side, device=device)
+                    xx = torch.linspace(0.0, 1.0, side, device=device)
+                    gy, gx = torch.meshgrid(yy, xx, indexing="ij")
+                    low_cols = []
+                    max_freq_sum = 8 if "lowbias" in variant_lower else 5
+                    for freq_sum in range(max_freq_sum):
+                        for fy in range(freq_sum + 1):
+                            fx = freq_sum - fy
+                            basis = torch.cos(math.pi * float(fy) * (gy + 0.5 / max(1, side))) * torch.cos(
+                                math.pi * float(fx) * (gx + 0.5 / max(1, side))
+                            )
+                            low_cols.append(basis.reshape(-1))
+                            if len(low_cols) >= frame_quota:
+                                break
+                        if len(low_cols) >= frame_quota:
+                            break
+                    if low_cols:
+                        _write_cols(torch.stack(low_cols, dim=1), frame_quota)
+                    tile = max(2, side // 4)
+                    local_cols = []
+                    for y0 in range(0, side, tile):
+                        for x0 in range(0, side, tile):
+                            y1 = min(side, y0 + tile)
+                            x1 = min(side, x0 + tile)
+                            basis = torch.zeros(side, side, device=device)
+                            basis[y0:y1, x0:x1] = 1.0
+                            local_cols.append(basis.reshape(-1))
+                            if len(local_cols) >= frame_quota:
+                                break
+                        if len(local_cols) >= frame_quota:
+                            break
+                    if local_cols:
+                        _write_cols(torch.stack(local_cols, dim=1), frame_quota)
+                _orthogonal_fill(quad_proj, col)
+        if "selfcondresp" in variant_lower:
+            with torch.no_grad():
+                z_centered = z_stats - z_stats.mean(dim=0, keepdim=True)
+                quad_proj.zero_()
+                col = 0
+                try:
+                    cov = z_centered.transpose(0, 1) @ z_centered / float(max(1, int(z_centered.shape[0]) - 1))
+                    evals, evecs = torch.linalg.eigh(cov.float())
+                    order = torch.argsort(evals, descending=True)
+                    evecs = evecs[:, order].to(device=device, dtype=quad_proj.dtype)
+                    take = min(self.hidden_dim // 2, int(evecs.shape[1]))
+                    if take > 0:
+                        quad_proj[:, :take] = evecs[:, :take]
+                        col = take
+                    cot_dim = min(64, max(8, self.output_dim * 6))
+                    cot = torch.randn(self.input_dim, cot_dim, device=device, generator=gen) / math.sqrt(max(1, self.input_dim))
+                    response = z_centered @ cot
+                    weighted = z_centered.transpose(0, 1) @ response
+                    u_cot, _s_cot, _vh_cot = torch.linalg.svd(weighted.float(), full_matrices=False)
+                    residual = u_cot.to(device=device, dtype=quad_proj.dtype)
+                    if col > 0:
+                        comps = quad_proj[:, :col]
+                        residual = residual - comps @ (comps.transpose(0, 1) @ residual)
+                    take_res = min(int(residual.shape[1]), self.hidden_dim - col)
+                    if take_res > 0:
+                        residual = residual[:, :take_res] - residual[:, :take_res].mean(dim=0, keepdim=True)
+                        residual = residual / residual.norm(dim=0, keepdim=True).clamp_min(1.0e-6)
+                        quad_proj[:, col : col + take_res] = residual
+                        col += take_res
+                except RuntimeError:
+                    pass
+                _orthogonal_fill(quad_proj, col)
+        if "covadaptp" in variant_lower:
+            with torch.no_grad():
+                z_centered = z_stats - z_stats.mean(dim=0, keepdim=True)
+                try:
+                    _u_pca, _s_pca, vh_pca = torch.linalg.svd(z_centered, full_matrices=False)
+                    n_comp = min(int(vh_pca.shape[0]), self.hidden_dim)
+                    quad_proj.zero_()
+                    if n_comp > 0:
+                        quad_proj[:, :n_comp] = vh_pca[:n_comp].transpose(0, 1).contiguous()
+                    _orthogonal_fill(quad_proj, n_comp)
+                    self.register_buffer("label_free_covadapt_enabled", torch.tensor([1], device=device, dtype=torch.int64))
+                except RuntimeError:
+                    self.register_buffer("label_free_covadapt_enabled", torch.tensor([0], device=device, dtype=torch.int64))
         if "pcap" in variant or "pcabandp" in variant:
             with torch.no_grad():
                 z_centered = z_stats - z_stats.mean(dim=0, keepdim=True)
@@ -6155,6 +7163,15 @@ def primitive_specs(param_budget: int, input_dim: int, output_dim: int) -> List[
         PrimitiveSpec("B1b-RSWAF-hinge-K8", "Activation", "rswaf_hinge", 8, h(8), "native+plan", 1, 0, 0, 0, 0, basis_order=1),
         PrimitiveSpec("B2r-FastKAN-RBF-stream-K2-repair", "RBF", "fastkan_rbf", 2, h(2), "R1_repair_stream_basis_mix+third_party/MJKAN+v12.10_rbf_triton_l3", 1, 0, 1, 0, 0, uses_dense_basis_tensor=0, basis_order=1, init_variant="rbf_k2_triton_l3_matmul"),
         PrimitiveSpec("B2s-GaussianRBF-stream-K4-recompute", "RBF", "compact_rbf", 4, h(4), "v12.10_rbf_f2_stream_recompute_no_dense_basis+triton_l3", 1, 0, 1, 0, 0, uses_dense_basis_tensor=0, basis_order=1, init_variant="rbf_k4_triton_l3_matmul"),
+        PrimitiveSpec("B2t-GaussianRBF-K4-inputcrossL4P128-tritonL3", "RBF", "compact_rbf", 4, h(4), "v12.11_rbf_k4_fixed_inputcross_rank128_expression_repair", 1, 0, 1, 0, 0, uses_dense_basis_tensor=0, basis_order=1, init_variant="rbf_k4_triton_l3_matmul_inputcross_localr4_projr128"),
+        PrimitiveSpec("B2u-GaussianRBF-K4-inputrot2L4P128-tritonL3", "RBF", "compact_rbf", 4, h(4), "v12.11_rbf_k4_fixed_inputcross_rank128_localrot2_expression_repair", 1, 0, 1, 0, 0, uses_dense_basis_tensor=0, basis_order=1, init_variant="rbf_k4_triton_l3_matmul_inputcross_localr4_localrot2_projr128"),
+        PrimitiveSpec("B2v-GaussianRBF-K4-inputcrossL4P128-linearres-tritonL3", "RBF", "compact_rbf", 4, h(4), "v12.11_rbf_k4_fixed_inputcross_rank128_linear_residual_task_bracket", 1, 0, 1, 1, 0, uses_dense_basis_tensor=0, basis_order=1, init_variant="rbf_k4_triton_l3_matmul_inputcross_localr4_projr128_linearres010"),
+        PrimitiveSpec("B2w-GaussianRBF-K4-inputrot2L4P256-tritonL3", "RBF", "compact_rbf", 4, h(4), "v12.11_rbf_k4_fixed_inputcross_rank256_localrot2_expression_repair", 1, 0, 1, 0, 0, uses_dense_basis_tensor=0, basis_order=1, init_variant="rbf_k4_triton_l3_matmul_inputcross_localr4_localrot2_projr256"),
+        PrimitiveSpec("B2x-GaussianRBF-K4-inputsqL4P256-tritonL3", "RBF", "compact_rbf", 4, h(4), "v12.11_rbf_k4_fixed_inputcross_rank256_projected_square_expression_repair", 1, 0, 1, 0, 0, uses_dense_basis_tensor=0, basis_order=1, init_variant="rbf_k4_triton_l3_matmul_inputcross_localr4_projr256_projsq"),
+        PrimitiveSpec("B2y-GaussianRBF-K4-inputrot2L8P256-tritonL3", "RBF", "compact_rbf", 4, h(4), "v12.11_rbf_k4_fixed_inputcross_rank256_localr8_rotated_expression_repair", 1, 0, 1, 0, 0, uses_dense_basis_tensor=0, basis_order=1, init_variant="rbf_k4_triton_l3_matmul_inputcross_localr8_localrot2_projr256"),
+        PrimitiveSpec("B2z-GaussianRBF-K4-orthoInputrot2L4P128-tritonL3", "RBF", "compact_rbf", 4, h(4), "v12.11_rbf_k4_orthogonal_inputcross_rank128_localrot2_expression_repair", 1, 0, 1, 0, 0, uses_dense_basis_tensor=0, basis_order=1, init_variant="rbf_k4_triton_l3_matmul_inputcross_localr4_localrot2_projr128_orthoproj"),
+        PrimitiveSpec("B2aa-GaussianRBF-K4-orthoInputrot2L4P256-tritonL3", "RBF", "compact_rbf", 4, h(4), "v12.11_rbf_k4_orthogonal_inputcross_rank256_localrot2_expression_repair", 1, 0, 1, 0, 0, uses_dense_basis_tensor=0, basis_order=1, init_variant="rbf_k4_triton_l3_matmul_inputcross_localr4_localrot2_projr256_orthoproj"),
+        PrimitiveSpec("B2ab-GaussianRBF-K4-orthoInputsqL4P128-tritonL3", "RBF", "compact_rbf", 4, h(4), "v12.11_rbf_k4_orthogonal_projected_square_rank128_expression_repair", 1, 0, 1, 0, 0, uses_dense_basis_tensor=0, basis_order=1, init_variant="rbf_k4_triton_l3_matmul_inputcross_localr4_projr128_projsq_orthoproj"),
         PrimitiveSpec("B2a-GaussianRBF-K4-compact", "RBF", "compact_rbf", 4, h(4), "third_party/MJKAN", 1, 0, 1, 0, 0, basis_order=1),
         PrimitiveSpec("B2b-FastKAN-RBF-K8", "RBF", "fastkan_rbf", 8, h(8), "third_party/MJKAN", 1, 0, 1, 0, 0, basis_order=1),
         PrimitiveSpec("B3a-ChebyKAN-K4", "OrthogonalPolynomial", "chebyshev", 4, h(4), "native+awesome-kan-family", 0, 1, 0, 0, 0, basis_order=4),
@@ -6195,6 +7212,8 @@ def primitive_specs(param_budget: int, input_dim: int, output_dim: int) -> List[
         PrimitiveSpec("B3v-ChebyKAN-K3-h112-inputcrossL4P128-linearres-tritonL3-gradbuf", "OrthogonalPolynomial", "chebyshev", 3, 112, "v12.8.3_cheby_k3_h112_inputcross_rank128_linear_residual_task_repair", 0, 1, 0, 1, 0, uses_dense_basis_tensor=0, basis_order=3, init_variant="cheby_k3_inputcross_localr4_projr128_triton_l3_gradbuf_linearres010"),
         PrimitiveSpec("B3w-ChebyKAN-K3-h112-inputcrossL4P128-linearres050-tritonL3-gradbuf", "OrthogonalPolynomial", "chebyshev", 3, 112, "v12.8.3_cheby_k3_h112_inputcross_rank128_stronger_linear_residual_task_repair", 0, 1, 0, 1, 0, uses_dense_basis_tensor=0, basis_order=3, init_variant="cheby_k3_inputcross_localr4_projr128_triton_l3_gradbuf_linearres050"),
         PrimitiveSpec("B3x-ChebyKAN-K3-h112-inputcrossL4P128-linearraw050-tritonL3-gradbuf", "OrthogonalPolynomial", "chebyshev", 3, 112, "v12.8.3_cheby_k3_h112_inputcross_rank128_raw_linear_residual_task_repair", 0, 1, 0, 1, 0, uses_dense_basis_tensor=0, basis_order=3, init_variant="cheby_k3_inputcross_localr4_projr128_triton_l3_gradbuf_linearres050_linearraw"),
+        PrimitiveSpec("B3an-ChebyKAN-K3-h112-inputcrossL4P128-linearraw025-tritonL3-gradbuf", "OrthogonalPolynomial", "chebyshev", 3, 112, "v12.11_cheby_b3x_raw_linear_residual_lower_strength_025_task_geometry_bracket", 0, 1, 0, 1, 0, uses_dense_basis_tensor=0, basis_order=3, init_variant="cheby_k3_inputcross_localr4_projr128_triton_l3_gradbuf_linearres025_linearraw"),
+        PrimitiveSpec("B3ao-ChebyKAN-K3-h112-inputcrossL4P128-linearraw010-tritonL3-gradbuf", "OrthogonalPolynomial", "chebyshev", 3, 112, "v12.11_cheby_b3x_raw_linear_residual_lower_strength_010_task_geometry_bracket", 0, 1, 0, 1, 0, uses_dense_basis_tensor=0, basis_order=3, init_variant="cheby_k3_inputcross_localr4_projr128_triton_l3_gradbuf_linearres010_linearraw"),
         PrimitiveSpec("B3b-LegendreKAN-K4", "OrthogonalPolynomial", "legendre", 4, h(4), "native+awesome-kan-family", 0, 1, 0, 0, 0, basis_order=4),
         PrimitiveSpec("B12a-LegendreKAN-K4-fan-scale-repair", "OrthogonalPolynomial", "legendre", 4, h(4), "R3_repair_global_fan_scale_init", 0, 1, 0, 0, 0, basis_order=4, init_variant="fan_scale_repair"),
         PrimitiveSpec("B12b-ChebyKAN-K4-fan-scale-repair", "OrthogonalPolynomial", "chebyshev", 4, h(4), "R3_repair_global_fan_scale_init", 0, 1, 0, 0, 0, basis_order=4, init_variant="fan_scale_repair"),
@@ -6682,6 +7701,15 @@ def primitive_specs(param_budget: int, input_dim: int, output_dim: int) -> List[
         PrimitiveSpec("B4w-FourierKAN-lowfreq-K4-h8-linearres050-tritonL3-matmulTile", "Fourier", "fourier_lowfreq", 4, 8, "v12.8.3_fourier_k4_h8_linearres050_triton_residual_grad_repair", 0, 1, 0, 1, 0, uses_dense_basis_tensor=0, basis_order=4, init_variant="fourier_k4_linearres_triton_l3_matmul_linearres050"),
         PrimitiveSpec("B5c-RickerWaveletKAN-lite-K4", "Wavelet", "ricker_wavelet", 4, h(4), "native+wavelet-family", 1, 0, 1, 0, 0, basis_order=1),
         PrimitiveSpec("B5h-HatWaveletKAN-local-K4", "Wavelet", "hat_wavelet", 4, h(4), "v12.8.3_family_specific_hat_wavelet_local_support+v12.10_hat_wavelet_triton_l3", 1, 0, 0, 0, 0, uses_dense_basis_tensor=0, basis_order=1, init_variant="hat_wavelet_k4_triton_l3_matmul"),
+        PrimitiveSpec("B5i-HatWaveletKAN-K4-inputcrossL4P128-tritonL3", "Wavelet", "hat_wavelet", 4, h(4), "v12.11_hat_wavelet_fixed_inputcross_rank128_expression_repair", 1, 0, 0, 0, 0, uses_dense_basis_tensor=0, basis_order=1, init_variant="hat_wavelet_k4_triton_l3_matmul_inputcross_localr4_projr128"),
+        PrimitiveSpec("B5j-HatWaveletKAN-K4-inputrot2L4P128-tritonL3", "Wavelet", "hat_wavelet", 4, h(4), "v12.11_hat_wavelet_fixed_inputcross_rank128_localrot2_expression_repair", 1, 0, 0, 0, 0, uses_dense_basis_tensor=0, basis_order=1, init_variant="hat_wavelet_k4_triton_l3_matmul_inputcross_localr4_localrot2_projr128"),
+        PrimitiveSpec("B5k-HatWaveletKAN-K4-inputcrossL4P128-linearres-tritonL3", "Wavelet", "hat_wavelet", 4, h(4), "v12.11_hat_wavelet_fixed_inputcross_rank128_linear_residual_expression_bracket", 1, 0, 0, 1, 0, uses_dense_basis_tensor=0, basis_order=1, init_variant="hat_wavelet_k4_triton_l3_matmul_inputcross_localr4_projr128_linearres010"),
+        PrimitiveSpec("B5l-HatWaveletKAN-K4-inputcrossL4P128-linearraw050-tritonL3", "Wavelet", "hat_wavelet", 4, h(4), "v12.11_hat_wavelet_raw_linear_residual_050_task_geometry_bracket", 1, 0, 0, 1, 0, uses_dense_basis_tensor=0, basis_order=1, init_variant="hat_wavelet_k4_triton_l3_matmul_inputcross_localr4_projr128_linearres050_linearraw"),
+        PrimitiveSpec("B5m-HatWaveletKAN-K4-inputcrossL4P128-linearraw025-tritonL3", "Wavelet", "hat_wavelet", 4, h(4), "v12.11_hat_wavelet_raw_linear_residual_025_task_geometry_bracket", 1, 0, 0, 1, 0, uses_dense_basis_tensor=0, basis_order=1, init_variant="hat_wavelet_k4_triton_l3_matmul_inputcross_localr4_projr128_linearres025_linearraw"),
+        PrimitiveSpec("B5n-HatWaveletKAN-K4-inputcrossL4P128-linearraw010-tritonL3", "Wavelet", "hat_wavelet", 4, h(4), "v12.11_hat_wavelet_raw_linear_residual_010_task_geometry_bracket", 1, 0, 0, 1, 0, uses_dense_basis_tensor=0, basis_order=1, init_variant="hat_wavelet_k4_triton_l3_matmul_inputcross_localr4_projr128_linearres010_linearraw"),
+        PrimitiveSpec("B5o-HatWaveletKAN-K4-inputcrossL4P128-linearraw005-tritonL3", "Wavelet", "hat_wavelet", 4, h(4), "v12.11_hat_wavelet_raw_linear_residual_005_task_geometry_bracket", 1, 0, 0, 1, 0, uses_dense_basis_tensor=0, basis_order=1, init_variant="hat_wavelet_k4_triton_l3_matmul_inputcross_localr4_projr128_linearres005_linearraw"),
+        PrimitiveSpec("B5p-HatWaveletKAN-K4-inputcrossL4P128-linearraw002-tritonL3", "Wavelet", "hat_wavelet", 4, h(4), "v12.11_hat_wavelet_raw_linear_residual_002_task_geometry_bracket", 1, 0, 0, 1, 0, uses_dense_basis_tensor=0, basis_order=1, init_variant="hat_wavelet_k4_triton_l3_matmul_inputcross_localr4_projr128_linearres002_linearraw"),
+        PrimitiveSpec("B5q-HatWaveletKAN-K4-inputcrossL4P128-linearraw001-tritonL3", "Wavelet", "hat_wavelet", 4, h(4), "v12.11_hat_wavelet_raw_linear_residual_001_task_geometry_bracket", 1, 0, 0, 1, 0, uses_dense_basis_tensor=0, basis_order=1, init_variant="hat_wavelet_k4_triton_l3_matmul_inputcross_localr4_projr128_linearres001_linearraw"),
         PrimitiveSpec("B6r-BSpline-order1-stream-K2-repair", "BSpline", "bspline_order1", 2, h(2), "R1_repair_stream_basis_mix+third_party/KANbeFair", 1, 0, 0, 0, 0, uses_dense_basis_tensor=0, basis_order=1),
         PrimitiveSpec("B6a-BSpline-order1-local-K4", "BSpline", "bspline_order1", 4, h(4), "third_party/KANbeFair", 1, 0, 0, 0, 0, basis_order=1),
         PrimitiveSpec("B6b-BSpline-order1-local-K8-expression-repair", "BSpline", "bspline_order1", 8, h(8), "R2_repair_increase_K+third_party/KANbeFair", 1, 0, 0, 0, 0, basis_order=1),

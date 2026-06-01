@@ -277,6 +277,10 @@ def run_raw_or_reuse(args: argparse.Namespace, out_dir: Path) -> tuple[Path, int
         str(args.kernel_measure_steps),
         "--task-compile-warmup-steps",
         str(args.task_compile_warmup_steps),
+        "--coupling-batch-size",
+        str(args.coupling_batch_size),
+        "--functional-batch-size",
+        str(args.functional_batch_size),
         "--datasets",
         args.datasets,
         "--seeds",
@@ -462,7 +466,7 @@ def write_functional_p3_gate(raw_dir: Path, out_dir: Path, base_linec: Mapping[s
     rows = [
         r
         for r in read_csv_rows(raw_dir / "v1283_b109_functional_delta_score_repair.csv")
-        if r.get("selected_b109_candidate_id") == B320_ID and r.get("candidate_id") == B320_ID
+        if r.get("candidate_id") == B320_ID
     ]
     out_rows: list[dict[str, Any]] = []
     for row in rows:
@@ -1423,6 +1427,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--kernel-warmup-steps", type=int, default=5)
     p.add_argument("--kernel-measure-steps", type=int, default=12)
     p.add_argument("--task-compile-warmup-steps", type=int, default=12)
+    p.add_argument("--coupling-batch-size", type=int, default=64)
     p.add_argument("--functional-batch-size", type=int, default=32)
     p.add_argument("--run-p4-short", type=int, default=0)
     p.add_argument("--p4-datasets", default="MNIST,Fashion-MNIST,KMNIST")

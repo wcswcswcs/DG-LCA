@@ -101,7 +101,7 @@ def _param_budget(input_dim: int, output_dim: int) -> Tuple[int, int]:
     return hidden, count
 
 
-def _make_model(method_id: str, input_dim: int, output_dim: int, x_stats: torch.Tensor, device: torch.device, seed: int, spec: prim.PrimitiveSpec | None, param_budget: int) -> torch.nn.Module:
+def _make_model(method_id: str, input_dim: int, output_dim: int, x_stats: torch.Tensor, device: torch.device, seed: int, spec: prim.PrimitiveSpec | None, param_budget: int, y_stats: torch.Tensor | None = None) -> torch.nn.Module:
     if method_id == "MLP-same-param-AdamW":
         hidden, _ = _param_budget(input_dim, output_dim)
         return prim.MLPBaseline(input_dim, output_dim, hidden, seed, device).to(device)
@@ -111,7 +111,9 @@ def _make_model(method_id: str, input_dim: int, output_dim: int, x_stats: torch.
     if getattr(spec, "model_kind", "edge_kan") == "lite_gated_legendre_quadratic":
         return prim.LiteGatedLegendreQuadraticKAN(input_dim, output_dim, spec, x_stats, seed, device).to(device)
     if getattr(spec, "model_kind", "edge_kan") == "simple_fast_task_geometry":
-        return prim.SimpleFastTaskGeometryKAN(input_dim, output_dim, spec, x_stats, seed, device).to(device)
+        return prim.SimpleFastTaskGeometryKAN(input_dim, output_dim, spec, x_stats, seed, device, y_stats).to(device)
+    if getattr(spec, "model_kind", "edge_kan") == "grouped_rational_kat":
+        return prim.GroupedRationalKATKAN(input_dim, output_dim, spec, x_stats, seed, device).to(device)
     if getattr(spec, "model_kind", "edge_kan") in {"quadratic_sketch", "trainable_quadratic_sketch"}:
         return prim.QuadraticSketchKAN(input_dim, output_dim, spec, x_stats, seed, device).to(device)
     return prim.PrimitiveKAN(input_dim, output_dim, spec, x_stats, seed, device, param_budget).to(device)

@@ -310,7 +310,12 @@ def _make_model(
     y_stats: torch.Tensor | None = None,
 ) -> torch.nn.Module:
     _, budget = v124._param_budget(input_dim, output_dim)
-    return v124._make_model(method_id, input_dim, output_dim, x_stats, device, int(seed), specs.get(method_id), budget, y_stats)
+    try:
+        return v124._make_model(method_id, input_dim, output_dim, x_stats, device, int(seed), specs.get(method_id), budget, y_stats)
+    except TypeError as exc:
+        if "positional" not in str(exc) and "argument" not in str(exc):
+            raise
+        return v124._make_model(method_id, input_dim, output_dim, x_stats, device, int(seed), specs.get(method_id), budget)
 
 
 def _time_call(fn, device: torch.device, warmup: int, measure: int) -> Tuple[float, float, float, List[float]]:
@@ -793,6 +798,15 @@ def _family_plan() -> List[Tuple[str, str, str]]:
         ("Rational", "B7a-RationalKAT-lite-safe-den-K4", "D2-A GroupRationalKAN / L1 reference + L2 compile-forward attempt"),
         ("RBF", "B2r-FastKAN-RBF-stream-K2-repair", "D3-A FastKAN fixed-center RBF / L1 stream + L2 compile-forward attempt"),
         ("RBF", "B2s-GaussianRBF-stream-K4-recompute", "D3-B v12.10 RBF-F2 fixed-center K4 stream recompute without dense basis materialization"),
+        ("RBF", "B2t-GaussianRBF-K4-inputcrossL4P128-tritonL3", "D3-C v12.11 fixed input-cross sidecar for RBF quadratic expression repair"),
+        ("RBF", "B2u-GaussianRBF-K4-inputrot2L4P128-tritonL3", "D3-D v12.11 local rotated input-cross sidecar for RBF rotated-quadratic repair"),
+        ("RBF", "B2v-GaussianRBF-K4-inputcrossL4P128-linearres-tritonL3", "D3-E v12.11 RBF input-cross plus small linear residual task bracket"),
+        ("RBF", "B2w-GaussianRBF-K4-inputrot2L4P256-tritonL3", "D3-F v12.11 rank-256 local rotated input-cross for RBF expression repair"),
+        ("RBF", "B2x-GaussianRBF-K4-inputsqL4P256-tritonL3", "D3-G v12.11 rank-256 projected-square input-cross for RBF random quadratic repair"),
+        ("RBF", "B2y-GaussianRBF-K4-inputrot2L8P256-tritonL3", "D3-H v12.11 rank-256 wider local rotated input-cross for RBF expression repair"),
+        ("RBF", "B2z-GaussianRBF-K4-orthoInputrot2L4P128-tritonL3", "D3-I v12.11 orthogonal rank-128 local rotated input-cross for RBF expression repair"),
+        ("RBF", "B2aa-GaussianRBF-K4-orthoInputrot2L4P256-tritonL3", "D3-J v12.11 orthogonal rank-256 local rotated input-cross for RBF expression repair"),
+        ("RBF", "B2ab-GaussianRBF-K4-orthoInputsqL4P128-tritonL3", "D3-K v12.11 orthogonal projected-square input-cross for RBF random quadratic repair"),
         ("Chebyshev", "B3c-ChebyKAN-K3-stream", "D4-A Cheby K3 stream / L1 + L2 compile-forward attempt"),
         ("Chebyshev", "B3e-ChebyKAN-K3-tritonL3-matmulTile", "D4-C Cheby K3 family-specific Triton matmul-tile L3 backward/update repair"),
         ("Chebyshev", "B3f-ChebyKAN-K4-tritonL3-matmulTile", "D4-D Cheby K4 family-specific Triton matmul-tile expression repair"),
@@ -829,6 +843,8 @@ def _family_plan() -> List[Tuple[str, str, str]]:
         ("Chebyshev", "B3v-ChebyKAN-K3-h112-inputcrossL4P128-linearres-tritonL3-gradbuf", "D4-M Cheby K3 h112 inputcross rank128 plus low-cost linear residual task repair"),
         ("Chebyshev", "B3w-ChebyKAN-K3-h112-inputcrossL4P128-linearres050-tritonL3-gradbuf", "D4-M Cheby K3 h112 inputcross rank128 plus stronger linear residual task repair"),
         ("Chebyshev", "B3x-ChebyKAN-K3-h112-inputcrossL4P128-linearraw050-tritonL3-gradbuf", "D4-N Cheby K3 h112 inputcross rank128 plus raw-scale linear residual task repair"),
+        ("Chebyshev", "B3an-ChebyKAN-K3-h112-inputcrossL4P128-linearraw025-tritonL3-gradbuf", "D4-Z Cheby B3x raw-scale linear residual lower-strength 0.25 task/geometry bracket"),
+        ("Chebyshev", "B3ao-ChebyKAN-K3-h112-inputcrossL4P128-linearraw010-tritonL3-gradbuf", "D4-Z Cheby B3x raw-scale linear residual lower-strength 0.10 task/geometry bracket"),
         ("Chebyshev", "B3a-ChebyKAN-K4", "D4-A Cheby K4 dense reference / L1 + L2 compile-forward attempt"),
         ("Chebyshev", "B3d-ChebyKAN-K6-stream", "D4-B Cheby K6 expression repair / L1 + L2 compile-forward attempt"),
         ("Fourier", "B4b-FourierKAN-lowfreq-K2-stream", "D5-A Fourier K2 fixedfreq stream / L1 + L2 compile-forward attempt"),
@@ -855,6 +871,15 @@ def _family_plan() -> List[Tuple[str, str, str]]:
         ("Fourier", "B4w-FourierKAN-lowfreq-K4-h8-linearres050-tritonL3-matmulTile", "D5-D Fourier K4 h8 stronger 0.50 linear residual with Triton residual add/gradient cost repair"),
         ("Fourier", "B4a-FourierKAN-lowfreq-K4", "D5-A Fourier K4 fixedfreq reference / L1 + L2 compile-forward attempt"),
         ("Wavelet", "B5h-HatWaveletKAN-local-K4", "D6-A HatWavelet local support / L1 stream + L2 compile-forward attempt"),
+        ("Wavelet", "B5i-HatWaveletKAN-K4-inputcrossL4P128-tritonL3", "D6-B v12.11 fixed input-cross sidecar for HatWavelet expression repair"),
+        ("Wavelet", "B5j-HatWaveletKAN-K4-inputrot2L4P128-tritonL3", "D6-C v12.11 local rotated input-cross sidecar for HatWavelet expression repair"),
+        ("Wavelet", "B5k-HatWaveletKAN-K4-inputcrossL4P128-linearres-tritonL3", "D6-D v12.11 HatWavelet input-cross plus small linear residual bracket"),
+        ("Wavelet", "B5l-HatWaveletKAN-K4-inputcrossL4P128-linearraw050-tritonL3", "D6-E v12.11 HatWavelet raw-linear residual 0.50 task repair bracket"),
+        ("Wavelet", "B5m-HatWaveletKAN-K4-inputcrossL4P128-linearraw025-tritonL3", "D6-F v12.11 HatWavelet raw-linear residual 0.25 task repair bracket"),
+        ("Wavelet", "B5n-HatWaveletKAN-K4-inputcrossL4P128-linearraw010-tritonL3", "D6-G v12.11 HatWavelet raw-linear residual 0.10 task repair bracket"),
+        ("Wavelet", "B5o-HatWaveletKAN-K4-inputcrossL4P128-linearraw005-tritonL3", "D6-H v12.11 HatWavelet raw-linear residual 0.05 task repair bracket"),
+        ("Wavelet", "B5p-HatWaveletKAN-K4-inputcrossL4P128-linearraw002-tritonL3", "D6-I v12.11 HatWavelet raw-linear residual 0.02 task repair bracket"),
+        ("Wavelet", "B5q-HatWaveletKAN-K4-inputcrossL4P128-linearraw001-tritonL3", "D6-J v12.11 HatWavelet raw-linear residual 0.01 task repair bracket"),
     ]
 
 
@@ -2361,7 +2386,7 @@ def run_family_microbench(args: argparse.Namespace, out_dir: Path, device: torch
             manual_variant = manual_model.manual_kernel_variant() if hasattr(manual_model, "manual_kernel_variant") else "unknown_manual_variant"  # type: ignore[attr-defined]
             l3_step_ratio = _safe_float(manual_m.get("step_q90_ms"), float("inf")) / max(EPS, _safe_float(mlp_m.get("step_q90_ms"), 0.0))
             l3_mem_ratio = _safe_float(manual_m.get("memory_peak_mb"), float("inf")) / max(EPS, _safe_float(mlp_m.get("memory_peak_mb"), 0.0)) if _safe_float(mlp_m.get("memory_peak_mb")) > 0 else 1.0
-            official_fused_l3 = int(manual_variant in {"rational_flashkat_grouped_triton_l3_gemm", "rational_flashkat_grouped_inputcross_gemm_l3", "rational_flashkat_grouped_paircross_gemm_l3", "rational_flashkat_grouped_paircross_pca_gemm_l3", "rational_flashkat_grouped_paircross_pca_gemm_frozenbackbone_l3", "rational_flashkat_grouped_paircross_pca_gemm_frozenbackbone_hiddenbias_l3", "rational_flashkat_grouped_paircross_pca_gemm_frozenbackbone_hiddenbias_hiddenresvjptriton_l3", "rational_flashkat_grouped_paircross_pca_gemm_frozenbackbone_hiddenbias_logitrmsnormsg_l3", "rational_flashkat_grouped_paircross_pca_gemm_frozenbackbone_hiddenbias_logitbatchrmsnormsg_l3", "rational_flashkat_grouped_paircross_pca_gemm_freezerational_l3", "rational_flashkat_grouped_paircross_signal_gemm_l3", "rational_flashkat_grouped_paircross_signal_gemm_frozenbackbone_l3", "rational_flashkat_grouped_paircross_signal_gemm_frozenbackbone_hiddenbias_l3", "rational_flashkat_grouped_paircross_signal_gemm_frozenbackbone_hiddenbias_hiddenresvjptriton_l3", "rational_flashkat_grouped_paircross_signal_gemm_freezerational_l3", "rational_flashkat_grouped_paircross_readout_triton_l3", "rational_flashkat_grouped_paircross_readout_block_triton_l3", "rational_flashkat_grouped_paircross_readout_block_triton_frozenbackbone_l3", "rational_flashkat_grouped_paircross_readout_block_triton_frozenbackbone_hiddentailgradtriton_l3", "rational_flashkat_grouped_paircross_readout_block_triton_frozenbackbone_hiddenresvjptriton_l3", "rational_flashkat_grouped_paircross_readout_block_triton_frozenbackbone_hiddenbias_l3", "rational_flashkat_grouped_paircross_readout_block_triton_frozenbackbone_hiddenbias_hiddentailgradtriton_l3", "rational_flashkat_grouped_paircross_readout_block_triton_frozenbackbone_hiddenbias_hiddenresvjptriton_l3", "rational_flashkat_grouped_paircross_readout_block_triton_frozenbackbone_hiddenbias_hiddenresvjptriton_logitrmsnormsg_l3", "rational_flashkat_grouped_paircross_readout_block_triton_frozenbackbone_hiddenbias_hiddenresvjptriton_logitbatchrmsnormsg_l3", "rational_flashkat_grouped_paircross_readout_block_triton_frozenbackbone_hiddenbias_hiddenresvjptriton_logitbatchrmsmixsg_l3", "rational_flashkat_grouped_paircross_readout_block_triton_freezerational_l3", "rational_flashkat_grouped_transformpair_gemm_l3", "rational_flashkat_grouped_pairhidden_gemm_l3", "rational_flashkat_grouped_pairbucket_l3", "rational_flashkat_grouped_pairbucket_triton_l3", "rational_flashkat_grouped_pairbucket_direct_triton_l3", "rational_flashkat_grouped_paircross_bucket_triton_l3", "rational_flashkat_grouped_pairreadbucket_triton_l3", "rational_flashkat_grouped_projsq_readout_gemm_l3", "rational_flashkat_grouped_projbilin_readout_gemm_l3", "cheby_k3_triton_l3_matmul", "cheby_k3_triton_l3_gradbuf", "cheby_k3_triton_l3_paircross_gradbuf", "cheby_k3_triton_l3_paircross_inputcross_gemm_gradbuf", "cheby_k3_triton_l3_paircross_inputcross_linearres_gemm_gradbuf", "cheby_k3_triton_l3_inputcross_gemm_gradbuf", "cheby_k3_triton_l3_inputcross_linearres_gemm_gradbuf", "cheby_k4_triton_l3_matmul", "fourier_k2_triton_l3", "fourier_k2_triton_l3_blockh", "fourier_k2_triton_l3_matmul", "fourier_k3_triton_l3_matmul", "fourier_k4_triton_l3_matmul", "fourier_k4_linearres_triton_l3_matmul", "fourier_k4_linearres_gemm_l3_matmul", "rbf_k2_triton_l3_matmul", "rbf_k4_triton_l3_matmul", "hat_wavelet_k4_triton_l3_matmul"})
+            official_fused_l3 = int(manual_variant in {"rational_flashkat_grouped_triton_l3_gemm", "rational_flashkat_grouped_inputcross_gemm_l3", "rational_flashkat_grouped_paircross_gemm_l3", "rational_flashkat_grouped_paircross_pca_gemm_l3", "rational_flashkat_grouped_paircross_pca_gemm_frozenbackbone_l3", "rational_flashkat_grouped_paircross_pca_gemm_frozenbackbone_hiddenbias_l3", "rational_flashkat_grouped_paircross_pca_gemm_frozenbackbone_hiddenbias_hiddenresvjptriton_l3", "rational_flashkat_grouped_paircross_pca_gemm_frozenbackbone_hiddenbias_logitrmsnormsg_l3", "rational_flashkat_grouped_paircross_pca_gemm_frozenbackbone_hiddenbias_logitbatchrmsnormsg_l3", "rational_flashkat_grouped_paircross_pca_gemm_freezerational_l3", "rational_flashkat_grouped_paircross_signal_gemm_l3", "rational_flashkat_grouped_paircross_signal_gemm_frozenbackbone_l3", "rational_flashkat_grouped_paircross_signal_gemm_frozenbackbone_hiddenbias_l3", "rational_flashkat_grouped_paircross_signal_gemm_frozenbackbone_hiddenbias_hiddenresvjptriton_l3", "rational_flashkat_grouped_paircross_signal_gemm_freezerational_l3", "rational_flashkat_grouped_paircross_readout_triton_l3", "rational_flashkat_grouped_paircross_readout_block_triton_l3", "rational_flashkat_grouped_paircross_readout_block_triton_frozenbackbone_l3", "rational_flashkat_grouped_paircross_readout_block_triton_frozenbackbone_hiddentailgradtriton_l3", "rational_flashkat_grouped_paircross_readout_block_triton_frozenbackbone_hiddenresvjptriton_l3", "rational_flashkat_grouped_paircross_readout_block_triton_frozenbackbone_hiddenbias_l3", "rational_flashkat_grouped_paircross_readout_block_triton_frozenbackbone_hiddenbias_hiddentailgradtriton_l3", "rational_flashkat_grouped_paircross_readout_block_triton_frozenbackbone_hiddenbias_hiddenresvjptriton_l3", "rational_flashkat_grouped_paircross_readout_block_triton_frozenbackbone_hiddenbias_hiddenresvjptriton_logitrmsnormsg_l3", "rational_flashkat_grouped_paircross_readout_block_triton_frozenbackbone_hiddenbias_hiddenresvjptriton_logitbatchrmsnormsg_l3", "rational_flashkat_grouped_paircross_readout_block_triton_frozenbackbone_hiddenbias_hiddenresvjptriton_logitbatchrmsmixsg_l3", "rational_flashkat_grouped_paircross_readout_block_triton_freezerational_l3", "rational_flashkat_grouped_transformpair_gemm_l3", "rational_flashkat_grouped_pairhidden_gemm_l3", "rational_flashkat_grouped_pairbucket_l3", "rational_flashkat_grouped_pairbucket_triton_l3", "rational_flashkat_grouped_pairbucket_direct_triton_l3", "rational_flashkat_grouped_paircross_bucket_triton_l3", "rational_flashkat_grouped_pairreadbucket_triton_l3", "rational_flashkat_grouped_projsq_readout_gemm_l3", "rational_flashkat_grouped_projbilin_readout_gemm_l3", "cheby_k3_triton_l3_matmul", "cheby_k3_triton_l3_gradbuf", "cheby_k3_triton_l3_paircross_gradbuf", "cheby_k3_triton_l3_paircross_inputcross_gemm_gradbuf", "cheby_k3_triton_l3_paircross_inputcross_linearres_gemm_gradbuf", "cheby_k3_triton_l3_inputcross_gemm_gradbuf", "cheby_k3_triton_l3_inputcross_linearres_gemm_gradbuf", "cheby_k4_triton_l3_matmul", "fourier_k2_triton_l3", "fourier_k2_triton_l3_blockh", "fourier_k2_triton_l3_matmul", "fourier_k3_triton_l3_matmul", "fourier_k4_triton_l3_matmul", "fourier_k4_linearres_triton_l3_matmul", "fourier_k4_linearres_gemm_l3_matmul", "rbf_k2_triton_l3_matmul", "rbf_k4_triton_l3_matmul", "rbf_k4_triton_l3_inputcross_gemm", "rbf_k4_triton_l3_inputcross_linearres_gemm", "hat_wavelet_k4_triton_l3_matmul", "hat_wavelet_k4_triton_l3_inputcross_gemm", "hat_wavelet_k4_triton_l3_inputcross_linearres_gemm"})
             official_efficiency_pass = int(bool(official_fused_l3) and l3_step_ratio <= 1.25 and l3_mem_ratio <= 1.05)
             l3_official_efficiency_pass = official_efficiency_pass
             l3_official_fused_kernel = official_fused_l3
@@ -3418,7 +3443,7 @@ def run_b109_functional_delta_score_repair(
     rows: List[Dict[str, Any]] = []
     control_rows: List[Dict[str, Any]] = []
     for idx, cid in enumerate(candidate_ids):
-        base = v1252._make_model(cid, input_dim, output_dim, x_train, device, int(args.seed) + 701 + idx, specs)
+        base = v1252._make_model(cid, input_dim, output_dim, x_train, device, int(args.seed) + 701 + idx, specs, y_train)
         task_delta = v1252._grad_delta(base, xb, yb, float(args.lr))
         snr_delta = v1252._basis_delta(base, task_delta, "basis_aware_snr_projected")
         orth_delta = v1252._basis_delta(base, task_delta, "basis_aware_orthogonal")
@@ -3818,6 +3843,7 @@ def main() -> None:
     device = _device_from_arg(args.device)
     if device.type != "cuda":
         raise RuntimeError("v12.8.3 no-CPU-offload contract requires CUDA")
+    torch.cuda.set_device(device)
     torch.set_float32_matmul_precision("highest")
     torch.backends.cuda.matmul.allow_tf32 = False
     x_train_cpu, y_train_cpu, x_val_cpu, y_val_cpu, _x_test_cpu, _y_test_cpu, input_dim, output_dim = _load_mnist(args)

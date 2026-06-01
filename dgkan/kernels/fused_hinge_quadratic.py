@@ -756,6 +756,78 @@ if TRITON_AVAILABLE:
         tl.store(grad_proj + offs_d[:, None] * H + offs_h[None, :], acc, mask=mask_d[:, None] & mask_h[None, :])
 
     @triton.jit
+    def _fhq_proj_grad_adamw_kernel(x, mu, std, q_out, q2_sum, delta, quad_readout, branch_scale, logit_gain, q_std, quad_proj, exp_avg, exp_avg_sq, step_size, B: tl.constexpr, D: tl.constexpr, H: tl.constexpr, C: tl.constexpr, LR: tl.constexpr, WEIGHT_DECAY: tl.constexpr, BETA1: tl.constexpr, BETA2: tl.constexpr, EPS_ADAM: tl.constexpr, BLOCK_B: tl.constexpr, BLOCK_D: tl.constexpr, BLOCK_H: tl.constexpr, C_BLOCK: tl.constexpr, Q_TANH: tl.constexpr, Q_RMS: tl.constexpr, CLASS_BRANCH: tl.constexpr, CLASS_GAIN: tl.constexpr):
+        pid_d = tl.program_id(0)
+        pid_h = tl.program_id(1)
+        offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+        offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+        offs_c = tl.arange(0, C_BLOCK)
+        mask_d = offs_d < D
+        mask_h = offs_h < H
+        mask_c = offs_c < C
+        wq = tl.load(quad_readout + offs_h[:, None] * C + offs_c[None, :], mask=mask_h[:, None] & mask_c[None, :], other=0.0)
+        wq2 = tl.load(quad_readout + (H + offs_h[:, None]) * C + offs_c[None, :], mask=mask_h[:, None] & mask_c[None, :], other=0.0)
+        qscale = tl.load(q_std + offs_h, mask=mask_h, other=1.0)
+        q_rms = tl.sqrt(tl.maximum(tl.load(q2_sum + offs_h, mask=mask_h, other=1.0) / B, 1.0e-8))
+        acc = tl.zeros((BLOCK_D, BLOCK_H), dtype=tl.float32)
+        for b0 in range(0, B, BLOCK_B):
+            offs_b = b0 + tl.arange(0, BLOCK_B)
+            mask_b = offs_b < B
+            xv = tl.load(x + offs_b[:, None] * D + offs_d[None, :], mask=mask_b[:, None] & mask_d[None, :], other=0.0)
+            z = (xv - tl.load(mu + offs_d, mask=mask_d, other=0.0)[None, :]) / tl.maximum(tl.load(std + offs_d, mask=mask_d, other=1.0)[None, :], 1.0e-4)
+            z = tl.minimum(3.0, tl.maximum(-3.0, z))
+            qv = tl.load(q_out + offs_b[:, None] * H + offs_h[None, :], mask=mask_b[:, None] & mask_h[None, :], other=0.0)
+            if Q_RMS:
+                qv = qv / q_rms[None, :]
+            if CLASS_BRANCH:
+                branch1 = tl.load(branch_scale + C + offs_c, mask=mask_c, other=0.0)
+            else:
+                branch1 = tl.load(branch_scale + 1) + tl.zeros((C_BLOCK,), dtype=tl.float32)
+            if CLASS_GAIN:
+                raw_gain = tl.load(logit_gain + offs_c, mask=mask_c, other=1.0)
+            else:
+                raw_gain = tl.load(logit_gain) + tl.zeros((C_BLOCK,), dtype=tl.float32)
+            gain = tl.minimum(4.0, tl.maximum(0.25, raw_gain))
+            gd = tl.load(delta + offs_b[:, None] * C + offs_c[None, :], mask=mask_b[:, None] & mask_c[None, :], other=0.0) * gain[None, :] * branch1[None, :]
+            grad_q = tl.dot(gd, tl.trans(wq)) + 2.0 * qv * tl.dot(gd, tl.trans(wq2))
+            if Q_TANH:
+                grad_q = grad_q * (1.0 - qv * qv)
+            if Q_RMS:
+                grad_q = grad_q / q_rms[None, :]
+            grad_q = grad_q / tl.maximum(qscale[None, :], 1.0e-4)
+            acc += tl.dot(tl.trans(z), grad_q)
+        idx = offs_d[:, None] * H + offs_h[None, :]
+        mask = mask_d[:, None] & mask_h[None, :]
+        p = tl.load(quad_proj + idx, mask=mask, other=0.0)
+        m = tl.load(exp_avg + idx, mask=mask, other=0.0)
+        v = tl.load(exp_avg_sq + idx, mask=mask, other=0.0)
+        if WEIGHT_DECAY != 0.0:
+            p = p * (1.0 - LR * WEIGHT_DECAY)
+        m = m * BETA1 + acc * (1.0 - BETA1)
+        v = v * BETA2 + acc * acc * (1.0 - BETA2)
+        p = p - step_size * m / (tl.sqrt(v) + EPS_ADAM)
+        tl.store(quad_proj + idx, p, mask=mask)
+        tl.store(exp_avg + idx, m, mask=mask)
+        tl.store(exp_avg_sq + idx, v, mask=mask)
+
+    @triton.jit
+    def _fhq_adamw_update_kernel(param, grad, exp_avg, exp_avg_sq, step_size, N: tl.constexpr, LR: tl.constexpr, WEIGHT_DECAY: tl.constexpr, BETA1: tl.constexpr, BETA2: tl.constexpr, EPS_ADAM: tl.constexpr, BLOCK_N: tl.constexpr):
+        offs = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+        mask = offs < N
+        p = tl.load(param + offs, mask=mask, other=0.0)
+        g = tl.load(grad + offs, mask=mask, other=0.0)
+        m = tl.load(exp_avg + offs, mask=mask, other=0.0)
+        v = tl.load(exp_avg_sq + offs, mask=mask, other=0.0)
+        if WEIGHT_DECAY != 0.0:
+            p = p * (1.0 - LR * WEIGHT_DECAY)
+        m = m * BETA1 + g * (1.0 - BETA1)
+        v = v * BETA2 + g * g * (1.0 - BETA2)
+        p = p - step_size * m / (tl.sqrt(v) + EPS_ADAM)
+        tl.store(param + offs, p, mask=mask)
+        tl.store(exp_avg + offs, m, mask=mask)
+        tl.store(exp_avg_sq + offs, v, mask=mask)
+
+    @triton.jit
     def _fhq_scalar_grad_kernel(
         logits,
         delta,
@@ -865,6 +937,29 @@ def _effective_delta_for_kernels(model: torch.nn.Module, logits: torch.Tensor, y
     return delta_final
 
 
+def _effective_delta_from_grad_logits_for_kernels(
+    model: torch.nn.Module,
+    grad_logits: torch.Tensor,
+    direct_logits: torch.Tensor,
+    quad_logits: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    delta_final = out if out is not None else torch.empty_like(grad_logits)
+    delta_final.copy_(grad_logits)
+    if not bool(getattr(model, "logit_norm_enabled", False)):
+        return delta_final
+    with torch.no_grad():
+        base = _base_logits(model, direct_logits, quad_logits)
+        rms = base.square().mean(dim=1, keepdim=True).sqrt().clamp_min(1.0e-4)
+        gain = _gain(model).view(1, -1)
+        g_pre = delta_final * gain
+        dot = (g_pre * base).sum(dim=1, keepdim=True)
+        denom = float(max(1, int(base.shape[1]))) * rms.square()
+        delta_base = model.logit_norm_target * (g_pre - base * dot / denom) / rms  # type: ignore[attr-defined]
+        delta_final.copy_(delta_base / gain.clamp_min(1.0e-6))
+    return delta_final
+
+
 def supported_simple(model: torch.nn.Module, input_dim: int, output_dim: int) -> Tuple[bool, str]:
     if not TRITON_AVAILABLE:
         return False, "triton_not_available"
@@ -915,7 +1010,7 @@ def supported_simple(model: torch.nn.Module, input_dim: int, output_dim: int) ->
 class FHQWorkspace:
     """Reusable CUDA buffers for one SimpleFastTaskGeometry FHQ step."""
 
-    def __init__(self, model: torch.nn.Module, batch_size: int, device: torch.device | None = None) -> None:
+    def __init__(self, model: torch.nn.Module, batch_size: int, device: torch.device | None = None, include_grad_proj: bool = True) -> None:
         self.batch_size = int(batch_size)
         if self.batch_size <= 0:
             raise ValueError("batch_size must be positive")
@@ -930,7 +1025,7 @@ class FHQWorkspace:
         self.delta = torch.empty((self.batch_size, classes), device=dev, dtype=torch.float32)
         self.grad_direct = torch.empty_like(model.direct_readout, device=dev)  # type: ignore[attr-defined]
         self.grad_quad = torch.empty_like(model.quad_readout, device=dev)  # type: ignore[attr-defined]
-        if isinstance(model.quad_proj, torch.nn.Parameter):  # type: ignore[attr-defined]
+        if include_grad_proj and isinstance(model.quad_proj, torch.nn.Parameter):  # type: ignore[attr-defined]
             self.grad_proj = torch.empty_like(model.quad_proj, device=dev)  # type: ignore[attr-defined]
         else:
             self.grad_proj = None
@@ -939,8 +1034,8 @@ class FHQWorkspace:
         self.grad_bias = torch.empty_like(model.bias, device=dev)  # type: ignore[attr-defined]
 
 
-def make_workspace(model: torch.nn.Module, batch_size: int, device: torch.device | None = None) -> FHQWorkspace:
-    return FHQWorkspace(model, batch_size, device=device)
+def make_workspace(model: torch.nn.Module, batch_size: int, device: torch.device | None = None, include_grad_proj: bool = True) -> FHQWorkspace:
+    return FHQWorkspace(model, batch_size, device=device, include_grad_proj=include_grad_proj)
 
 
 def forward(model: torch.nn.Module, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1201,3 +1296,106 @@ def backward_learnablep_workspace(model: torch.nn.Module, x: torch.Tensor, y: to
     model.quad_proj.grad = workspace.grad_proj  # type: ignore[attr-defined]
     _scalar_grads_into(model, logits, delta_tensor, direct_logits, quad_logits, workspace.grad_branch, workspace.grad_gain, workspace.grad_bias)
     return logits.new_tensor(0.0)
+
+
+def backward_learnablep_workspace_from_grad_logits(model: torch.nn.Module, x: torch.Tensor, grad_logits: torch.Tensor, logits: torch.Tensor, q_out: torch.Tensor, q2_sum: torch.Tensor, direct_logits: torch.Tensor, quad_logits: torch.Tensor, workspace: FHQWorkspace) -> torch.Tensor:
+    assert TRITON_AVAILABLE and triton is not None
+    if workspace.grad_proj is None:
+        raise ValueError("learnable-P workspace requires a learnable quad_proj")
+    delta_tensor = _effective_delta_from_grad_logits_for_kernels(model, grad_logits, direct_logits, quad_logits, workspace.delta[: int(logits.shape[0])])
+    _direct_grad(model, x, delta_tensor, workspace.grad_direct)
+    _quad_grad(model, q_out, q2_sum, delta_tensor, workspace.grad_quad)
+    dim = int(model.input_dim)  # type: ignore[attr-defined]
+    hidden = int(model.hidden_dim)  # type: ignore[attr-defined]
+    classes = int(model.output_dim)  # type: ignore[attr-defined]
+    _fhq_proj_grad_kernel[(triton.cdiv(dim, 64), triton.cdiv(hidden, 64))](x, model.mu.contiguous(), model.std.contiguous(), q_out, q2_sum, delta_tensor, model.quad_readout.contiguous(), model.branch_scale.contiguous(), model.logit_gain.contiguous(), model.quad_feature_std.contiguous(), workspace.grad_proj, B=int(x.shape[0]), D=dim, H=hidden, C=classes, BLOCK_B=128, BLOCK_D=64, BLOCK_H=64, C_BLOCK=triton.next_power_of_2(classes), Q_TANH=bool(getattr(model, "quad_tanh_enabled", False)), Q_RMS=bool(getattr(model, "quad_batch_rms_enabled", False)), CLASS_BRANCH=bool(getattr(model, "class_branch_scale_enabled", False)), CLASS_GAIN=class_gain_enabled(model))  # type: ignore[attr-defined]
+    model.direct_readout.grad = workspace.grad_direct  # type: ignore[attr-defined]
+    model.quad_readout.grad = workspace.grad_quad  # type: ignore[attr-defined]
+    model.quad_proj.grad = workspace.grad_proj  # type: ignore[attr-defined]
+    _scalar_grads_into(model, logits, delta_tensor, direct_logits, quad_logits, workspace.grad_branch, workspace.grad_gain, workspace.grad_bias)
+    return logits.new_tensor(0.0)
+
+
+def _quad_proj_adamw_state(model: torch.nn.Module, param: torch.nn.Parameter) -> tuple[torch.Tensor, torch.Tensor]:
+    exp_avg = getattr(model, "_fhq_quad_proj_exp_avg", None)
+    exp_avg_sq = getattr(model, "_fhq_quad_proj_exp_avg_sq", None)
+    if exp_avg is None or exp_avg.shape != param.shape or exp_avg.device != param.device:
+        exp_avg = torch.zeros_like(param)
+        setattr(model, "_fhq_quad_proj_exp_avg", exp_avg)
+    if exp_avg_sq is None or exp_avg_sq.shape != param.shape or exp_avg_sq.device != param.device:
+        exp_avg_sq = torch.zeros_like(param)
+        setattr(model, "_fhq_quad_proj_exp_avg_sq", exp_avg_sq)
+    return exp_avg, exp_avg_sq
+
+
+@torch.no_grad()
+def _adamw_update_quad_proj(model: torch.nn.Module, grad_proj: torch.Tensor, *, lr: float, weight_decay: float, step_count: int, beta1: float = 0.9, beta2: float = 0.999, eps: float = 1.0e-8) -> None:
+    param = model.quad_proj  # type: ignore[attr-defined]
+    if not isinstance(param, torch.nn.Parameter) or not param.requires_grad:
+        return
+    exp_avg, exp_avg_sq = _quad_proj_adamw_state(model, param)
+    if float(weight_decay) != 0.0:
+        param.mul_(1.0 - float(lr) * float(weight_decay))
+    exp_avg.mul_(float(beta1)).add_(grad_proj, alpha=1.0 - float(beta1))
+    exp_avg_sq.mul_(float(beta2)).addcmul_(grad_proj, grad_proj, value=1.0 - float(beta2))
+    step = max(1, int(step_count))
+    bias_correction1 = 1.0 - float(beta1) ** step
+    bias_correction2 = 1.0 - float(beta2) ** step
+    step_size = float(lr) * (bias_correction2 ** 0.5) / bias_correction1
+    param.addcdiv_(exp_avg, exp_avg_sq.sqrt().add_(float(eps)), value=-step_size)
+
+
+@torch.no_grad()
+def _triton_adamw_update_quad_proj(model: torch.nn.Module, grad_proj: torch.Tensor, *, lr: float, weight_decay: float, step_count: int, beta1: float = 0.9, beta2: float = 0.999, eps: float = 1.0e-8) -> None:
+    assert TRITON_AVAILABLE and triton is not None
+    param = model.quad_proj  # type: ignore[attr-defined]
+    if not isinstance(param, torch.nn.Parameter) or not param.requires_grad:
+        return
+    exp_avg, exp_avg_sq = _quad_proj_adamw_state(model, param)
+    step = max(1, int(step_count))
+    step_size = float(lr) * ((1.0 - float(beta2) ** step) ** 0.5) / (1.0 - float(beta1) ** step)
+    n = int(param.numel())
+    _fhq_adamw_update_kernel[(triton.cdiv(n, 1024),)](
+        param,
+        grad_proj,
+        exp_avg,
+        exp_avg_sq,
+        step_size,
+        N=n,
+        LR=float(lr),
+        WEIGHT_DECAY=float(weight_decay),
+        BETA1=float(beta1),
+        BETA2=float(beta2),
+        EPS_ADAM=float(eps),
+        BLOCK_N=1024,
+    )
+
+
+def backward_learnablep_workspace_fused_quadproj_adamw_from_grad_logits(model: torch.nn.Module, x: torch.Tensor, grad_logits: torch.Tensor, logits: torch.Tensor, q_out: torch.Tensor, q2_sum: torch.Tensor, direct_logits: torch.Tensor, quad_logits: torch.Tensor, workspace: FHQWorkspace, *, lr: float, weight_decay: float, step_count: int) -> torch.Tensor:
+    assert TRITON_AVAILABLE and triton is not None
+    delta_tensor = _effective_delta_from_grad_logits_for_kernels(model, grad_logits, direct_logits, quad_logits, workspace.delta[: int(logits.shape[0])])
+    _direct_grad(model, x, delta_tensor, workspace.grad_direct)
+    _quad_grad(model, q_out, q2_sum, delta_tensor, workspace.grad_quad)
+    dim = int(model.input_dim)  # type: ignore[attr-defined]
+    hidden = int(model.hidden_dim)  # type: ignore[attr-defined]
+    classes = int(model.output_dim)  # type: ignore[attr-defined]
+    if workspace.grad_proj is None:
+        exp_avg, exp_avg_sq = _quad_proj_adamw_state(model, model.quad_proj)  # type: ignore[attr-defined]
+        beta1 = 0.9
+        beta2 = 0.999
+        step = max(1, int(step_count))
+        step_size = float(lr) * ((1.0 - beta2 ** step) ** 0.5) / (1.0 - beta1 ** step)
+        _fhq_proj_grad_adamw_kernel[(triton.cdiv(dim, 64), triton.cdiv(hidden, 64))](x, model.mu.contiguous(), model.std.contiguous(), q_out, q2_sum, delta_tensor, model.quad_readout.contiguous(), model.branch_scale.contiguous(), model.logit_gain.contiguous(), model.quad_feature_std.contiguous(), model.quad_proj, exp_avg, exp_avg_sq, step_size, B=int(x.shape[0]), D=dim, H=hidden, C=classes, LR=float(lr), WEIGHT_DECAY=float(weight_decay), BETA1=beta1, BETA2=beta2, EPS_ADAM=1.0e-8, BLOCK_B=128, BLOCK_D=64, BLOCK_H=64, C_BLOCK=triton.next_power_of_2(classes), Q_TANH=bool(getattr(model, "quad_tanh_enabled", False)), Q_RMS=bool(getattr(model, "quad_batch_rms_enabled", False)), CLASS_BRANCH=bool(getattr(model, "class_branch_scale_enabled", False)), CLASS_GAIN=class_gain_enabled(model))  # type: ignore[attr-defined]
+    else:
+        _fhq_proj_grad_kernel[(triton.cdiv(dim, 64), triton.cdiv(hidden, 64))](x, model.mu.contiguous(), model.std.contiguous(), q_out, q2_sum, delta_tensor, model.quad_readout.contiguous(), model.branch_scale.contiguous(), model.logit_gain.contiguous(), model.quad_feature_std.contiguous(), workspace.grad_proj, B=int(x.shape[0]), D=dim, H=hidden, C=classes, BLOCK_B=128, BLOCK_D=64, BLOCK_H=64, C_BLOCK=triton.next_power_of_2(classes), Q_TANH=bool(getattr(model, "quad_tanh_enabled", False)), Q_RMS=bool(getattr(model, "quad_batch_rms_enabled", False)), CLASS_BRANCH=bool(getattr(model, "class_branch_scale_enabled", False)), CLASS_GAIN=class_gain_enabled(model))  # type: ignore[attr-defined]
+        _triton_adamw_update_quad_proj(model, workspace.grad_proj, lr=lr, weight_decay=weight_decay, step_count=step_count)
+    model.direct_readout.grad = workspace.grad_direct  # type: ignore[attr-defined]
+    model.quad_readout.grad = workspace.grad_quad  # type: ignore[attr-defined]
+    model.quad_proj.grad = None  # type: ignore[attr-defined]
+    _scalar_grads_into(model, logits, delta_tensor, direct_logits, quad_logits, workspace.grad_branch, workspace.grad_gain, workspace.grad_bias)
+    return logits.new_tensor(0.0)
+
+
+def backward_learnablep_workspace_fused_quadproj_adamw(model: torch.nn.Module, x: torch.Tensor, y: torch.Tensor, logits: torch.Tensor, q_out: torch.Tensor, q2_sum: torch.Tensor, direct_logits: torch.Tensor, quad_logits: torch.Tensor, workspace: FHQWorkspace, *, lr: float, weight_decay: float, step_count: int) -> torch.Tensor:
+    grad_logits = delta_into(logits, y, workspace.delta[: int(logits.shape[0])])
+    return backward_learnablep_workspace_fused_quadproj_adamw_from_grad_logits(model, x, grad_logits, logits, q_out, q2_sum, direct_logits, quad_logits, workspace, lr=lr, weight_decay=weight_decay, step_count=step_count)
