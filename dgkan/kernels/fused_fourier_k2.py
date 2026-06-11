@@ -969,16 +969,13 @@ def forward_matmul_k4_linearres(model, x: torch.Tensor) -> Tuple[torch.Tensor, t
     return logits, h
 
 
-def backward(model, x: torch.Tensor, y: torch.Tensor, logits: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+def backward_from_grad_logits(model, x: torch.Tensor, grad_logits: torch.Tensor, logits: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
     _check_model(model)
     if x.dtype != torch.float32 or x.device.type != "cuda":
-        raise ValueError("fused_fourier_k2 backward requires fp32 CUDA input")
+        raise ValueError("fused_fourier_k2 backward_from_grad_logits requires fp32 CUDA input")
     x = x.contiguous()
     with torch.no_grad():
-        loss = F.cross_entropy(logits, y)
-        grad_logits = torch.softmax(logits, dim=1)
-        grad_logits[torch.arange(int(y.numel()), device=y.device), y] -= 1.0
-        grad_logits = (grad_logits / float(max(1, int(y.numel())))).contiguous()
+        grad_logits = grad_logits.to(device=logits.device, dtype=logits.dtype).contiguous()
         gw1 = torch.empty_like(model.w1)
         gw2 = torch.empty_like(model.w2)
         batch = int(x.shape[0])
@@ -1013,7 +1010,20 @@ def backward(model, x: torch.Tensor, y: torch.Tensor, logits: torch.Tensor, h: t
         )
         model.w1.grad = gw1
         model.w2.grad = gw2
-        return loss.detach()
+        return (logits.detach().float() * grad_logits.detach().float()).sum().detach()
+
+
+def backward(model, x: torch.Tensor, y: torch.Tensor, logits: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+    _check_model(model)
+    if x.dtype != torch.float32 or x.device.type != "cuda":
+        raise ValueError("fused_fourier_k2 backward requires fp32 CUDA input")
+    with torch.no_grad():
+        loss = F.cross_entropy(logits, y)
+        grad_logits = torch.softmax(logits, dim=1)
+        grad_logits[torch.arange(int(y.numel()), device=y.device), y] -= 1.0
+        grad_logits = (grad_logits / float(max(1, int(y.numel())))).contiguous()
+    backward_from_grad_logits(model, x, grad_logits, logits, h)
+    return loss.detach()
 
 
 def backward_k3(model, x: torch.Tensor, y: torch.Tensor, logits: torch.Tensor, h: torch.Tensor) -> torch.Tensor:

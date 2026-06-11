@@ -48,6 +48,7 @@ if TRITON_AVAILABLE:
         BLOCK_B: tl.constexpr,
         BLOCK_D: tl.constexpr,
         BLOCK_H: tl.constexpr,
+        FAST_K2: tl.constexpr,
     ):
         b_block = tl.program_id(0)
         h_block = tl.program_id(1)
@@ -65,12 +66,24 @@ if TRITON_AVAILABLE:
             mu = tl.load(mu_ptr + d, mask=d_mask, other=0.0)
             std = tl.maximum(tl.load(std_ptr + d, mask=d_mask, other=1.0), 1.0e-3)
             z = _tanh_tl((xv - mu[None, :]) / std[None, :])
-            for kk in range(0, K):
-                center = tl.load(centers_ptr + kk)
-                r = (z - center) / width
-                phi = tl.exp(-0.5 * r * r)
-                w = tl.load(w1_ptr + ((d[:, None] * H + offs_h[None, :]) * K + kk), mask=d_mask[:, None] & h_mask[None, :], other=0.0)
-                acc += tl.dot(phi, w, input_precision="tf32x3")
+            if FAST_K2:
+                center0 = tl.load(centers_ptr)
+                center1 = tl.load(centers_ptr + 1)
+                r0 = (z - center0) / width
+                r1 = (z - center1) / width
+                phi0 = tl.exp(-0.5 * r0 * r0)
+                phi1 = tl.exp(-0.5 * r1 * r1)
+                w0 = tl.load(w1_ptr + ((d[:, None] * H + offs_h[None, :]) * K), mask=d_mask[:, None] & h_mask[None, :], other=0.0)
+                w1 = tl.load(w1_ptr + ((d[:, None] * H + offs_h[None, :]) * K + 1), mask=d_mask[:, None] & h_mask[None, :], other=0.0)
+                acc += tl.dot(phi0, w0, input_precision="tf32x3")
+                acc += tl.dot(phi1, w1, input_precision="tf32x3")
+            else:
+                for kk in range(0, K):
+                    center = tl.load(centers_ptr + kk)
+                    r = (z - center) / width
+                    phi = tl.exp(-0.5 * r * r)
+                    w = tl.load(w1_ptr + ((d[:, None] * H + offs_h[None, :]) * K + kk), mask=d_mask[:, None] & h_mask[None, :], other=0.0)
+                    acc += tl.dot(phi, w, input_precision="tf32x3")
         h_val = _tanh_tl(acc * INV_SQRT_D)
         tl.store(h_ptr + offs_b[:, None] * H + offs_h[None, :], h_val, mask=b_mask[:, None] & h_mask[None, :])
 
@@ -90,6 +103,7 @@ if TRITON_AVAILABLE:
         BLOCK_B: tl.constexpr,
         BLOCK_H: tl.constexpr,
         BLOCK_C: tl.constexpr,
+        FAST_K2: tl.constexpr,
     ):
         b_block = tl.program_id(0)
         c_block = tl.program_id(1)
@@ -104,13 +118,111 @@ if TRITON_AVAILABLE:
             hh = start + offs_h
             h_mask = hh < H
             h_val = tl.load(h_ptr + offs_b[:, None] * H + hh[None, :], mask=b_mask[:, None] & h_mask[None, :], other=0.0)
-            for kk in range(0, K):
-                center = tl.load(centers_ptr + kk)
-                r = (h_val - center) / width
-                phi = tl.exp(-0.5 * r * r)
-                w = tl.load(w2_ptr + ((hh[:, None] * C + offs_c[None, :]) * K + kk), mask=h_mask[:, None] & c_mask[None, :], other=0.0)
-                acc += tl.dot(phi, w, input_precision="tf32x3")
+            if FAST_K2:
+                center0 = tl.load(centers_ptr)
+                center1 = tl.load(centers_ptr + 1)
+                r0 = (h_val - center0) / width
+                r1 = (h_val - center1) / width
+                phi0 = tl.exp(-0.5 * r0 * r0)
+                phi1 = tl.exp(-0.5 * r1 * r1)
+                w0 = tl.load(w2_ptr + ((hh[:, None] * C + offs_c[None, :]) * K), mask=h_mask[:, None] & c_mask[None, :], other=0.0)
+                w1 = tl.load(w2_ptr + ((hh[:, None] * C + offs_c[None, :]) * K + 1), mask=h_mask[:, None] & c_mask[None, :], other=0.0)
+                acc += tl.dot(phi0, w0, input_precision="tf32x3")
+                acc += tl.dot(phi1, w1, input_precision="tf32x3")
+            else:
+                for kk in range(0, K):
+                    center = tl.load(centers_ptr + kk)
+                    r = (h_val - center) / width
+                    phi = tl.exp(-0.5 * r * r)
+                    w = tl.load(w2_ptr + ((hh[:, None] * C + offs_c[None, :]) * K + kk), mask=h_mask[:, None] & c_mask[None, :], other=0.0)
+                    acc += tl.dot(phi, w, input_precision="tf32x3")
         tl.store(logits_ptr + offs_b[:, None] * C + offs_c[None, :], acc * INV_SQRT_H, mask=b_mask[:, None] & c_mask[None, :])
+
+
+    @triton.jit
+    def _rbf_forward_singlelaunch_kernel(
+        x_ptr,
+        mu_ptr,
+        std_ptr,
+        centers_ptr,
+        scales_ptr,
+        w1_ptr,
+        w2_ptr,
+        h_ptr,
+        logits_ptr,
+        B: tl.constexpr,
+        D: tl.constexpr,
+        H: tl.constexpr,
+        C: tl.constexpr,
+        K: tl.constexpr,
+        INV_SQRT_D: tl.constexpr,
+        INV_SQRT_H: tl.constexpr,
+        BLOCK_B: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+        BLOCK_H: tl.constexpr,
+        BLOCK_C: tl.constexpr,
+        FAST_K2: tl.constexpr,
+    ):
+        b_block = tl.program_id(0)
+        c_block = tl.program_id(1)
+        offs_b = b_block * BLOCK_B + tl.arange(0, BLOCK_B)
+        offs_c = c_block * BLOCK_C + tl.arange(0, BLOCK_C)
+        offs_d = tl.arange(0, BLOCK_D)
+        offs_h_local = tl.arange(0, BLOCK_H)
+        b_mask = offs_b < B
+        c_mask = offs_c < C
+        width = tl.maximum(tl.load(scales_ptr), 1.0e-3)
+        logits_acc = tl.zeros((BLOCK_B, BLOCK_C), tl.float32)
+        for h_start in range(0, H, BLOCK_H):
+            hh = h_start + offs_h_local
+            h_mask = hh < H
+            hidden_acc = tl.zeros((BLOCK_B, BLOCK_H), tl.float32)
+            for d_start in range(0, D, BLOCK_D):
+                d = d_start + offs_d
+                d_mask = d < D
+                xv = tl.load(x_ptr + offs_b[:, None] * D + d[None, :], mask=b_mask[:, None] & d_mask[None, :], other=0.0)
+                mu = tl.load(mu_ptr + d, mask=d_mask, other=0.0)
+                std = tl.maximum(tl.load(std_ptr + d, mask=d_mask, other=1.0), 1.0e-3)
+                z = _tanh_tl((xv - mu[None, :]) / std[None, :])
+                if FAST_K2:
+                    center0 = tl.load(centers_ptr)
+                    center1 = tl.load(centers_ptr + 1)
+                    r0 = (z - center0) / width
+                    r1 = (z - center1) / width
+                    phi0 = tl.exp(-0.5 * r0 * r0)
+                    phi1 = tl.exp(-0.5 * r1 * r1)
+                    w10 = tl.load(w1_ptr + ((d[:, None] * H + hh[None, :]) * K), mask=d_mask[:, None] & h_mask[None, :], other=0.0)
+                    w11 = tl.load(w1_ptr + ((d[:, None] * H + hh[None, :]) * K + 1), mask=d_mask[:, None] & h_mask[None, :], other=0.0)
+                    hidden_acc += tl.dot(phi0, w10, input_precision="tf32x3")
+                    hidden_acc += tl.dot(phi1, w11, input_precision="tf32x3")
+                else:
+                    for kk in range(0, K):
+                        center = tl.load(centers_ptr + kk)
+                        r = (z - center) / width
+                        phi = tl.exp(-0.5 * r * r)
+                        w1v = tl.load(w1_ptr + ((d[:, None] * H + hh[None, :]) * K + kk), mask=d_mask[:, None] & h_mask[None, :], other=0.0)
+                        hidden_acc += tl.dot(phi, w1v, input_precision="tf32x3")
+            h_val = _tanh_tl(hidden_acc * INV_SQRT_D)
+            tl.store(h_ptr + offs_b[:, None] * H + hh[None, :], h_val, mask=b_mask[:, None] & h_mask[None, :])
+            if FAST_K2:
+                center0_h = tl.load(centers_ptr)
+                center1_h = tl.load(centers_ptr + 1)
+                r0_h = (h_val - center0_h) / width
+                r1_h = (h_val - center1_h) / width
+                phi0_h = tl.exp(-0.5 * r0_h * r0_h)
+                phi1_h = tl.exp(-0.5 * r1_h * r1_h)
+                w20 = tl.load(w2_ptr + ((hh[:, None] * C + offs_c[None, :]) * K), mask=h_mask[:, None] & c_mask[None, :], other=0.0)
+                w21 = tl.load(w2_ptr + ((hh[:, None] * C + offs_c[None, :]) * K + 1), mask=h_mask[:, None] & c_mask[None, :], other=0.0)
+                logits_acc += tl.dot(phi0_h, w20, input_precision="tf32x3")
+                logits_acc += tl.dot(phi1_h, w21, input_precision="tf32x3")
+            else:
+                for kk in range(0, K):
+                    center_h = tl.load(centers_ptr + kk)
+                    r_h = (h_val - center_h) / width
+                    phi_h = tl.exp(-0.5 * r_h * r_h)
+                    w2v = tl.load(w2_ptr + ((hh[:, None] * C + offs_c[None, :]) * K + kk), mask=h_mask[:, None] & c_mask[None, :], other=0.0)
+                    logits_acc += tl.dot(phi_h, w2v, input_precision="tf32x3")
+        tl.store(logits_ptr + offs_b[:, None] * C + offs_c[None, :], logits_acc * INV_SQRT_H, mask=b_mask[:, None] & c_mask[None, :])
 
 
     @triton.jit
@@ -210,6 +322,32 @@ def _check_model(model, k: int | None = None) -> None:
         raise ValueError("fused_rbf currently supports K=2 or K=4")
 
 
+def _forward_block_h(model) -> int:
+    variant = str(getattr(getattr(model, "spec", None), "init_variant", "")).lower()
+    for value in (16, 32, 64, 128):
+        if f"blockh{value}" in variant or f"block_h{value}" in variant or f"block-h{value}" in variant:
+            return value
+    return 32
+
+
+def _forward_block_b(model, batch: int) -> int:
+    variant = str(getattr(getattr(model, "spec", None), "init_variant", "")).lower()
+    for value in (16, 32, 64, 128):
+        if f"blockb{value}" in variant or f"block_b{value}" in variant or f"block-b{value}" in variant:
+            return value
+    return 64 if int(batch) >= 1024 else 32
+
+
+def _forward_fast_k2(model) -> bool:
+    variant = str(getattr(getattr(model, "spec", None), "init_variant", "")).lower()
+    return int(model.k) == 2 and "fastk2" in variant
+
+
+def _forward_singlelaunch(model) -> bool:
+    variant = str(getattr(getattr(model, "spec", None), "init_variant", "")).lower()
+    return "singlelaunch" in variant or "single_launch" in variant or "single-launch" in variant
+
+
 def forward_matmul(model, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     _check_model(model)
     if x.dtype != torch.float32 or x.device.type != "cuda":
@@ -221,10 +359,43 @@ def forward_matmul(model, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     k = int(model.k)
     logits = torch.empty((batch, c_dim), device=x.device, dtype=torch.float32)
     h = torch.empty((batch, h_dim), device=x.device, dtype=torch.float32)
-    block_b = 16
-    block_d = 64
-    block_h = 32
+    block_b = _forward_block_b(model, batch)
+    if int(model.input_dim) <= 8:
+        block_d = 8
+    elif int(model.input_dim) <= 16:
+        block_d = 16
+    elif int(model.input_dim) <= 32:
+        block_d = 32
+    else:
+        block_d = 64
+    block_h = _forward_block_h(model)
+    fast_k2 = _forward_fast_k2(model)
     block_c = max(16, triton.next_power_of_2(c_dim))
+    if _forward_singlelaunch(model):
+        _rbf_forward_singlelaunch_kernel[(triton.cdiv(batch, block_b), triton.cdiv(c_dim, block_c))](
+            x,
+            model.mu,
+            model.std,
+            model.centers,
+            model.scales,
+            model.w1,
+            model.w2,
+            h,
+            logits,
+            batch,
+            int(model.input_dim),
+            h_dim,
+            c_dim,
+            k,
+            1.0 / math.sqrt(max(1, int(model.input_dim))),
+            1.0 / math.sqrt(max(1, h_dim)),
+            BLOCK_B=block_b,
+            BLOCK_D=block_d,
+            BLOCK_H=block_h,
+            BLOCK_C=block_c,
+            FAST_K2=fast_k2,
+        )
+        return logits, h
     _rbf_forward_hidden_kernel[(triton.cdiv(batch, block_b), triton.cdiv(h_dim, block_h))](
         x,
         model.mu,
@@ -241,6 +412,7 @@ def forward_matmul(model, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         BLOCK_B=block_b,
         BLOCK_D=block_d,
         BLOCK_H=block_h,
+        FAST_K2=fast_k2,
     )
     _rbf_forward_logits_kernel[(triton.cdiv(batch, block_b), triton.cdiv(c_dim, block_c))](
         h,
@@ -256,6 +428,7 @@ def forward_matmul(model, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         BLOCK_B=block_b,
         BLOCK_H=block_h,
         BLOCK_C=block_c,
+        FAST_K2=fast_k2,
     )
     return logits, h
 

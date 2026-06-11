@@ -1636,6 +1636,9 @@ class PrimitiveKAN(nn.Module):
     def _manual_rbf_triton_l3_matmul(self) -> bool:
         return self.spec.basis_name in {"compact_rbf", "fastkan_rbf"} and int(self.k) in {2, 4} and str(self.spec.init_variant).startswith("rbf_k")
 
+    def _manual_rational_k4_triton_l3_matmul(self) -> bool:
+        return self.spec.basis_name == "rational_kat_lite" and int(self.k) in {2, 4} and str(self.spec.init_variant).startswith(f"rational_k{int(self.k)}_triton_l3_matmul")
+
     def _manual_hat_wavelet_triton_l3_matmul(self) -> bool:
         return self.spec.basis_name == "hat_wavelet" and int(self.k) == 4 and str(self.spec.init_variant).startswith("hat_wavelet_k4_triton_l3_matmul")
 
@@ -1647,6 +1650,8 @@ class PrimitiveKAN(nn.Module):
         }
 
     def manual_kernel_variant(self) -> str:
+        if self._manual_rational_k4_triton_l3_matmul():
+            return f"rational_k{int(self.k)}_triton_l3_matmul"
         if self._manual_rbf_triton_l3_matmul():
             if self.cheby_input_cross_enabled:
                 if self.linear_residual_enabled:
@@ -1701,6 +1706,11 @@ class PrimitiveKAN(nn.Module):
 
     def manual_ce_forward_cache(self, x: torch.Tensor):
         with torch.no_grad():
+            if self._manual_rational_k4_triton_l3_matmul():
+                from dgkan.kernels import fused_rational_k4
+
+                logits, h = fused_rational_k4.forward_matmul(self, x)
+                return logits, (f"rational_k{int(self.k)}_triton_l3_matmul", x, h)
             if self._manual_rbf_triton_l3_matmul():
                 from dgkan.kernels import fused_rbf
 
@@ -1867,6 +1877,18 @@ class PrimitiveKAN(nn.Module):
 
     def manual_ce_backward_from_cache(self, logits: torch.Tensor, cache, y: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
+            if cache and isinstance(cache[0], str):
+                tag = str(cache[0])
+                if tag.startswith("rational_k") and tag.endswith("_triton_l3_matmul"):
+                    from dgkan.kernels import fused_rational_k4
+
+                    _variant, x, h = cache
+                    return fused_rational_k4.backward(self, x, y, logits, h)
+                if tag.startswith("rbf_k") and tag.endswith("_triton_l3_matmul"):
+                    from dgkan.kernels import fused_rbf
+
+                    _variant, x, h = cache
+                    return fused_rbf.backward(self, x, y, logits, h)
             probs = torch.softmax(logits, dim=1)
             loss = F.cross_entropy(logits, y)
             grad_logits = probs
@@ -2037,6 +2059,11 @@ class PrimitiveKAN(nn.Module):
                 self.cheby_input_cross_readout.grad = input_feats.transpose(0, 1) @ grad_logits
                 self.linear_readout.grad = (z.transpose(0, 1) @ grad_logits) / self._linear_residual_denominator()
                 return loss
+            if cache and isinstance(cache[0], str) and str(cache[0]).startswith("rational_k") and str(cache[0]).endswith("_triton_l3_matmul"):
+                from dgkan.kernels import fused_rational_k4
+
+                _variant, x, h = cache
+                return fused_rational_k4.backward(self, x, y, logits, h)
             if cache and isinstance(cache[0], str) and cache[0] == "hat_wavelet_k4_triton_l3_matmul":
                 from dgkan.kernels import fused_hat_wavelet
 
@@ -7138,6 +7165,10 @@ class MLPBaseline(nn.Module):
         self.w0 = nn.Parameter(torch.randn(input_dim, hidden_dim, device=device, generator=gen) / math.sqrt(input_dim))
         self.w1 = nn.Parameter(torch.randn(hidden_dim, hidden_dim, device=device, generator=gen) / math.sqrt(hidden_dim))
         self.w2 = nn.Parameter(torch.randn(hidden_dim, output_dim, device=device, generator=gen) / math.sqrt(hidden_dim))
+
+    def frozen_readout_features(self, x: torch.Tensor) -> torch.Tensor:
+        h = F.silu(x @ self.w0)
+        return F.silu(h @ self.w1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = F.silu(x @ self.w0)

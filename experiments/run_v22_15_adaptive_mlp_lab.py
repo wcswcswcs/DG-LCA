@@ -144,6 +144,9 @@ def _simulate(adapter: str, mode: str, seed: int, steps: int, dim: int, device: 
     manifold_residuals: list[float] = []
     manifold_risks: list[float] = []
     manifold_smoothness: list[float] = []
+    predicted_drifts: list[float] = []
+    actual_drifts: list[float] = []
+    trajectory_debt = 0.0
     coord = None
     history = torch.stack([source + 0.03 * _normal(gen, (dim,), device) for _ in range(24)])
     basis, basis_row = build_source_manifold_basis("ReadoutSourcePCA", history, dim=8, seed=seed)
@@ -156,7 +159,9 @@ def _simulate(adapter: str, mode: str, seed: int, steps: int, dim: int, device: 
         retention = retention_score(base_effect, source) if base_effect.norm() > 0 else 0.0
         if threshold_cross == "" and retention < 0.25 and step > 20:
             threshold_cross = step
-        source_loss_linear = float(profile["usefulness"]) * retention - 0.00008 * max(0, source_state.age - 1000)
+        predicted_drift = max(0.0, float(prev_retention) - float(retention))
+        predicted_drifts.append(predicted_drift)
+        source_loss_linear = float(profile["usefulness"]) * retention - 0.00008 * max(0, source_state.age - 1000) - trajectory_debt
         if source_loss_linear < 0.0:
             flip_count += 1
         features = RiskFeatures(
@@ -170,7 +175,17 @@ def _simulate(adapter: str, mode: str, seed: int, steps: int, dim: int, device: 
             pairwise_antisymmetry_error=float(profile["pair"]),
             basis_channel_energy_fraction=0.0,
         )
-        decision = decide_controller(features, threshold=0.20 if "predictive" in mode else 0.42, max_lambda=7.0)
+        predictive_mode = mode in {
+            "M4 predictive_adaptive_readout_prox",
+            "M5 predictive_adaptive_source_state_prox",
+            "M6 continuous_lowrank_guidance",
+            "M6b source_manifold_lowrank_guidance",
+        }
+        decision = decide_controller(
+            features,
+            threshold=0.14 if predictive_mode else 0.42,
+            max_lambda=3.5 if predictive_mode else 7.0,
+        )
         lam = 0.0
         target_source = source
         uses_loss_modification = 0
@@ -180,18 +195,24 @@ def _simulate(adapter: str, mode: str, seed: int, steps: int, dim: int, device: 
             lam = 5.0
         elif mode == "M4 predictive_adaptive_readout_prox":
             lam = decision.lambda_t
+            derivative_lam = 0.35 + 5.0 * predicted_drift + 1.5 * max(0.0, 0.36 - retention)
+            if predicted_drift > 0.006 or retention < 0.36 or source_loss_linear < 0.02:
+                lam = max(lam, min(3.5, derivative_lam))
         elif mode == "M5 predictive_adaptive_source_state_prox":
             source_state = transport_source_state(source_state, source, washout_risk=decision.washout_risk, source_loss_linear_gain=source_loss_linear)
             release_count = source_state.release_count
             refresh_count = source_state.refresh_count
             stale_count = source_state.stale_count
             lam = decision.lambda_t
+            derivative_lam = 0.30 + 4.5 * predicted_drift + 1.3 * max(0.0, 0.36 - retention)
+            if predicted_drift > 0.006 or retention < 0.36 or source_loss_linear < 0.02:
+                lam = max(lam, min(3.2, derivative_lam))
             target_source = source_state.mixed / source_state.mixed.norm().clamp_min(1.0e-12)
         elif mode == "M6 continuous_lowrank_guidance":
-            cont_decision = decide_controller(features, threshold=0.05, max_lambda=4.0)
-            lam = max(0.05, cont_decision.lambda_t)
+            cont_decision = decide_controller(features, threshold=0.05, max_lambda=3.0)
+            lam = max(0.08 + 2.5 * predicted_drift, cont_decision.lambda_t)
         elif mode == "M6b source_manifold_lowrank_guidance":
-            lam = max(0.10, decision.lambda_t)
+            lam = max(0.12 + 2.0 * predicted_drift, decision.lambda_t)
             if step % max(1, exact_interval) == 0 or coord is None:
                 updated, coord, sm_diag = manifold_coordinate_solve(basis, jacobian, base_effect, source, lambda_t=lam, previous_coordinates=coord)
             else:
@@ -204,19 +225,22 @@ def _simulate(adapter: str, mode: str, seed: int, steps: int, dim: int, device: 
                     "latent_smoothness_energy": float((coord[1:] - coord[:-1]).square().mean().item()) if coord.numel() > 1 else 0.0,
                 }
             state = updated + 0.25 * drift
+            trajectory_debt *= 0.72 if retention >= 0.25 else 0.88
             manifold_residuals.append(float(sm_diag["manifold_projection_residual_Gf"]))
             manifold_risks.append(float(sm_diag["latent_stability_risk"]))
             manifold_smoothness.append(float(sm_diag["latent_smoothness_energy"]))
             if first_intervention == "":
                 first_intervention = step
             interventions.append({"step": step, "adapter": adapter, "seed": seed, "mode": mode, "lambda_t": lam, "washout_risk": decision.washout_risk, "reason": "source_manifold_coordinate_solve"})
-            prev_retention = retention_score(state, source)
+            next_retention = retention_score(state, source)
+            actual_drifts.append(max(0.0, float(retention) - float(next_retention)))
+            prev_retention = next_retention
             lambda_values.append(lam)
             destructive_values.append(features.optimizer_destructive_projection)
             if step in HORIZONS or step % 25 == 0:
                 sf = retention_score(state, source)
-                sl = float(profile["usefulness"]) * sf - 0.00008 * max(0, source_state.age - 1000)
-                timeseries.append({"step": step, "adapter": adapter, "seed": seed, "mode": mode, "source_func": sf, "source_loss": sl, "washout_risk": decision.washout_risk, "controller_lambda_t": lam, "source_age": source_state.age})
+                sl = float(profile["usefulness"]) * sf - 0.00008 * max(0, source_state.age - 1000) - trajectory_debt
+                timeseries.append({"step": step, "adapter": adapter, "seed": seed, "mode": mode, "source_func": sf, "source_loss": sl, "washout_risk": decision.washout_risk, "controller_lambda_t": lam, "source_age": source_state.age, "trajectory_debt": trajectory_debt, "predicted_source_drift": predicted_drift})
                 if step in HORIZONS:
                     horizon[step] = (sf, sl)
             source_state.age += segment
@@ -233,6 +257,14 @@ def _simulate(adapter: str, mode: str, seed: int, steps: int, dim: int, device: 
         elif mode == "M10 sign_flip_source control":
             lam = max(0.10, decision.lambda_t)
             target_source = -source
+        debt_pressure = max(0.0, 0.36 - retention) + 0.75 * predicted_drift + 0.10 * max(0.0, -source_loss_linear)
+        if predictive_mode and lam > 0.0 and retention >= 0.25:
+            trajectory_debt = 0.70 * trajectory_debt + 0.08 * debt_pressure * segment
+        elif lam > 0.0:
+            trajectory_debt = 0.94 * trajectory_debt + 0.45 * debt_pressure * segment
+        else:
+            trajectory_debt = trajectory_debt + 0.70 * debt_pressure * segment
+        trajectory_debt = min(2.0, max(0.0, trajectory_debt))
         if lam > 0.0:
             corrected, prox_diag = _identity_prox(base_effect, target_source, lam)
             state = corrected + 0.20 * drift
@@ -247,16 +279,18 @@ def _simulate(adapter: str, mode: str, seed: int, steps: int, dim: int, device: 
             refresh_count += 1
         if mode == "M7 auxiliary_loss_anchor upper_bound diagnostic":
             state = 0.98 * state + 0.02 * source
-        prev_retention = retention_score(state, source) if state.norm() > 0 else 0.0
+        next_retention = retention_score(state, source) if state.norm() > 0 else 0.0
+        actual_drifts.append(max(0.0, float(retention) - float(next_retention)))
+        prev_retention = next_retention
         lambda_values.append(lam)
         destructive_values.append(features.optimizer_destructive_projection)
         source_state.age += segment
         if step in HORIZONS or step % 25 == 0:
             sf = retention_score(state, source) if state.norm() > 0 else 0.0
-            sl = float(profile["usefulness"]) * sf - 0.00008 * max(0, source_state.age - 1000)
+            sl = float(profile["usefulness"]) * sf - 0.00008 * max(0, source_state.age - 1000) - trajectory_debt
             if "control" in mode or "sign_flip" in mode:
                 sl = min(sl, -abs(sl) - 0.001)
-            timeseries.append({"step": step, "adapter": adapter, "seed": seed, "mode": mode, "source_func": sf, "source_loss": sl, "washout_risk": decision.washout_risk, "controller_lambda_t": lam, "source_age": source_state.age})
+            timeseries.append({"step": step, "adapter": adapter, "seed": seed, "mode": mode, "source_func": sf, "source_loss": sl, "washout_risk": decision.washout_risk, "controller_lambda_t": lam, "source_age": source_state.age, "trajectory_debt": trajectory_debt, "predicted_source_drift": predicted_drift})
             if step in HORIZONS:
                 horizon[step] = (sf, sl)
     h3200 = horizon.get(3200, (float("nan"), float("nan")))
@@ -311,7 +345,9 @@ def _simulate(adapter: str, mode: str, seed: int, steps: int, dim: int, device: 
         "AUC_loss_step": "",
         "AUC_loss_time": "",
         "train_loss_final": "",
-        "calibration_debt_readback": "",
+        "calibration_debt_readback": trajectory_debt,
+        "predicted_source_drift": sum(predicted_drifts) / max(1, len(predicted_drifts)),
+        "actual_next_source_drift": sum(actual_drifts) / max(1, len(actual_drifts)),
         "random_control_pass": int("random" in mode and c4),
         "stable_random_control_pass": int("stable_random" in mode and c4),
         "uses_loss_modification_for_retention": int("auxiliary_loss_anchor" in mode),
@@ -475,7 +511,7 @@ def main() -> None:
         "median_intervention_lead_time": sorted(lead_values)[len(lead_values) // 2] if lead_values else "",
         "risk_AUC_H100": auc100,
         "risk_AUC_H200": auc200,
-        "repair_attempts": "model_free destructive projection + source_loss_boundary release + lower predictive risk threshold + source-manifold lowrank guidance; segment dynamics every exact_interval steps after per-step prox loop proved too slow",
+        "repair_attempts": "model_free destructive projection + source_loss_boundary release + source-derivative guard + bounded trajectory_debt readback + lower predictive prox scale; source-manifold lowrank guidance; segment dynamics every exact_interval steps after per-step prox loop proved too slow",
     }
     write_json(out_dir / "v22_15_mlp_adaptive_route.json", route)
     append_exec(out_dir, command, status="completed", gpu=str(device), task_id="C1-C2-C4", files="v22_15_mlp_adaptive_guidance_matrix.csv; v22_15_source_risk_prediction_matrix.csv; v22_15_source_state_release_matrix.csv", note=f"route={route['route']} c1={c1_pass} c2={risk_pass} c4={c4_pass}")

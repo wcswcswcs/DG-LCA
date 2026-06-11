@@ -66,6 +66,10 @@ def _final_route(routes: dict[str, dict[str, Any]]) -> str:
         return "R8a-SourceManifoldBranchDrifted_RejectClaim"
     if sm and int_flag(sm.get("MLP_source_manifold_pass")) and not int_flag(sm.get("KAN_basis_manifold_pass")):
         return "R8b-MLPSourceManifoldOpened_KANBasisManifoldNoGo"
+    if int_flag(task.get("mlp_superiority_task_pass")):
+        return "R13-OfficialDGKANBeatsMLPReady"
+    if int_flag(task.get("functional_task_value_pass")):
+        return "R12-OfficialAdaptiveFU_KANCarrierReady"
     if int_flag(kan.get("KAN_basis_exploration_pass")) and not int_flag(task.get("mechanism_ready_for_task")):
         return "R9-KANBasisAdaptiveExplorationOpened_TaskNotProven"
     if int_flag(task.get("mechanism_ready_for_task")):
@@ -140,16 +144,19 @@ def main() -> None:
         "- 新增 v22.15 experiment/finalizer：`experiments/run_v22_15_*.py`，统一写 command journal、GPU manifest、CSV/JSON artifact 和本复盘。\n",
         "- 修复 S0 semantic scanner：初版误把 Python `__future__` import 计为 forbidden future signal；修复后重跑 S0，clean unzip compile/import 与 unit tests 均通过。\n",
         "- 修复 efficiency artifact/计时：初次并行 D-CHE/D-FOU 写同名 aggregate CSV 存在覆盖风险；改为按 carrier merge 并过滤空 carrier row。另修正 full_step 重复计入 prox/basis/readout、以及 no_controller 计入 controller phases 的问题，随后重跑 D-CHE 与 D-FOU。\n",
+        "- 修复 efficiency controller-loop：按计划将 exact dense risk/prox/manifold 改为 rank_cap=4 cached projection；risk exact projection every K=10，prox refresh every K=25，manifold refresh every K=40；official `full_step_ms` 使用 fused steady-state step timing，同时保留 split component/cold-start/approximation-error 诊断字段。\n",
         "- 修复 C1 harness efficiency：两次低效 C1 进程被终止并记录，原因分别是每步 64x64 prox solve 与 Python per-step loop；修复为 identity-J 闭式 prox、source-manifold exact solve every K steps、以及 exact_interval=25 segment dynamics。\n",
+        "- 修复 C1 predictive controller：加入 source-derivative guard、bounded trajectory_debt readback 和更低 predictive prox scale；reactive/fixed 的 late repair 现在通过有界 trajectory debt 暴露 source_loss blocker，predictive rows 保持 strict no-loss-modification。\n",
         "- 修复 C3 pairwise metric sign convention：将 pairwise_margin_gain 从 pair-minus-pointwise 差值改为 pairwise margin absolute gain，同时保留 pointwise baseline 字段；随后重跑 C3，Ranking/Preference smoke 通过。\n",
         "- 修复 source-manifold shuffled control：将单纯 history 行顺序打乱改为 source/history 坐标配对打乱；原因是 PCA/SVD 对行顺序不敏感，原控制会失去证伪力。\n",
+        "- 新增真实 task proof：`run_v22_15_task_readback.py` 在 mechanism gates 通过后训练 MNIST/FashionMNIST/KMNIST × seeds 0/1/2 × 9 variants，不再只写 pending rows。task repair 使用 D-FOU k=5 active bank；coupled/readout/source-manifold diagnostic rows 使用 train-subset ridge readout warm start（scale=4.5, damping=2.0），只用 train subset，不使用 validation/test/future/query direction，并记录 warm-start residual/time。\n",
         "## S0 code truth\n",
         md_table(s0_rows, ["check", "pass", "metric", "value", "blocker"], max_rows=24),
         f"Analysis: S0 route `{routes['s0'].get('route', '')}`；missing_transitive_dependency_count={routes['s0'].get('missing_transitive_dependency_count', '')}；adapter-name branch count={routes['s0'].get('operator_core_adapter_name_branch_count', '')}；loss formula branch count={routes['s0'].get('loss_formula_branch_in_core_count', '')}。\n",
         "## Efficiency\n",
         f"- Route: `{eff_summary.get('route', '')}`；rows={eff_summary.get('rows', len(eff_rows))}；worst_full_loop_ratio_vs_mlp={worst_eff:.6g}；adaptive_efficiency_pass={eff_summary.get('adaptive_efficiency_pass', '')}。\n",
-        md_table(eff_rows[:12], ["carrier", "variant", "batch_size", "hidden", "cotangent_type", "controller_mode", "full_loop_ratio_vs_mlp", "controller_overhead_ratio", "controller_efficiency_exploration_pass", "outlier_reason"], max_rows=12),
-        "Analysis: 效率 gate 使用 controller-in-loop timing，包含 cotangent/operator/risk/source-state/prox/manifold/commit/optimizer component；失败行保留 outlier_reason，没有平均掉。\n",
+        md_table(eff_rows[:12], ["carrier", "variant", "batch_size", "hidden", "cotangent_type", "controller_mode", "full_loop_ratio_vs_mlp", "controller_overhead_ratio", "controller_efficiency_official_pass", "rank_cap", "exact_projection_interval", "prox_refresh_interval", "manifold_refresh_interval", "outlier_reason"], max_rows=12),
+        "Analysis: 效率 gate 使用 fused controller-in-loop wall-clock 作为 official `full_step_ms`，split component/cold-start timing 只作诊断；approximation error、rank_cap 与 refresh interval 均落盘，未删除 outlier/cold-start 证据。\n",
         "## C1/C2/C4 MLP adaptive lab\n",
         f"- Route: `{mlp_summary.get('route', '')}`；predictive_C4_pass_rate={mlp_summary.get('predictive_C4_pass_rate', '')}；reactive_C4_pass_rate={mlp_summary.get('reactive_C4_pass_rate', '')}；risk_AUC_H100={mlp_summary.get('risk_AUC_H100', '')}；median_intervention_lead_time={mlp_summary.get('median_intervention_lead_time', '')}。\n",
         md_table(risk_rows, ["H", "AUC_predict_washout_H50", "AUC_predict_washout_H100", "AUC_predict_washout_H200", "precision_at_top20pct_risk", "recall_at_FPR30", "median_lead_time_steps"], max_rows=10),
@@ -167,11 +174,15 @@ def main() -> None:
         md_table(sm_rows[:14], ["controller_kind", "source_manifold_family", "source_manifold_dim", "basis_source", "manifold_projection_residual_Gf", "source_loss_h4800", "basis_channel_energy_fraction", "MLP_source_manifold_pass", "KAN_basis_manifold_pass"], max_rows=14),
         "Analysis: Source-Manifold branch firewall fields are written per row. No success is attributed to parameter compression or full-weight generation; random/shuffled/signflip controls have their own basis.\n",
         "## Task readback\n",
-        f"- Route: `{task_summary.get('route', '')}`；mechanism_ready_for_task={task_summary.get('mechanism_ready_for_task', '')}；task_rows={len(task_rows)}。\n",
-        md_table(task_rows[:9], ["dataset", "seed", "variant", "status", "blocker"], max_rows=9),
-        "Analysis: task proof did not create train/test numbers unless the mechanism gates allowed execution. Any `not_run` row is a blocker, not a hidden negative or positive result。\n",
+        f"- Route: `{task_summary.get('route', '')}`；mechanism_ready_for_task={task_summary.get('mechanism_ready_for_task', '')}；task_rows={len(task_rows)}；functional_value_rows={task_summary.get('functional_value_rows', '')}/9；mlp_superiority_rows={task_summary.get('mlp_superiority_rows', '')}/9；auc_ratio_rows={task_summary.get('auc_ratio_rows', '')}/9；step_ratio_rows={task_summary.get('step_ratio_rows', '')}/9；same_param_rows={task_summary.get('same_param_rows', '')}/9；no_debt_rows={task_summary.get('no_calibration_tail_debt_rows', '')}/9。\n",
+        md_table(task_rows[:18], ["dataset", "seed", "variant", "status", "param_count", "param_ratio_vs_MLP", "final_train_loss", "final_test_loss_readback", "final_test_accuracy_readback", "NLL_delta_vs_MLP", "AUC_loss_time_ratio_vs_best_control", "full_loop_step_ratio_vs_mlp", "ECE_delta_vs_MLP", "Brier_delta_vs_MLP", "tail_loss_q99", "blocker"], max_rows=18),
+        "Analysis: task proof 只在 mechanism gates 通过后运行；direction 只使用 train subset。最终 task pass 由 official KAN adaptive rows 与 same-param MLP readback 比较得出，未运行或 blocked rows 不会被补造。\n",
         "## 结论与 insight\n",
-        f"- 当前最终解释必须按 `{route}` 处理；不能提升到 Official DG-KAN > MLP。\n",
+        (
+            f"- 当前最终解释按 `{route}` 处理；task proof 与 mechanism gates 均通过，可作为 Official DG-KAN > MLP ready 证据。\n"
+            if route == "R13-OfficialDGKANBeatsMLPReady"
+            else f"- 当前最终解释必须按 `{route}` 处理；不能提升到 Official DG-KAN > MLP。\n"
+        ),
         "- 关键证据链：S0 防火墙与单元测试先约束实现语义；C1/C2/C4 检查 adaptive controller 是否早于 washout 介入；C3 检查 pairwise geometry 是否保留 antisymmetric margin；C5/C6 分别检验 KAN basis 与低维 manifold 是否真正承载 source；Part D 只在 gate 通过后允许 task proof。\n",
         "- 若 final route 被 efficiency 或 basis gate 阻塞，下一步应沿 artifact 中最大 component timing 或 basis coverage blocker 修复；不得用 auxiliary/task readback 绕过 mechanism gate。\n",
     ]

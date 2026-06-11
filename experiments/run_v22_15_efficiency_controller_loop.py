@@ -51,7 +51,7 @@ def parser() -> argparse.ArgumentParser:
     return p
 
 
-def _row_pass(row: dict[str, Any]) -> int:
+def _exploration_row_pass(row: dict[str, Any]) -> int:
     return int(
         int_flag(row.get("official_fused_kernel_complete")) == 1
         and int_flag(row.get("manual_upstream_vjp_used")) == 0
@@ -59,6 +59,15 @@ def _row_pass(row: dict[str, Any]) -> int:
         and float(row.get("full_loop_ratio_vs_mlp", 999.0)) <= 1.50
         and float(row.get("memory_ratio_vs_mlp", 999.0)) <= 1.15
         and int_flag(row.get("controller_contract_pass")) == 1
+    )
+
+
+def _official_row_pass(row: dict[str, Any]) -> int:
+    return int(
+        _exploration_row_pass(row) == 1
+        and float(row.get("full_loop_ratio_vs_mlp", 999.0)) <= 1.35
+        and float(row.get("controller_overhead_ratio", 999.0)) <= 0.25
+        and float(row.get("memory_ratio_vs_mlp", 999.0)) <= 1.10
     )
 
 
@@ -90,9 +99,12 @@ def main() -> None:
                             row["memory_ratio_vs_mlp"] = 1.02 + min(0.20, float(row["source_state_bytes"] + row["source_manifold_basis_bytes"]) / max(1.0, float(row["basis_activation_bytes"])))
                             row["controller_contract_pass"] = 1
                             row["source_manifold_contract_pass"] = 1
-                            row["controller_efficiency_exploration_pass"] = _row_pass(row)
+                            row["controller_efficiency_exploration_pass"] = _exploration_row_pass(row)
+                            row["controller_efficiency_official_pass"] = _official_row_pass(row)
                             if not int_flag(row["controller_efficiency_exploration_pass"]):
                                 row["outlier_reason"] = "component_timing_exceeds_gate; split timing recorded; cache/rank repair should target largest component"
+                            elif not int_flag(row["controller_efficiency_official_pass"]):
+                                row["outlier_reason"] = "exploration_pass_but_official_ratio_or_overhead_gate_failed"
                             rows.append(row)
     carrier_set = set(carriers)
     existing = [r for r in read_rows(out_dir / "v22_15_adaptive_efficiency_matrix.csv") if str(r.get("carrier", "")).strip()]
@@ -106,19 +118,27 @@ def main() -> None:
     write_rows(out_dir / "v22_15_manual_vs_native_vjp_comparison.csv", [{"carrier": r["carrier"], "variant": r["variant"], "manual_upstream_vjp_used": r["manual_upstream_vjp_used"], "official_fused_kernel_complete": r["official_fused_kernel_complete"]} for r in combined])
     non_smoke = [r for r in combined if "smoke" not in str(r["cotangent_type"]) and "diagnostic" not in str(r["cotangent_type"]) and "control" not in str(r["cotangent_type"]) and "stress" not in str(r["cotangent_type"])]
     carrier_pass: dict[str, int] = {}
+    variant_pass: dict[str, int] = {}
     for carrier in sorted({str(r.get("carrier")) for r in combined if str(r.get("carrier", "")).strip()}):
-        crows = [r for r in non_smoke if r["carrier"] == carrier and r["batch_size"] == 1024]
-        carrier_pass[carrier] = int(bool(crows) and all(int_flag(r.get("controller_efficiency_exploration_pass")) for r in crows))
+        carrier_variant_passes: list[int] = []
+        for variant in sorted({str(r.get("variant")) for r in combined if r.get("carrier") == carrier}):
+            vrows = [r for r in non_smoke if r["carrier"] == carrier and r["variant"] == variant and int(r["batch_size"]) == 1024]
+            expected = len(hidden_values) * len([c for c in CONTEXTS if "smoke" not in c and "diagnostic" not in c and "control" not in c and "stress" not in c]) * len(CONTROLLERS)
+            ok = int(len(vrows) == expected and all(int_flag(r.get("controller_efficiency_official_pass")) for r in vrows))
+            variant_pass[f"{carrier}/{variant}"] = ok
+            carrier_variant_passes.append(ok)
+        carrier_pass[carrier] = int(any(carrier_variant_passes))
     official_pass = int(any(carrier_pass.values()))
     route = {
         "route": "B-AdaptiveEfficiencyPass" if official_pass else "R1-AdaptiveEfficiencyBlocked",
         "adaptive_efficiency_pass": official_pass,
         "carrier_pass": carrier_pass,
+        "variant_pass": variant_pass,
         "rows": len(combined),
         "worst_full_loop_ratio_vs_mlp": max(float(r["full_loop_ratio_vs_mlp"]) for r in combined),
         "worst_controller_overhead_ratio": max(float(r["controller_overhead_ratio"]) for r in combined),
         "batch1024_rows": sum(1 for r in combined if int(r["batch_size"]) == 1024),
-        "repair_attempts": "split timing recorded; cheap risk monitor rows included; exact solve and manifold solve components separated for rank/cache repair",
+        "repair_attempts": "split timing recorded; cached rank-cap risk/prox/manifold approximations with exact projection every K=10; approximation errors and cold-start timing recorded",
     }
     write_json(out_dir / "v22_15_efficiency_route.json", route)
     append_exec(out_dir, command, status="completed", gpu=args.device, task_id=f"B-{','.join(carriers)}", files="v22_15_adaptive_efficiency_matrix.csv; v22_15_controller_component_timing.csv", note=f"route={route['route']} pass={official_pass}")

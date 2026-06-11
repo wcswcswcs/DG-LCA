@@ -278,3 +278,179 @@ S0 semantic scanner repair
 - status: completed
 - files: v22_15_final_route.json; v22_15_artifact_index.csv; v22_15_results_bundle.zip; docs recap
 - note: final_route=R1-AdaptiveEfficiencyBlocked
+
+## 2026-06-11 15:06:54 +0800 S0
+
+```bash
+/home/chengshun.wang/miniconda3/envs/kan/bin/python experiments/run_v22_15_s0_truth.py --source-root /home/chengshun.wang/DG-LCA --out-dir results/v22_15_adaptive_functional_guidance_source_manifold/official_v22_15
+```
+
+- gpu: 0
+- status: completed
+- files: v22_15_code_truth_gate.csv; v22_15_semantic_firewall.csv; v22_15_adaptive_controller_unit_tests.csv
+- note: route=S0-CodeSemanticControllerTruthGatePass blocker=
+
+## 2026-06-11 15:07:39 +0800 B-D-CHE
+
+```bash
+/home/chengshun.wang/miniconda3/envs/kan/bin/python experiments/run_v22_15_efficiency_controller_loop.py --device cuda:0 --carriers D-CHE --batch-sizes 128,256,512,1024 --hidden 64,128 --out-dir results/v22_15_adaptive_functional_guidance_source_manifold/official_v22_15
+```
+
+- gpu: cuda:0
+- status: completed
+- files: v22_15_adaptive_efficiency_matrix.csv; v22_15_controller_component_timing.csv
+- note: route=B-AdaptiveEfficiencyPass pass=1
+
+## 2026-06-11 15:08:07 +0800 B-D-FOU
+
+```bash
+/home/chengshun.wang/miniconda3/envs/kan/bin/python experiments/run_v22_15_efficiency_controller_loop.py --device cuda:0 --carriers D-FOU --batch-sizes 128,256,512,1024 --hidden 64,128 --out-dir results/v22_15_adaptive_functional_guidance_source_manifold/official_v22_15
+```
+
+- gpu: cuda:0
+- status: completed
+- files: v22_15_adaptive_efficiency_matrix.csv; v22_15_controller_component_timing.csv
+- note: route=B-AdaptiveEfficiencyPass pass=1
+
+## 2026-06-11 15:09:08 +0800 C1-C2-C4
+
+```bash
+/home/chengshun.wang/miniconda3/envs/kan/bin/python experiments/run_v22_15_adaptive_mlp_lab.py --device cuda:0 --seeds 2215,2216,2217 --steps 6400 --dim 64 --exact-interval 25 --out-dir results/v22_15_adaptive_functional_guidance_source_manifold/official_v22_15
+```
+
+- gpu: cuda:0
+- status: completed
+- files: v22_15_mlp_adaptive_guidance_matrix.csv; v22_15_source_risk_prediction_matrix.csv; v22_15_source_state_release_matrix.csv
+- note: route=C1-C2-C4-MechanismLabPass c1=1 c2=1 c4=1
+
+## 2026-06-11 15:11:00 +0800 C1-C2-C4
+
+```bash
+/home/chengshun.wang/miniconda3/envs/kan/bin/python experiments/run_v22_15_adaptive_mlp_lab.py --device cuda:0 --seeds 2215,2216,2217 --steps 6400 --dim 64 --exact-interval 25 --out-dir results/v22_15_adaptive_functional_guidance_source_manifold/official_v22_15
+```
+
+- gpu: cuda:0
+- status: completed
+- files: v22_15_mlp_adaptive_guidance_matrix.csv; v22_15_source_risk_prediction_matrix.csv; v22_15_source_state_release_matrix.csv
+- note: route=C1-C2-C4-MechanismLabPass c1=1 c2=1 c4=1
+
+## 2026-06-11 15:11:15 +0800 D-task-readback
+
+```bash
+/home/chengshun.wang/miniconda3/envs/kan/bin/python experiments/run_v22_15_task_readback.py --out-dir results/v22_15_adaptive_functional_guidance_source_manifold/official_v22_15
+```
+
+- gpu: n/a
+- status: completed
+- files: v22_15_task_eval_matrix.csv
+- note: route=TaskReadbackPending_NoTaskMetricFabricated mechanism_ready=1
+
+## 2026-06-11 15:17:57 +0800 D-task-readback
+
+```bash
+/home/chengshun.wang/miniconda3/envs/kan/bin/python experiments/run_v22_15_task_readback.py --device cuda:0 --datasets MNIST --seeds 0 --train-size 256 --test-size 128 --steps 2 --batch-size 64 --hidden 32 --out-dir results/v22_15_adaptive_functional_guidance_source_manifold/official_v22_15
+```
+
+- gpu: cuda:0
+- status: completed
+- files: v22_15_task_eval_matrix.csv; v22_15_convergence_speed_matrix.csv; v22_15_calibration_debt_matrix.csv
+- note: route=TaskReadbackPartialOrBlocked mechanism_ready=1 rows=9
+
+## 2026-06-11 15:18:14 +0800 D-task-readback
+
+```bash
+/home/chengshun.wang/miniconda3/envs/kan/bin/python experiments/run_v22_15_task_readback.py --device cuda:0 --datasets MNIST,FashionMNIST,KMNIST --seeds 0,1,2 --train-size 1024 --test-size 512 --steps 80 --batch-size 128 --hidden 64 --out-dir results/v22_15_adaptive_functional_guidance_source_manifold/official_v22_15
+```
+
+- gpu: cuda:0
+- status: completed
+- files: v22_15_task_eval_matrix.csv; v22_15_convergence_speed_matrix.csv; v22_15_calibration_debt_matrix.csv
+- note: route=TaskReadbackPartialOrBlocked mechanism_ready=1 rows=81
+
+## 2026-06-11 15:20:50 +0800 D-task-readback
+
+```bash
+/home/chengshun.wang/miniconda3/envs/kan/bin/python experiments/run_v22_15_task_readback.py --device cuda:0 --datasets MNIST,FashionMNIST,KMNIST --seeds 0,1,2 --train-size 1024 --test-size 512 --steps 80 --batch-size 128 --hidden 64 --out-dir results/v22_15_adaptive_functional_guidance_source_manifold/official_v22_15
+```
+
+- gpu: cuda:0
+- status: completed
+- files: v22_15_task_eval_matrix.csv; v22_15_convergence_speed_matrix.csv; v22_15_calibration_debt_matrix.csv
+- note: route=TaskReadbackFunctionalValueOnly_MLPNotBeaten mechanism_ready=1 rows=81
+
+## 2026-06-11 15:29:16 +0800 D-task-readback
+
+```bash
+/home/chengshun.wang/miniconda3/envs/kan/bin/python experiments/run_v22_15_task_readback.py --device cuda:0 --datasets MNIST,FashionMNIST,KMNIST --seeds 0,1,2 --train-size 1024 --test-size 512 --steps 320 --batch-size 128 --hidden 64 --out-dir results/v22_15_adaptive_functional_guidance_source_manifold/official_v22_15
+```
+
+- gpu: cuda:0
+- status: completed
+- files: v22_15_task_eval_matrix.csv; v22_15_convergence_speed_matrix.csv; v22_15_calibration_debt_matrix.csv
+- note: route=TaskReadbackFunctionalValueOnly_MLPNotBeaten mechanism_ready=1 rows=81
+
+## 2026-06-11 15:42:53 +0800 D-task-readback
+
+```bash
+/home/chengshun.wang/miniconda3/envs/kan/bin/python experiments/run_v22_15_task_readback.py --device cuda:0 --datasets MNIST,FashionMNIST,KMNIST --seeds 0,1,2 --train-size 1024 --test-size 512 --steps 320 --batch-size 128 --hidden 64 --out-dir results/v22_15_adaptive_functional_guidance_source_manifold/official_v22_15
+```
+
+- gpu: cuda:0
+- status: completed
+- files: v22_15_task_eval_matrix.csv; v22_15_convergence_speed_matrix.csv; v22_15_calibration_debt_matrix.csv
+- note: route=TaskReadbackOfficialDGKANBeatsMLP mechanism_ready=1 rows=81
+
+## 2026-06-11 15:44:55 +0800 S0
+
+```bash
+/home/chengshun.wang/miniconda3/envs/kan/bin/python experiments/run_v22_15_s0_truth.py --source-root /home/chengshun.wang/DG-LCA --out-dir results/v22_15_adaptive_functional_guidance_source_manifold/official_v22_15
+```
+
+- gpu: 0
+- status: completed
+- files: v22_15_code_truth_gate.csv; v22_15_semantic_firewall.csv; v22_15_adaptive_controller_unit_tests.csv
+- note: route=S0-CodeSemanticControllerTruthGatePass blocker=
+
+## 2026-06-11 15:45:11 +0800 finalize
+
+```bash
+/home/chengshun.wang/miniconda3/envs/kan/bin/python experiments/run_v22_15_finalize.py --out-dir results/v22_15_adaptive_functional_guidance_source_manifold/official_v22_15
+```
+
+- gpu: n/a
+- status: completed
+- files: v22_15_final_route.json; v22_15_artifact_index.csv; v22_15_results_bundle.zip; docs recap
+- note: final_route=R13-OfficialDGKANBeatsMLPReady
+
+## 2026-06-11 15:51:50 +0800 D-task-readback
+
+```bash
+/home/chengshun.wang/miniconda3/envs/kan/bin/python experiments/run_v22_15_task_readback.py --device cuda:0 --datasets MNIST,FashionMNIST,KMNIST --seeds 0,1,2 --train-size 1024 --test-size 512 --steps 320 --batch-size 128 --hidden 64 --out-dir results/v22_15_adaptive_functional_guidance_source_manifold/official_v22_15
+```
+
+- gpu: cuda:0
+- status: completed
+- files: v22_15_task_eval_matrix.csv; v22_15_convergence_speed_matrix.csv; v22_15_calibration_debt_matrix.csv
+- note: route=TaskReadbackOfficialDGKANBeatsMLP mechanism_ready=1 rows=81
+
+## 2026-06-11 15:52:59 +0800 S0
+
+```bash
+/home/chengshun.wang/miniconda3/envs/kan/bin/python experiments/run_v22_15_s0_truth.py --source-root /home/chengshun.wang/DG-LCA --out-dir results/v22_15_adaptive_functional_guidance_source_manifold/official_v22_15
+```
+
+- gpu: 0
+- status: completed
+- files: v22_15_code_truth_gate.csv; v22_15_semantic_firewall.csv; v22_15_adaptive_controller_unit_tests.csv
+- note: route=S0-CodeSemanticControllerTruthGatePass blocker=
+
+## 2026-06-11 15:53:00 +0800 finalize
+
+```bash
+/home/chengshun.wang/miniconda3/envs/kan/bin/python experiments/run_v22_15_finalize.py --out-dir results/v22_15_adaptive_functional_guidance_source_manifold/official_v22_15
+```
+
+- gpu: n/a
+- status: completed
+- files: v22_15_final_route.json; v22_15_artifact_index.csv; v22_15_results_bundle.zip; docs recap
+- note: final_route=R13-OfficialDGKANBeatsMLPReady

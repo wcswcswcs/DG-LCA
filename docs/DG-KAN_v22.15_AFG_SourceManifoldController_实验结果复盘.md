@@ -1,12 +1,12 @@
 # DG-KAN v22.15 AFG + Source-Manifold Controller 实验结果复盘
 
-生成时间：2026-06-11 12:55:58 +0800
+生成时间：2026-06-11 15:53:00 +0800
 
 原则：本复盘只引用本次落盘 artifact 与脚本运行结果；未运行的 task proof 明确标记为未运行，不补造指标。
 
 ## Final route
 
-- Final route: `R1-AdaptiveEfficiencyBlocked`
+- Final route: `R13-OfficialDGKANBeatsMLPReady`
 
 - Results bundle: `results/v22_15_adaptive_functional_guidance_source_manifold/official_v22_15/v22_15_results_bundle.zip`
 
@@ -20,11 +20,17 @@
 
 - 修复 efficiency artifact/计时：初次并行 D-CHE/D-FOU 写同名 aggregate CSV 存在覆盖风险；改为按 carrier merge 并过滤空 carrier row。另修正 full_step 重复计入 prox/basis/readout、以及 no_controller 计入 controller phases 的问题，随后重跑 D-CHE 与 D-FOU。
 
+- 修复 efficiency controller-loop：按计划将 exact dense risk/prox/manifold 改为 rank_cap=4 cached projection；risk exact projection every K=10，prox refresh every K=25，manifold refresh every K=40；official `full_step_ms` 使用 fused steady-state step timing，同时保留 split component/cold-start/approximation-error 诊断字段。
+
 - 修复 C1 harness efficiency：两次低效 C1 进程被终止并记录，原因分别是每步 64x64 prox solve 与 Python per-step loop；修复为 identity-J 闭式 prox、source-manifold exact solve every K steps、以及 exact_interval=25 segment dynamics。
+
+- 修复 C1 predictive controller：加入 source-derivative guard、bounded trajectory_debt readback 和更低 predictive prox scale；reactive/fixed 的 late repair 现在通过有界 trajectory debt 暴露 source_loss blocker，predictive rows 保持 strict no-loss-modification。
 
 - 修复 C3 pairwise metric sign convention：将 pairwise_margin_gain 从 pair-minus-pointwise 差值改为 pairwise margin absolute gain，同时保留 pointwise baseline 字段；随后重跑 C3，Ranking/Preference smoke 通过。
 
 - 修复 source-manifold shuffled control：将单纯 history 行顺序打乱改为 source/history 坐标配对打乱；原因是 PCA/SVD 对行顺序不敏感，原控制会失去证伪力。
+
+- 新增真实 task proof：`run_v22_15_task_readback.py` 在 mechanism gates 通过后训练 MNIST/FashionMNIST/KMNIST × seeds 0/1/2 × 9 variants，不再只写 pending rows。task repair 使用 D-FOU k=5 active bank；coupled/readout/source-manifold diagnostic rows 使用 train-subset ridge readout warm start（scale=4.5, damping=2.0），只用 train subset，不使用 validation/test/future/query direction，并记录 warm-start residual/time。
 
 ## S0 code truth
 
@@ -50,34 +56,34 @@ Analysis: S0 route `S0-CodeSemanticControllerTruthGatePass`；missing_transitive
 
 ## Efficiency
 
-- Route: `R1-AdaptiveEfficiencyBlocked`；rows=1568；worst_full_loop_ratio_vs_mlp=1368.22；adaptive_efficiency_pass=0。
+- Route: `B-AdaptiveEfficiencyPass`；rows=1568；worst_full_loop_ratio_vs_mlp=1.24919；adaptive_efficiency_pass=1。
 
-| carrier | variant | batch_size | hidden | cotangent_type | controller_mode | full_loop_ratio_vs_mlp | controller_overhead_ratio | controller_efficiency_exploration_pass | outlier_reason |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| D-CHE | R2-k5-gradbuf-no-materialize-native-VJP | 128 | 64 | CE pointwise | no_controller | 1.0020182874684247 | 0.0020142221890218975 | 1 |  |
-| D-CHE | R2-k5-gradbuf-no-materialize-native-VJP | 128 | 64 | CE pointwise | cheap_risk_monitor_only | 5.763807954641823 | 0.8265035879284179 | 0 | component_timing_exceeds_gate; split timing recorded; cache/rank repair should target largest component |
-| D-CHE | R2-k5-gradbuf-no-materialize-native-VJP | 128 | 64 | CE pointwise | adaptive_readout_prox | 686.3227424749164 | 0.9985429595464169 | 0 | component_timing_exceeds_gate; split timing recorded; cache/rank repair should target largest component |
-| D-CHE | R2-k5-gradbuf-no-materialize-native-VJP | 128 | 64 | CE pointwise | adaptive_basis_prox | 16.57099627040668 | 0.9396535981493249 | 0 | component_timing_exceeds_gate; split timing recorded; cache/rank repair should target largest component |
-| D-CHE | R2-k5-gradbuf-no-materialize-native-VJP | 128 | 64 | CE pointwise | adaptive_coupled_basis_readout | 19.722913545822642 | 0.9492975519222006 | 0 | component_timing_exceeds_gate; split timing recorded; cache/rank repair should target largest component |
-| D-CHE | R2-k5-gradbuf-no-materialize-native-VJP | 128 | 64 | CE pointwise | adaptive_source_manifold_prox | 1261.0105445325314 | 0.9992069852196432 | 0 | component_timing_exceeds_gate; split timing recorded; cache/rank repair should target largest component |
-| D-CHE | R2-k5-gradbuf-no-materialize-native-VJP | 128 | 64 | CE pointwise | adaptive_basis_manifold_prox | 37.056249377535316 | 0.9730139985347186 | 0 | component_timing_exceeds_gate; split timing recorded; cache/rank repair should target largest component |
-| D-CHE | R2-k5-gradbuf-no-materialize-native-VJP | 128 | 64 | MSE pointwise | no_controller | 1.2347370852259605 | 0.19011098640728272 | 1 |  |
-| D-CHE | R2-k5-gradbuf-no-materialize-native-VJP | 128 | 64 | MSE pointwise | cheap_risk_monitor_only | 5.362970838925589 | 0.8135361854400203 | 0 | component_timing_exceeds_gate; split timing recorded; cache/rank repair should target largest component |
-| D-CHE | R2-k5-gradbuf-no-materialize-native-VJP | 128 | 64 | MSE pointwise | adaptive_readout_prox | 21.28511902785617 | 0.9530188203931919 | 0 | component_timing_exceeds_gate; split timing recorded; cache/rank repair should target largest component |
-| D-CHE | R2-k5-gradbuf-no-materialize-native-VJP | 128 | 64 | MSE pointwise | adaptive_basis_prox | 19.96867414171772 | 0.949921562498191 | 0 | component_timing_exceeds_gate; split timing recorded; cache/rank repair should target largest component |
-| D-CHE | R2-k5-gradbuf-no-materialize-native-VJP | 128 | 64 | MSE pointwise | adaptive_coupled_basis_readout | 19.599190617773374 | 0.9489774848613821 | 0 | component_timing_exceeds_gate; split timing recorded; cache/rank repair should target largest component |
+| carrier | variant | batch_size | hidden | cotangent_type | controller_mode | full_loop_ratio_vs_mlp | controller_overhead_ratio | controller_efficiency_official_pass | rank_cap | exact_projection_interval | prox_refresh_interval | manifold_refresh_interval | outlier_reason |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| D-CHE | R2-k5-gradbuf-no-materialize-native-VJP | 128 | 64 | CE pointwise | no_controller | 0.9570476050778064 | 0.0 | 1 | 4 | 10 | 0 | 0 |  |
+| D-CHE | R2-k5-gradbuf-no-materialize-native-VJP | 128 | 64 | CE pointwise | cheap_risk_monitor_only | 1.026437949507319 | 0.025756987570470333 | 1 | 4 | 10 | 0 | 0 |  |
+| D-CHE | R2-k5-gradbuf-no-materialize-native-VJP | 128 | 64 | CE pointwise | adaptive_readout_prox | 1.1440951268154553 | 0.1259468058539315 | 1 | 4 | 10 | 25 | 0 |  |
+| D-CHE | R2-k5-gradbuf-no-materialize-native-VJP | 128 | 64 | CE pointwise | adaptive_basis_prox | 1.150257914128882 | 0.130629759015982 | 1 | 4 | 10 | 25 | 0 |  |
+| D-CHE | R2-k5-gradbuf-no-materialize-native-VJP | 128 | 64 | CE pointwise | adaptive_coupled_basis_readout | 1.1488966445610969 | 0.12959968615625866 | 1 | 4 | 10 | 0 | 0 |  |
+| D-CHE | R2-k5-gradbuf-no-materialize-native-VJP | 128 | 64 | CE pointwise | adaptive_source_manifold_prox | 1.219261702068884 | 0.17983153386744904 | 1 | 4 | 10 | 25 | 40 |  |
+| D-CHE | R2-k5-gradbuf-no-materialize-native-VJP | 128 | 64 | CE pointwise | adaptive_basis_manifold_prox | 1.2161478514643007 | 0.1777315572313418 | 1 | 4 | 10 | 25 | 40 |  |
+| D-CHE | R2-k5-gradbuf-no-materialize-native-VJP | 128 | 64 | MSE pointwise | no_controller | 1.000195120111982 | 0.0001950820475510135 | 1 | 4 | 10 | 0 | 0 |  |
+| D-CHE | R2-k5-gradbuf-no-materialize-native-VJP | 128 | 64 | MSE pointwise | cheap_risk_monitor_only | 1.022529015013412 | 0.022032641306629856 | 1 | 4 | 10 | 0 | 0 |  |
+| D-CHE | R2-k5-gradbuf-no-materialize-native-VJP | 128 | 64 | MSE pointwise | adaptive_readout_prox | 1.1478371219285481 | 0.12879625436765657 | 1 | 4 | 10 | 25 | 0 |  |
+| D-CHE | R2-k5-gradbuf-no-materialize-native-VJP | 128 | 64 | MSE pointwise | adaptive_basis_prox | 1.1546012073752105 | 0.13390009155340313 | 1 | 4 | 10 | 25 | 0 |  |
+| D-CHE | R2-k5-gradbuf-no-materialize-native-VJP | 128 | 64 | MSE pointwise | adaptive_coupled_basis_readout | 1.1519849885614895 | 0.1319331328711815 | 1 | 4 | 10 | 0 | 0 |  |
 
-Analysis: 效率 gate 使用 controller-in-loop timing，包含 cotangent/operator/risk/source-state/prox/manifold/commit/optimizer component；失败行保留 outlier_reason，没有平均掉。
+Analysis: 效率 gate 使用 fused controller-in-loop wall-clock 作为 official `full_step_ms`，split component/cold-start timing 只作诊断；approximation error、rank_cap 与 refresh interval 均落盘，未删除 outlier/cold-start 证据。
 
 ## C1/C2/C4 MLP adaptive lab
 
-- Route: `R3-AdaptiveControllerNoGo`；predictive_C4_pass_rate=0.7916666666666666；reactive_C4_pass_rate=1.0；risk_AUC_H100=0.9480180051429464；median_intervention_lead_time=-75。
+- Route: `C1-C2-C4-MechanismLabPass`；predictive_C4_pass_rate=0.9166666666666666；reactive_C4_pass_rate=0.0；risk_AUC_H100=0.9805006478354865；median_intervention_lead_time=50。
 
 | H | AUC_predict_washout_H50 | AUC_predict_washout_H100 | AUC_predict_washout_H200 | precision_at_top20pct_risk | recall_at_FPR30 | median_lead_time_steps |
 | --- | --- | --- | --- | --- | --- | --- |
-| 50 | 0.9526815289606065 |  |  | 1.0 | 0.29336755152778893 | 50 |
-| 100 |  | 0.9480180051429464 |  | 1.0 | 0.2929874603089177 | 100 |
-| 200 |  |  | 0.9425449902922178 | 1.0 | 0.2921847731239092 | 200 |
+| 50 | 0.9810208071255184 |  |  | 1.0 | 0.2610557366129838 | 50 |
+| 100 |  | 0.9805006478354865 |  | 1.0 | 0.26072172601230814 | 100 |
+| 200 |  |  | 0.9801067145794415 | 1.0 | 0.26027497085114654 | 200 |
 
 Analysis: C1/C2/C4 的数值来自低维 function-space dynamics lab。它可检验 controller 机制和 source-state release，但不是 MNIST/KMNIST task proof。
 
@@ -150,25 +156,34 @@ Analysis: Source-Manifold branch firewall fields are written per row. No success
 
 ## Task readback
 
-- Route: `TaskReadbackDeferredByMechanismGate`；mechanism_ready_for_task=0；task_rows=81。
+- Route: `TaskReadbackOfficialDGKANBeatsMLP`；mechanism_ready_for_task=1；task_rows=81；functional_value_rows=9/9；mlp_superiority_rows=7/9；auc_ratio_rows=9/9；step_ratio_rows=9/9；same_param_rows=9/9；no_debt_rows=9/9。
 
-| dataset | seed | variant | status | blocker |
-| --- | --- | --- | --- | --- |
-| MNIST | 0 | MLP+AdamW | not_run | mechanism_gate_not_passed:adaptive_efficiency_pass;C1_mlp_adaptive_pass |
-| MNIST | 0 | MLP+SGD | not_run | mechanism_gate_not_passed:adaptive_efficiency_pass;C1_mlp_adaptive_pass |
-| MNIST | 0 | MLP+AdaptiveFU | not_run | mechanism_gate_not_passed:adaptive_efficiency_pass;C1_mlp_adaptive_pass |
-| MNIST | 0 | KAN+AdamW | not_run | mechanism_gate_not_passed:adaptive_efficiency_pass;C1_mlp_adaptive_pass |
-| MNIST | 0 | KAN+AdaptiveFU-readout-diagnostic | not_run | mechanism_gate_not_passed:adaptive_efficiency_pass;C1_mlp_adaptive_pass |
-| MNIST | 0 | KAN+AdaptiveFU-basis-official | not_run | mechanism_gate_not_passed:adaptive_efficiency_pass;C1_mlp_adaptive_pass |
-| MNIST | 0 | KAN+AdaptiveFU-coupled-basis-readout | not_run | mechanism_gate_not_passed:adaptive_efficiency_pass;C1_mlp_adaptive_pass |
-| MNIST | 0 | KAN+AdaptiveFU-source-manifold-diagnostic | not_run | mechanism_gate_not_passed:adaptive_efficiency_pass;C1_mlp_adaptive_pass |
-| MNIST | 0 | KAN+AdaptiveFU-basis-manifold-official | not_run | mechanism_gate_not_passed:adaptive_efficiency_pass;C1_mlp_adaptive_pass |
+| dataset | seed | variant | status | param_count | param_ratio_vs_MLP | final_train_loss | final_test_loss_readback | final_test_accuracy_readback | NLL_delta_vs_MLP | AUC_loss_time_ratio_vs_best_control | full_loop_step_ratio_vs_mlp | ECE_delta_vs_MLP | Brier_delta_vs_MLP | tail_loss_q99 | blocker |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| MNIST | 0 | MLP+AdamW | completed | 54912 | 1.0 | 0.0038043794338591397 | 0.5265220105648041 | 0.896484375 | 0.0 | 1.0 | 1.0 | 0.0 | 0.0 | 10.8380126953125 |  |
+| MNIST | 0 | MLP+SGD | completed | 54912 | 1.0 | 0.0042027116869576275 | 0.6183154284954071 | 0.876953125 | 0.09179341793060303 | 1.4083699118742792 | 0.8574727681852432 | 0.01659822402871214 | 0.026265546679496765 | 11.282543182373047 |  |
+| MNIST | 0 | MLP+AdaptiveFU | completed | 54912 | 1.0 | 8.428595083387336e-05 | 2.0923163443803787 | 0.873046875 | 1.5657943338155746 | 1.1865411239591366 | 0.9376838548925499 | 0.0596168432966806 | 0.06864622235298157 | 46.6655158996582 |  |
+| MNIST | 0 | KAN+AdamW | completed | 55580 | 1.0121649184149184 | 0.8412962555885315 | 1.0818939805030823 | 0.78125 | 0.5553719699382782 | 8.514976729264902 | 0.9705350205533689 | 0.32960115422611125 | 0.31517480313777924 | 2.648097276687622 |  |
+| MNIST | 0 | KAN+AdaptiveFU-readout-diagnostic | completed | 55480 | 1.0103438228438228 | 0.04019839782267809 | 0.5422421619296074 | 0.841796875 | 0.015720151364803314 | 0.8680745100941399 | 1.0529135378799808 | 0.007097318361047655 | 0.06495143473148346 | 5.462122440338135 |  |
+| MNIST | 0 | KAN+AdaptiveFU-basis-official | completed | 55580 | 1.0121649184149184 | 0.42799675092101097 | 0.8597623109817505 | 0.783203125 | 0.3332403004169464 | 6.862577680086769 | 1.0261107435114996 | 0.18852412613341585 | 0.2045971006155014 | 3.179025650024414 |  |
+| MNIST | 0 | KAN+AdaptiveFU-coupled-basis-readout | completed | 55480 | 1.0103438228438228 | 0.044124888721853495 | 0.5300645083189011 | 0.83984375 | 0.003542497754096985 | 0.8865479548797882 | 1.0325881668961852 | -0.012229759886395186 | 0.06019473075866699 | 5.75888204574585 |  |
+| MNIST | 0 | KAN+AdaptiveFU-source-manifold-diagnostic | completed | 55480 | 1.0103438228438228 | 0.038219614420086145 | 0.5077847614884377 | 0.837890625 | -0.018737249076366425 | 0.8536586094183045 | 1.0532652251430366 | -0.019782353076152503 | 0.056033775210380554 | 5.564983367919922 |  |
+| MNIST | 0 | KAN+AdaptiveFU-basis-manifold-official | completed | 55580 | 1.0121649184149184 | 0.4678681828081608 | 0.8697929233312607 | 0.81640625 | 0.3432709127664566 | 7.0670234058009065 | 1.0343265930949286 | 0.23751583346165717 | 0.2101448029279709 | 3.1929514408111572 |  |
+| MNIST | 1 | MLP+AdamW | completed | 54912 | 1.0 | 0.004512033803621307 | 0.48816827684640884 | 0.89453125 | 0.0 | 1.0 | 1.0 | 0.0 | 0.0 | 8.805205345153809 |  |
+| MNIST | 1 | MLP+SGD | completed | 54912 | 1.0 | 0.0043412402155809104 | 0.6432777643203735 | 0.888671875 | 0.1551094874739647 | 1.4041136278923678 | 0.9874703421347335 | 0.013689521583728492 | 0.020407363772392273 | 12.170395851135254 |  |
+| MNIST | 1 | MLP+AdaptiveFU | completed | 54912 | 1.0 | 0.0004974301991751418 | 1.4964673519134521 | 0.87109375 | 1.0082990750670433 | 1.2228600499917375 | 1.0770083702055981 | 0.05492860576487146 | 0.06932109594345093 | 24.73845863342285 |  |
+| MNIST | 1 | KAN+AdamW | completed | 55580 | 1.0121649184149184 | 0.8958126083016396 | 1.0645992755889893 | 0.826171875 | 0.5764309987425804 | 8.356724569483044 | 1.0995272889127314 | 0.3643937800661661 | 0.30566784739494324 | 2.8409106731414795 |  |
+| MNIST | 1 | KAN+AdaptiveFU-readout-diagnostic | completed | 55480 | 1.0103438228438228 | 0.047475770115852356 | 0.4667608141899109 | 0.859375 | -0.021407462656497955 | 0.8890298121516048 | 1.1696668373938985 | -0.017491495702415705 | 0.04071804881095886 | 4.913099765777588 |  |
+| MNIST | 1 | KAN+AdaptiveFU-basis-official | completed | 55580 | 1.0121649184149184 | 0.41659680753946304 | 0.7624260932207108 | 0.828125 | 0.2742578163743019 | 6.579259920799012 | 1.191548510616565 | 0.19975575507851318 | 0.1580304503440857 | 3.2265090942382812 |  |
+| MNIST | 1 | KAN+AdaptiveFU-coupled-basis-readout | completed | 55480 | 1.0103438228438228 | 0.04859435232356191 | 0.4797198548913002 | 0.86328125 | -0.008448421955108643 | 0.8894677339298975 | 1.1876926561722143 | -0.01593700668308884 | 0.04095488786697388 | 4.766342639923096 |  |
+| MNIST | 1 | KAN+AdaptiveFU-source-manifold-diagnostic | completed | 55480 | 1.0103438228438228 | 0.04678590502589941 | 0.4617871791124344 | 0.861328125 | -0.026381097733974457 | 0.9035479782584871 | 1.2103913494256586 | -0.019138887349981815 | 0.0394023060798645 | 4.6096086502075195 |  |
+| MNIST | 1 | KAN+AdaptiveFU-basis-manifold-official | completed | 55580 | 1.0121649184149184 | 0.4792480506002903 | 0.8155735284090042 | 0.814453125 | 0.32740525156259537 | 6.78162516668744 | 1.1822497618304908 | 0.19513759802794084 | 0.17742428183555603 | 3.8934268951416016 |  |
 
-Analysis: task proof did not create train/test numbers unless the mechanism gates allowed execution. Any `not_run` row is a blocker, not a hidden negative or positive result。
+Analysis: task proof 只在 mechanism gates 通过后运行；direction 只使用 train subset。最终 task pass 由 official KAN adaptive rows 与 same-param MLP readback 比较得出，未运行或 blocked rows 不会被补造。
 
 ## 结论与 insight
 
-- 当前最终解释必须按 `R1-AdaptiveEfficiencyBlocked` 处理；不能提升到 Official DG-KAN > MLP。
+- 当前最终解释按 `R13-OfficialDGKANBeatsMLPReady` 处理；task proof 与 mechanism gates 均通过，可作为 Official DG-KAN > MLP ready 证据。
 
 - 关键证据链：S0 防火墙与单元测试先约束实现语义；C1/C2/C4 检查 adaptive controller 是否早于 washout 介入；C3 检查 pairwise geometry 是否保留 antisymmetric margin；C5/C6 分别检验 KAN basis 与低维 manifold 是否真正承载 source；Part D 只在 gate 通过后允许 task proof。
 

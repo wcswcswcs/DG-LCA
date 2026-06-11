@@ -561,16 +561,13 @@ def forward_matmul(model, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     return logits, h
 
 
-def _backward_k3_impl(model, x: torch.Tensor, y: torch.Tensor, logits: torch.Tensor, h: torch.Tensor, *, use_grad_buffers: bool) -> torch.Tensor:
+def backward_from_grad_logits(model, x: torch.Tensor, grad_logits: torch.Tensor, logits: torch.Tensor, h: torch.Tensor, *, use_grad_buffers: bool = False) -> torch.Tensor:
     _check_model(model, 3)
     if x.dtype != torch.float32 or x.device.type != "cuda":
-        raise ValueError("fused_chebyshev_k3 backward requires fp32 CUDA input")
+        raise ValueError("fused_chebyshev_k3 backward_from_grad_logits requires fp32 CUDA input")
     x = x.contiguous()
     with torch.no_grad():
-        loss = F.cross_entropy(logits, y)
-        grad_logits = torch.softmax(logits, dim=1)
-        grad_logits[torch.arange(int(y.numel()), device=y.device), y] -= 1.0
-        grad_logits = (grad_logits / float(max(1, int(y.numel())))).contiguous()
+        grad_logits = grad_logits.to(device=logits.device, dtype=logits.dtype).contiguous()
         if use_grad_buffers:
             gw1 = _persistent_grad_buffer(model, "_cheby_k3_gw1_buffer", model.w1)
             gw2 = _persistent_grad_buffer(model, "_cheby_k3_gw2_buffer", model.w2)
@@ -609,7 +606,20 @@ def _backward_k3_impl(model, x: torch.Tensor, y: torch.Tensor, logits: torch.Ten
         )
         model.w1.grad = gw1
         model.w2.grad = gw2
-        return loss.detach()
+        return (logits.detach().float() * grad_logits.detach().float()).sum().detach()
+
+
+def _backward_k3_impl(model, x: torch.Tensor, y: torch.Tensor, logits: torch.Tensor, h: torch.Tensor, *, use_grad_buffers: bool) -> torch.Tensor:
+    _check_model(model, 3)
+    if x.dtype != torch.float32 or x.device.type != "cuda":
+        raise ValueError("fused_chebyshev_k3 backward requires fp32 CUDA input")
+    with torch.no_grad():
+        loss = F.cross_entropy(logits, y)
+        grad_logits = torch.softmax(logits, dim=1)
+        grad_logits[torch.arange(int(y.numel()), device=y.device), y] -= 1.0
+        grad_logits = (grad_logits / float(max(1, int(y.numel())))).contiguous()
+    backward_from_grad_logits(model, x, grad_logits, logits, h, use_grad_buffers=use_grad_buffers)
+    return loss.detach()
 
 
 def backward(model, x: torch.Tensor, y: torch.Tensor, logits: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
