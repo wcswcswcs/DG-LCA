@@ -288,6 +288,7 @@ MECHANISMS = [
     "M268-V2206MetricSolverT10G0CompensatedHiddenBlockFU",
     "M269-V2206MetricSolverT11G0EarlyObservableFU",
     "M270-V2206MetricSolverT12G0SoftCompensatedHiddenBlockFU",
+    "M271-V2206MetricSolverT12G0HiddenOnlySoftCompensatedFU",
 ]
 
 
@@ -2048,6 +2049,7 @@ def make_update(
             mechanism=mechanism,
             hidden_residual_scale=float(cfg.get("hidden_residual_scale", 0.35)),
             hidden_function_fraction=float(cfg.get("hidden_function_fraction", 0.25)),
+            block_role=str(cfg.get("block_role", "all")),
             seed=seed,
         )
     if mechanism in METRIC_FIRST_MECHANISM_TO_METRIC:
@@ -3724,6 +3726,7 @@ def mechanism_contract_rows() -> list[dict[str, object]]:
         "M268-V2206MetricSolverT10G0CompensatedHiddenBlockFU": ("function_metric_solver+matrix_block", "v22_06_T10_G0_compensated_hidden_readout_block_source_metric_solver", 0, 1, 0, 1, 0),
         "M269-V2206MetricSolverT11G0EarlyObservableFU": ("function_metric_solver+matrix_block", "v22_06_T11_G0_early_observable_source_channel_metric_solver", 0, 1, 0, 1, 0),
         "M270-V2206MetricSolverT12G0SoftCompensatedHiddenBlockFU": ("function_metric_solver+matrix_block", "v22_06_T12_G0_soft_compensated_hidden_readout_block_source_metric_solver", 0, 1, 0, 1, 0),
+        "M271-V2206MetricSolverT12G0HiddenOnlySoftCompensatedFU": ("function_metric_solver+matrix_block", "v22_06_T12_G0_hidden_only_soft_compensated_source_metric_solver", 0, 1, 0, 1, 0),
     }
     terminal_alias = {
         "M170-EarlySourceSlowEMATerminalSourcePreserveStrongFU",

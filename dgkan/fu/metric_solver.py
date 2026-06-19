@@ -102,6 +102,13 @@ V2206_SOLVER_CONFIGS: dict[str, dict[str, str]] = {
         "solver_level": "S2-ReadoutExactSoftCompensatedHiddenResidualBlock",
         "hidden_residual_scale": "0.35",
     },
+    "M271-V2206MetricSolverT12G0HiddenOnlySoftCompensatedFU": {
+        "target_family": "T12-SoftCompensatedBlockSourceChannel",
+        "metric_family": "G0-L2",
+        "solver_level": "S2-HiddenOnlySoftCompensatedResidualBlock",
+        "hidden_residual_scale": "0.70",
+        "block_role": "hidden_only",
+    },
 }
 
 
@@ -288,9 +295,17 @@ def _metric_weights(logits: torch.Tensor, metric_family: str) -> torch.Tensor:
 def _find_readout(model: torch.nn.Module) -> tuple[str, torch.nn.Parameter | None]:
     for name, p in model.named_parameters():
         low = name.lower()
-        if p.requires_grad and p.ndim == 2 and ("w2" in low or "readout" in low or "classifier" in low):
+        if p.requires_grad and p.ndim in {2, 3} and ("w2" in low or "readout" in low or "classifier" in low):
             return name, p
     return "", None
+
+
+def _matched_random_target(target: torch.Tensor, *, seed: int) -> torch.Tensor:
+    if target.numel() == 0:
+        return torch.zeros_like(target)
+    gen = torch.Generator(device=target.device).manual_seed(int(seed))
+    noise = torch.randn(tuple(target.shape), device=target.device, dtype=target.dtype, generator=gen)
+    return noise * (torch.linalg.vector_norm(target.detach()).clamp_min(EPS) / torch.linalg.vector_norm(noise.detach()).clamp_min(EPS))
 
 
 def solve_metric_readout_update(
@@ -306,6 +321,7 @@ def solve_metric_readout_update(
     hidden_function_fraction: float = 0.25,
     target_scale: float = 1.0,
     block_role: str = "all",
+    target_control: str = "",
     seed: int = 0,
 ) -> UpdateTensor:
     start = time.perf_counter()
@@ -334,8 +350,32 @@ def solve_metric_readout_update(
         base3 = model(xb3).detach().float()
         feats1 = model.frozen_readout_features(xb1).detach().float()
         feats2 = model.frozen_readout_features(xb2).detach().float()
+        readout_is_basis_tensor = readout.ndim == 3
+        if readout_is_basis_tensor:
+            hdim = int(readout.shape[0])
+            classes = int(readout.shape[1])
+            kval = int(readout.shape[2])
+            n_readout = hdim * kval
+            feature_scale = float(max(1, hdim)) ** 0.5
+            feats1 = feats1[:, :n_readout] / feature_scale
+            feats2 = feats2[:, :n_readout] / feature_scale
+        else:
+            classes = int(readout.shape[1])
+            n_readout = int(readout.shape[0])
+            feature_scale = 1.0
+            feats1 = feats1[:, :n_readout]
+            feats2 = feats2[:, :n_readout]
         target1, d1 = _target_from_logits(base1, yb1, target_family)
         target2, d2 = _target_from_logits(base2, yb2, target_family, reference_target=target1)
+        target_control_normalized = str(target_control or "").strip().lower()
+        if target_control_normalized == "random":
+            target1 = _matched_random_target(target1, seed=900_271 + int(seed))
+            target2 = _matched_random_target(target2, seed=900_541 + int(seed))
+        elif target_control_normalized == "signflip":
+            target1 = -target1
+            target2 = -target2
+        elif target_control_normalized:
+            raise ValueError(f"unknown target_control={target_control!r}")
         feats = torch.cat([feats1, feats2], dim=0)
         target = torch.cat([target1, target2], dim=0) * float(target_scale)
         weights = _metric_weights(torch.cat([base1, base2], dim=0), metric_family).to(device=device, dtype=feats.dtype)
@@ -349,12 +389,17 @@ def solve_metric_readout_update(
         except Exception:
             delta_w = torch.linalg.lstsq(gram, rhs).solution
 
+        def pack_readout_delta(delta: torch.Tensor, param: torch.Tensor) -> torch.Tensor:
+            if readout_is_basis_tensor:
+                return delta.reshape(hdim, kval, classes).permute(0, 2, 1).contiguous().to(device=device, dtype=param.dtype)
+            return delta.reshape_as(param).to(device=device, dtype=param.dtype)
+
         chunks: list[torch.Tensor] = []
         for pname, p in model.named_parameters():
             if not p.requires_grad:
                 continue
             if pname == readout_name:
-                chunks.append((-delta_w).to(device=device, dtype=p.dtype).reshape(-1))
+                chunks.append((-pack_readout_delta(delta_w, p)).reshape(-1))
             else:
                 chunks.append(torch.zeros_like(p, device=device).reshape(-1))
         update_vec = torch.cat(chunks) if chunks else torch.zeros_like(g_ref)
@@ -456,6 +501,12 @@ def solve_metric_readout_update(
                         hidden_base2 = model(xb2).detach().float()
                         hidden_feats1 = model.frozen_readout_features(xb1).detach().float()
                         hidden_feats2 = model.frozen_readout_features(xb2).detach().float()
+                        if readout_is_basis_tensor:
+                            hidden_feats1 = hidden_feats1[:, :n_readout] / feature_scale
+                            hidden_feats2 = hidden_feats2[:, :n_readout] / feature_scale
+                        else:
+                            hidden_feats1 = hidden_feats1[:, :n_readout]
+                            hidden_feats2 = hidden_feats2[:, :n_readout]
                         load_flat_params(model, before)
                         hidden_actual = torch.cat([hidden_base1 - base1, hidden_base2 - base2], dim=0)
                         comp_target = target.to(device=device, dtype=hidden_actual.dtype) - hidden_actual
@@ -473,7 +524,7 @@ def solve_metric_readout_update(
                             if not p.requires_grad:
                                 continue
                             if pname == readout_name:
-                                comp_chunks.append((-comp_delta_w).to(device=device, dtype=p.dtype).reshape(-1))
+                                comp_chunks.append((-pack_readout_delta(comp_delta_w, p)).reshape(-1))
                             else:
                                 comp_chunks.append(torch.zeros_like(p, device=device).reshape(-1))
                         comp_update_vec = torch.cat(comp_chunks) if comp_chunks else torch.zeros_like(g_ref)
@@ -584,6 +635,7 @@ def solve_metric_readout_update(
         "solver_status": "metric_readout_exact_solve",
         "is_proxy": 0,
         "mechanism": mechanism,
+        "target_control": target_control_normalized or "none",
         "target_family": target_family,
         "metric_family": metric_family,
         "solver_level": (
@@ -622,6 +674,9 @@ def solve_metric_readout_update(
         ),
         "commit_type": "direct_parameter_commit",
         "target_scale": float(target_scale),
+        "readout_param_ndim": int(readout.ndim),
+        "readout_feature_count": int(n_readout),
+        "readout_feature_scale": float(feature_scale),
         "block_role": block_role_normalized,
         "block_restricted_solver": int(block_role_normalized != "all"),
         "block_restricted_solver_status": "block_mask_applied" if block_role_normalized != "all" else "not_restricted",
