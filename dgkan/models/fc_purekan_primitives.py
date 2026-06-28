@@ -314,6 +314,129 @@ def _stream_mix(z: torch.Tensor, weight: torch.Tensor, basis_name: str, k: int, 
     return out
 
 
+def _parse_decimal_token(text: str, token: str, default: float) -> float:
+    match = re.search(rf"{token}(\d+)", str(text).lower())
+    if match is None:
+        return float(default)
+    raw = match.group(1)
+    scale = 100.0 if len(raw) <= 3 else 1000.0
+    return max(float(int(raw)) / scale, 1.0e-4)
+
+
+def _wlb_config(k: int, variant: str) -> Dict[str, float]:
+    lower = str(variant).lower()
+    lowfreq_match = re.search(r"lowfreq(\d+)", lower)
+    bump_match = re.search(r"bump(\d+)", lower)
+    lowfreq = int(lowfreq_match.group(1)) if lowfreq_match is not None else max(1, min(2, int(k) // 2))
+    bumps = int(bump_match.group(1)) if bump_match is not None else max(0, int(k) - 2 * lowfreq)
+    width = _parse_decimal_token(lower, "width", 0.18)
+    temp = _parse_decimal_token(lower, "temp", 0.05)
+    if "tail_safe" in lower:
+        width = min(width, 0.14)
+    return {"lowfreq": float(max(0, lowfreq)), "bumps": float(max(0, bumps)), "width": width, "temp": temp}
+
+
+def _column_quantile_knots(values: torch.Tensor, count: int) -> torch.Tensor:
+    x = values.detach()
+    if x.ndim == 1:
+        x = x.reshape(-1, 1)
+    n, dim = int(x.shape[0]), int(x.shape[1])
+    if n <= 0:
+        return torch.zeros((dim, int(count)), device=x.device, dtype=x.dtype)
+    sorted_x = torch.sort(x, dim=0).values
+    qs = torch.linspace(0.0, 1.0, int(count), device=x.device)
+    idx = torch.round(qs * float(max(0, n - 1))).long().clamp(0, max(0, n - 1))
+    return sorted_x[idx].transpose(0, 1).contiguous()
+
+
+def _soft_quantile_coordinate(z: torch.Tensor, knots: torch.Tensor, temp: float) -> torch.Tensor:
+    if knots.ndim != 2 or int(knots.shape[0]) != int(z.shape[1]):
+        return ((z + 1.0) * 0.5).clamp(0.0, 1.0)
+    tau = max(float(temp), 1.0e-4)
+    diff = (z.unsqueeze(-1) - knots.to(device=z.device, dtype=z.dtype).unsqueeze(0)) / tau
+    return torch.sigmoid(diff.clamp(-40.0, 40.0)).mean(dim=-1).clamp(0.0, 1.0)
+
+
+def _wlb_basis_raw(z: torch.Tensor, knots: torch.Tensor, k: int, variant: str) -> torch.Tensor:
+    cfg = _wlb_config(int(k), variant)
+    lower = str(variant).lower()
+    s = _soft_quantile_coordinate(z, knots, cfg["temp"])
+    vals = []
+    if "monotone" in lower:
+        for power in range(1, int(cfg["lowfreq"]) + 1):
+            vals.append(s.pow(power) - (1.0 / float(power + 1)))
+    else:
+        for freq in range(1, int(cfg["lowfreq"]) + 1):
+            angle = 2.0 * math.pi * float(freq) * s
+            vals.append(torch.sin(angle))
+            vals.append(torch.cos(angle))
+    bumps = int(cfg["bumps"])
+    if bumps > 0:
+        if "tail_safe" in lower:
+            centers = torch.linspace(0.08, 0.92, bumps, device=z.device, dtype=z.dtype)
+        else:
+            centers = torch.linspace(0.0, 1.0, bumps, device=z.device, dtype=z.dtype)
+        width = max(float(cfg["width"]), 1.0e-4)
+        for center in centers:
+            if "monotone" in lower:
+                denom = (1.0 - center).clamp_min(1.0e-4)
+                vals.append(F.relu(s - center) / denom)
+            elif "compacthat" in lower:
+                vals.append(F.relu(1.0 - (s - center).abs() / width))
+            else:
+                vals.append(torch.exp(-0.5 * ((s - center) / width).square()))
+    while len(vals) < int(k):
+        base = int(cfg["lowfreq"]) if "monotone" in lower else 2 * int(cfg["lowfreq"])
+        power = len(vals) - base + 1
+        vals.append((s - 0.5).pow(max(1, power)))
+    return torch.stack(vals[: int(k)], dim=-1)
+
+
+def _wlb_basis_derivative_raw(z: torch.Tensor, knots: torch.Tensor, k: int, variant: str) -> torch.Tensor:
+    cfg = _wlb_config(int(k), variant)
+    lower = str(variant).lower()
+    tau = max(float(cfg["temp"]), 1.0e-4)
+    if knots.ndim != 2 or int(knots.shape[0]) != int(z.shape[1]):
+        s = ((z + 1.0) * 0.5).clamp(0.0, 1.0)
+        ds = torch.full_like(z, 0.5)
+    else:
+        diff = (z.unsqueeze(-1) - knots.to(device=z.device, dtype=z.dtype).unsqueeze(0)) / tau
+        sig = torch.sigmoid(diff.clamp(-40.0, 40.0))
+        s = sig.mean(dim=-1).clamp(0.0, 1.0)
+        ds = (sig * (1.0 - sig)).mean(dim=-1) / tau
+    vals = []
+    if "monotone" in lower:
+        for power in range(1, int(cfg["lowfreq"]) + 1):
+            vals.append(float(power) * s.pow(max(0, power - 1)) * ds)
+    else:
+        for freq in range(1, int(cfg["lowfreq"]) + 1):
+            angle = 2.0 * math.pi * float(freq) * s
+            scale = 2.0 * math.pi * float(freq) * ds
+            vals.append(torch.cos(angle) * scale)
+            vals.append(-torch.sin(angle) * scale)
+    bumps = int(cfg["bumps"])
+    if bumps > 0:
+        if "tail_safe" in lower:
+            centers = torch.linspace(0.08, 0.92, bumps, device=z.device, dtype=z.dtype)
+        else:
+            centers = torch.linspace(0.0, 1.0, bumps, device=z.device, dtype=z.dtype)
+        width = max(float(cfg["width"]), 1.0e-4)
+        for center in centers:
+            r = (s - center) / width
+            if "monotone" in lower:
+                denom = (1.0 - center).clamp_min(1.0e-4)
+                vals.append((s >= center).to(dtype=z.dtype) * ds / denom)
+            elif "compacthat" in lower:
+                vals.append(-torch.sign(r) * (r.abs() < 1.0).to(dtype=z.dtype) * ds / width)
+            else:
+                vals.append(torch.exp(-0.5 * r.square()) * (-r / width) * ds)
+    while len(vals) < int(k):
+        base = int(cfg["lowfreq"]) if "monotone" in lower else 2 * int(cfg["lowfreq"])
+        power = len(vals) - base + 1
+        vals.append(float(max(1, power)) * (s - 0.5).pow(max(0, power - 1)) * ds)
+    return torch.stack(vals[: int(k)], dim=-1)
+
+
 _FLASHKAT_RATIONAL_KERNEL_CACHE = None
 
 
@@ -1315,12 +1438,23 @@ class PrimitiveKAN(nn.Module):
         std = xs.std(dim=0).clamp_min(1.0e-3)
         self.register_buffer("mu", mu)
         self.register_buffer("std", std)
+        self.wlb_enabled = spec.basis_name == "warped_lowfreq_bump"
+        self.wlb_knots_count = 64
         if spec.basis_name in {"relu_hinge", "rswaf_hinge"}:
             centers = torch.linspace(-1.0, 1.0, max(1, self.k - 1), device=device)
         else:
             centers = torch.linspace(-1.0, 1.0, self.k, device=device)
         self.register_buffer("centers", centers)
         self.register_buffer("scales", torch.tensor([max(0.2, 2.0 / max(1, self.k - 1))], device=device))
+        if self.wlb_enabled:
+            z_stats = torch.tanh((xs - mu) / std)
+            self.register_buffer("wlb_input_knots", _column_quantile_knots(z_stats, self.wlb_knots_count))
+            self.register_buffer("wlb_hidden_knots", torch.zeros((self.hidden_dim, self.wlb_knots_count), device=device))
+            self.register_buffer("wlb_input_mean", torch.zeros((self.input_dim, self.k), device=device))
+            self.register_buffer("wlb_input_std", torch.ones((self.input_dim, self.k), device=device))
+            self.register_buffer("wlb_hidden_mean", torch.zeros((self.hidden_dim, self.k), device=device))
+            self.register_buffer("wlb_hidden_std", torch.ones((self.hidden_dim, self.k), device=device))
+            self.register_buffer("wlb_buffer_refresh_count", torch.zeros((), device=device))
         gen = torch.Generator(device=device).manual_seed(int(seed))
         fan1 = math.sqrt(max(1, self.input_dim * self.k))
         fan2 = math.sqrt(max(1, self.hidden_dim * self.k))
@@ -1464,6 +1598,8 @@ class PrimitiveKAN(nn.Module):
                     eye_cols = min(self.input_dim, self.hidden_dim - col)
                     for idx in range(eye_cols):
                         self.w1[idx, col + idx, 0] = math.sqrt(float(self.input_dim))
+        if self.wlb_enabled:
+            self.refresh_wlb_buffers(xs)
 
     @property
     def edge_param_count(self) -> int:
@@ -1477,20 +1613,71 @@ class PrimitiveKAN(nn.Module):
     def _norm_input(self, x: torch.Tensor) -> torch.Tensor:
         return torch.tanh((x - self.mu) / self.std)
 
+    def _wlb_normalized_basis(self, z: torch.Tensor, *, layer: str) -> torch.Tensor:
+        if layer == "input":
+            knots = self.wlb_input_knots
+            mean = self.wlb_input_mean
+            std = self.wlb_input_std
+        else:
+            knots = self.wlb_hidden_knots
+            mean = self.wlb_hidden_mean
+            std = self.wlb_hidden_std
+        raw = _wlb_basis_raw(z, knots, self.k, self.spec.init_variant).to(dtype=z.dtype)
+        return (raw - mean.to(device=z.device, dtype=z.dtype).unsqueeze(0)) / std.to(device=z.device, dtype=z.dtype).unsqueeze(0).clamp_min(1.0e-6)
+
+    def _wlb_normalized_derivative(self, z: torch.Tensor, *, layer: str) -> torch.Tensor:
+        if layer == "input":
+            knots = self.wlb_input_knots
+            std = self.wlb_input_std
+        else:
+            knots = self.wlb_hidden_knots
+            std = self.wlb_hidden_std
+        raw = _wlb_basis_derivative_raw(z, knots, self.k, self.spec.init_variant).to(dtype=z.dtype)
+        return raw / std.to(device=z.device, dtype=z.dtype).unsqueeze(0).clamp_min(1.0e-6)
+
+    def refresh_wlb_buffers(self, x_for_stats: torch.Tensor) -> None:
+        if not self.wlb_enabled:
+            return
+        with torch.no_grad():
+            x = x_for_stats[: min(4096, int(x_for_stats.shape[0]))].to(device=self.mu.device, dtype=self.mu.dtype)
+            z = self._norm_input(x)
+            self.wlb_input_knots.copy_(_column_quantile_knots(z, self.wlb_knots_count).to(device=self.mu.device, dtype=self.mu.dtype))
+            raw1 = _wlb_basis_raw(z, self.wlb_input_knots, self.k, self.spec.init_variant).to(dtype=self.mu.dtype)
+            self.wlb_input_mean.copy_(raw1.mean(dim=0))
+            self.wlb_input_std.copy_(raw1.std(dim=0).clamp_min(1.0e-3))
+            b1 = (raw1 - self.wlb_input_mean.unsqueeze(0)) / self.wlb_input_std.unsqueeze(0).clamp_min(1.0e-6)
+            pre_h = torch.einsum("bdk,dhk->bh", b1, self.w1.detach()) / math.sqrt(max(1, self.input_dim))
+            h = torch.tanh(pre_h)
+            self.wlb_hidden_knots.copy_(_column_quantile_knots(h, self.wlb_knots_count).to(device=self.mu.device, dtype=self.mu.dtype))
+            raw2 = _wlb_basis_raw(h, self.wlb_hidden_knots, self.k, self.spec.init_variant).to(dtype=self.mu.dtype)
+            self.wlb_hidden_mean.copy_(raw2.mean(dim=0))
+            self.wlb_hidden_std.copy_(raw2.std(dim=0).clamp_min(1.0e-3))
+            self.wlb_buffer_refresh_count.add_(1.0)
+
+    def _basis_eval_layer(self, z: torch.Tensor, *, layer: str) -> torch.Tensor:
+        if self.wlb_enabled:
+            return self._wlb_normalized_basis(z, layer=layer)
+        return _basis_eval(z, self.spec.basis_name, self.k, self.centers, self.scales)
+
+    def _basis_derivative_layer(self, z: torch.Tensor, *, layer: str) -> torch.Tensor:
+        if self.wlb_enabled:
+            return self._wlb_normalized_derivative(z, layer=layer)
+        return _basis_derivative(z, self.spec.basis_name, self.k, self.centers, self.scales)
+
     def layer1_basis(self, x: torch.Tensor) -> torch.Tensor:
-        return _basis_eval(self._norm_input(x), self.spec.basis_name, self.k, self.centers, self.scales)
+        return self._basis_eval_layer(self._norm_input(x), layer="input")
 
     def hidden(self, x: torch.Tensor) -> torch.Tensor:
         z = self._norm_input(x)
-        if int(self.spec.uses_dense_basis_tensor) == 0:
+        if int(self.spec.uses_dense_basis_tensor) == 0 and not self.wlb_enabled:
             h = _stream_mix(z, self.w1, self.spec.basis_name, self.k, self.centers, self.scales) / math.sqrt(max(1, self.input_dim))
         else:
-            b1 = _basis_eval(z, self.spec.basis_name, self.k, self.centers, self.scales)
+            b1 = self._basis_eval_layer(z, layer="input")
             h = torch.einsum("bdk,dhk->bh", b1, self.w1) / math.sqrt(max(1, self.input_dim))
         return torch.tanh(h)
 
     def layer2_basis(self, h: torch.Tensor) -> torch.Tensor:
-        return _basis_eval(h, self.spec.basis_name, self.k, self.centers, self.scales)
+        return self._basis_eval_layer(h, layer="hidden")
 
     def _cheby_paircross_features(self, h: torch.Tensor) -> torch.Tensor:
         rank = int(getattr(self, "cheby_cross_rank", 0))
@@ -1542,7 +1729,7 @@ class PrimitiveKAN(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         z = self._norm_input(x)
         h = self.hidden(x)
-        if int(self.spec.uses_dense_basis_tensor) == 0:
+        if int(self.spec.uses_dense_basis_tensor) == 0 and not self.wlb_enabled:
             logits = _stream_mix(h, self.w2, self.spec.basis_name, self.k, self.centers, self.scales) / math.sqrt(max(1, self.hidden_dim))
         else:
             b2 = self.layer2_basis(h)
@@ -1867,11 +2054,11 @@ class PrimitiveKAN(nn.Module):
                 sqrt_h = math.sqrt(max(1, self.hidden_dim))
                 logits = _stream_mix(h, self.w2, self.spec.basis_name, self.k, self.centers, self.scales) / sqrt_h
                 return logits, (f"{self.spec.basis_name}_stream_recompute", z, h)
-            b1 = _basis_eval(z, self.spec.basis_name, self.k, self.centers, self.scales)
+            b1 = self._basis_eval_layer(z, layer="input")
             pre_h = torch.einsum("bdk,dhk->bh", b1, self.w1) / math.sqrt(max(1, self.input_dim))
             h = torch.tanh(pre_h)
-            b2 = _basis_eval(h, self.spec.basis_name, self.k, self.centers, self.scales)
-            db2 = _basis_derivative(h, self.spec.basis_name, self.k, self.centers, self.scales)
+            b2 = self._basis_eval_layer(h, layer="hidden")
+            db2 = self._basis_derivative_layer(h, layer="hidden")
             logits = torch.einsum("bhk,hck->bc", b2, self.w2) / math.sqrt(max(1, self.hidden_dim))
             return logits, (b1, pre_h, h, b2, db2)
 

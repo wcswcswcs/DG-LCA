@@ -934,6 +934,8 @@ def dispatch_specs(args: argparse.Namespace, specs: list[dict[str, Any]], task_p
             str(args.calibration_nuisance_mode),
             "--calibration-nuisance-cadence",
             str(args.calibration_nuisance_cadence),
+            "--cached-controller-emit-cadence",
+            str(args.cached_controller_emit_cadence),
             "--label",
             str(spec["label"]),
         ]
@@ -2032,6 +2034,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--calibration-correction-weight", type=float, default=0.0)
     p.add_argument("--calibration-nuisance-mode", choices=["brier", "confidence", "overconfidence", "tail", "margin", "tail_margin", "tail_brier", "tail_brier_balanced", "tail_brier_brier2_balanced", "tail_brier_pareto", "tail_brier_pareto2", "tail_brier_qp", "tail_brier_qp_margin", "tail_brier_qp_brier_margin", "tail_q99_brier_qp_margin"], default="brier")
     p.add_argument("--calibration-nuisance-cadence", type=int, default=1)
+    p.add_argument("--cached-controller-emit-cadence", type=int, default=1)
     p.add_argument("--kan-init-variant", default="default")
     p.add_argument("--pure-fu-mode", action="store_true")
     p.add_argument("--warmup-steps", type=int, default=0)
@@ -2126,6 +2129,7 @@ def main() -> None:
             calibration_correction_weight=args.calibration_correction_weight,
             calibration_nuisance_mode=args.calibration_nuisance_mode,
             calibration_nuisance_cadence=args.calibration_nuisance_cadence,
+            cached_controller_emit_cadence=args.cached_controller_emit_cadence,
             pure_fu_mode=args.pure_fu_mode,
             warmup_steps=args.warmup_steps,
             kan_init_variant=args.kan_init_variant,
