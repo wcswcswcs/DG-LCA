@@ -7,6 +7,7 @@ from .scfg_optimizer_wrapper import SCFGOptimizerWrapper
 from .witnessed_optimizer_wrapper import WitnessedOptimizerWrapper
 from .witnessed_preconditioner_wrapper import WitnessedPreconditionerWrapper
 from .composite_metric_preserving_optimizer_wrapper import CompositeMetricPreservingOptimizerWrapper
+from .composite_metric_tube_optimizer_wrapper import CompositeMetricTubeOptimizerWrapper
 from dgkan.fu.kan_edge_natural_residual import EdgeNaturalResidualOptimizer
 from dgkan.fu.kan_distributional_edge_natural_residual import DistributionalEdgeNaturalResidualOptimizer
 from dgkan.fu.kan_brier_natural_dynamic_edge_basis import BrierNaturalDynamicEdgeOptimizer
@@ -16,6 +17,7 @@ __all__ = [
     "BrierNaturalDynamicEdgeOptimizer",
     "CCSGOptimizerWrapper",
     "CompositeMetricPreservingOptimizerWrapper",
+    "CompositeMetricTubeOptimizerWrapper",
     "DistributionalEdgeNaturalResidualOptimizer",
     "EdgeNaturalResidualOptimizer",
     "ManualAdamWConfig",
