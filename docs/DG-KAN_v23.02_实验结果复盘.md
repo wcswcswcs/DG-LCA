@@ -6477,6 +6477,140 @@ From `results/v23_02_visual_pattern_c_both_seed5_floor04/part_c_taskwise_c2_summ
 - The final blocker remains Part C taskwise/random-gap separation.
 - Direct F positive-control evidence remains valid but cannot be promoted while Part C stays failed.
 
+## 2026-07-03 05:00:59 +0800 Corner-Checker Hybrid Part C Diagnostic Recap
+
+### Result root
+
+- `results/v23_02_corner_checker_hybrid_c_both_seed5_floor04`
+
+### Scope
+
+- Tasks: `local_patch_interaction`, `rotation_sensitive`
+- Schemes: `C20_FunctionalGram_CornerCheckerHybridDegreeEdgebankSNR_s0`, `C21_FunctionalGram_CornerCheckerHybridDegreeRandomMatched_s0`
+- Basis/depth: `dche_k9`, `depth3`
+- Seeds per group: 5
+- Gate floor: 0.4
+
+### Data
+
+From `results/v23_02_corner_checker_hybrid_c_both_seed5_floor04/part_c_taskwise_c2_summary.json`:
+
+```json
+{
+  "route": "C_C2FormationTaskwiseFailed",
+  "gate_pass": 0,
+  "row_count": 20,
+  "used_fake_data_rows": 0,
+  "C20_group": {
+    "taskwise_all_pass": 1,
+    "official_pass": 0,
+    "C2_accuracy_improvement_median": 0.51171875,
+    "C2_coverage_improvement_median": 0.16042050320675116,
+    "gate_density_median": 0.6522997325286266,
+    "random_gap": 0.01120207260510142
+  },
+  "C20_tasks": {
+    "local_patch_interaction": {
+      "taskwise_pass": 1,
+      "C2_coverage_improvement_median": 0.06363091863386217,
+      "random_gap": 0.10580588797165547
+    },
+    "rotation_sensitive": {
+      "taskwise_pass": 1,
+      "C2_coverage_improvement_median": 0.29832908615935594,
+      "random_gap": 0.03422732156468555
+    }
+  },
+  "C21_random_matched_control": {
+    "taskwise_all_pass": 0,
+    "official_pass": 0,
+    "C2_coverage_improvement_median": 0.14921843060164974,
+    "random_gap": 0.14921843060164974
+  }
+}
+```
+
+### Analysis
+
+- C20 is the strongest Part C repair evidence so far: it passes both tasks at the taskwise level and has positive coverage on both tasks.
+- It still fails official Part C because aggregate random-gap separation is only 0.01120207260510142, far below the official threshold.
+- Compared with C16, C20 fixes the rotation taskwise failure; compared with C18, it preserves local-patch behavior while retaining rotation signal.
+- The remaining Part C blocker has narrowed: raw C2 formation exists for the two synthetic tasks, but the official random-control separation criterion is not satisfied.
+- This supports the insight that the edge-function Hilbert/Sobolev block family can induce useful task structure, but the current matched-random baseline is too close to the structured family or the block family needs stronger non-random alignment.
+
+### Conclusion
+
+- Part C is still officially failed; no promotion.
+- Good news: C20 shows a concrete two-task C2-forming direction.
+- Next solid repair direction: keep the corner-checker hybrid block, then improve random-control separation, for example by reducing matched-control structural leakage or increasing structured block specificity without raising fake/data leakage risks.
+
+## 2026-07-03 05:12:29 +0800 Corner-Checker Hybrid Floor Grid Recap
+
+### Result root
+
+- `results/v23_02_corner_checker_hybrid_c_both_seed5_floors`
+
+### Data
+
+From `results/v23_02_corner_checker_hybrid_c_both_seed5_floors/part_c_taskwise_c2_summary.json`:
+
+```json
+{
+  "route": "C_C2FormationTaskwiseFailed",
+  "gate_pass": 0,
+  "row_count": 60,
+  "used_fake_data_rows": 0,
+  "C20_floor_grid": [
+    {
+      "gate_floor": 0.3,
+      "taskwise_all_pass": 0,
+      "C2_coverage_improvement_median": 0.17556355401484325,
+      "random_gap": -0.02962311116334604,
+      "official_pass": 0
+    },
+    {
+      "gate_floor": 0.35,
+      "taskwise_all_pass": 0,
+      "C2_coverage_improvement_median": 0.18068588554024245,
+      "random_gap": -0.02292403803903653,
+      "official_pass": 0
+    },
+    {
+      "gate_floor": 0.4,
+      "taskwise_all_pass": 1,
+      "C2_coverage_improvement_median": 0.16042050320675116,
+      "random_gap": -0.0013607958203465387,
+      "official_pass": 0
+    }
+  ],
+  "C20_floor_0p4_tasks": {
+    "local_patch_interaction": {
+      "taskwise_pass": 1,
+      "C2_coverage_improvement_median": 0.06363091863386217,
+      "random_gap": 0.12672323535480245
+    },
+    "rotation_sensitive": {
+      "taskwise_pass": 1,
+      "C2_coverage_improvement_median": 0.29832908615935594,
+      "random_gap": 0.03194779217301402
+    }
+  }
+}
+```
+
+### Analysis
+
+- The grid confirms that `gate_floor=0.4` is the only tested C20 floor that passes both tasks taskwise.
+- Floors 0.3 and 0.35 have positive aggregate coverage but fail taskwise, mostly because one task does not retain enough separated coverage.
+- The repeated floor-0.4 run keeps the same qualitative picture as the single floor-0.4 diagnostic: two-task raw C2 formation exists, but official aggregate random-gap separation remains near zero.
+- The slight sign/size change in aggregate random gap between the single floor-0.4 run and the grid run is consistent with the stochastic matched-random control; both runs are far below the official threshold, so neither supports promotion.
+
+### Conclusion
+
+- Part C remains officially failed.
+- Floor tuning alone is not enough.
+- The most actionable insight remains: preserve C20's two-task taskwise behavior, but redesign the matched random control or strengthen structured/non-random separation.
+
 ## 2026-07-03 04:17:29 +0800 Part F direct C2/F5 positive-control
 
 ```json
@@ -7218,6 +7352,392 @@ From `results/v23_02_visual_pattern_c_both_seed5_floor04/part_c_taskwise_c2_summ
       "random_gap": 0.36807773530017585,
       "rows": 5,
       "scheme": "C19_FunctionalGram_VisualPatternDegreeRandomMatched_s0",
+      "task": "rotation_sensitive",
+      "taskwise_pass": 1
+    }
+  ],
+  "used_fake_data_rows": 0
+}
+```
+
+## 2026-07-03 04:59:19 +0800 Part C taskwise C2 formation
+
+```json
+{
+  "candidate_update_selection_used": 0,
+  "dominant_blocker": "taskwise_c2_or_random_gap_failed",
+  "error_rows": 0,
+  "gate_pass": 0,
+  "generated_at": "2026-07-03 04:59:19 +0800",
+  "held_test_usage": 0,
+  "metric_winner_selection_used": 0,
+  "ok_rows": 20,
+  "part": "C",
+  "passing_scheme_groups": [],
+  "route": "C_C2FormationTaskwiseFailed",
+  "row_count": 20,
+  "runtime_selector_used": 0,
+  "scheme_groups": [
+    {
+      "C2_accuracy_improvement_median": 0.51171875,
+      "C2_coverage_improvement_median": 0.16042050320675116,
+      "basis_key": "dche_k9",
+      "depth": "depth3",
+      "gate_density_median": 0.6522997325286266,
+      "gate_floor": 0.4,
+      "official_pass": 0,
+      "random_control_scheme": "C21_FunctionalGram_CornerCheckerHybridDegreeRandomMatched_s0",
+      "random_gap": 0.01120207260510142,
+      "rows": 10,
+      "scheme": "C20_FunctionalGram_CornerCheckerHybridDegreeEdgebankSNR_s0",
+      "taskwise_all_pass": 1
+    },
+    {
+      "C2_accuracy_improvement_median": 0.5078125,
+      "C2_coverage_improvement_median": 0.14921843060164974,
+      "basis_key": "dche_k9",
+      "depth": "depth3",
+      "gate_density_median": 0.653312209972905,
+      "gate_floor": 0.4,
+      "official_pass": 0,
+      "random_control_scheme": "C7_FunctionalGram_RandomMatchedGate_s0",
+      "random_gap": 0.14921843060164974,
+      "rows": 10,
+      "scheme": "C21_FunctionalGram_CornerCheckerHybridDegreeRandomMatched_s0",
+      "taskwise_all_pass": 0
+    }
+  ],
+  "taskwise_groups": [
+    {
+      "C2_accuracy_improvement_median": 0.5,
+      "C2_coverage_improvement_median": 0.06363091863386217,
+      "basis_key": "dche_k9",
+      "depth": "depth3",
+      "gate_density_median": 0.663216059654951,
+      "gate_floor": 0.4,
+      "random_control_scheme": "C21_FunctionalGram_CornerCheckerHybridDegreeRandomMatched_s0",
+      "random_gap": 0.10580588797165547,
+      "rows": 5,
+      "scheme": "C20_FunctionalGram_CornerCheckerHybridDegreeEdgebankSNR_s0",
+      "task": "local_patch_interaction",
+      "taskwise_pass": 1
+    },
+    {
+      "C2_accuracy_improvement_median": 0.546875,
+      "C2_coverage_improvement_median": 0.29832908615935594,
+      "basis_key": "dche_k9",
+      "depth": "depth3",
+      "gate_density_median": 0.6494237149341242,
+      "gate_floor": 0.4,
+      "random_control_scheme": "C21_FunctionalGram_CornerCheckerHybridDegreeRandomMatched_s0",
+      "random_gap": 0.03422732156468555,
+      "rows": 5,
+      "scheme": "C20_FunctionalGram_CornerCheckerHybridDegreeEdgebankSNR_s0",
+      "task": "rotation_sensitive",
+      "taskwise_pass": 1
+    },
+    {
+      "C2_accuracy_improvement_median": 0.453125,
+      "C2_coverage_improvement_median": -0.0421749693377933,
+      "basis_key": "dche_k9",
+      "depth": "depth3",
+      "gate_density_median": 0.6608180962502961,
+      "gate_floor": 0.4,
+      "random_control_scheme": "C7_FunctionalGram_RandomMatchedGate_s0",
+      "random_gap": -0.0421749693377933,
+      "rows": 5,
+      "scheme": "C21_FunctionalGram_CornerCheckerHybridDegreeRandomMatched_s0",
+      "task": "local_patch_interaction",
+      "taskwise_pass": 0
+    },
+    {
+      "C2_accuracy_improvement_median": 0.5546875,
+      "C2_coverage_improvement_median": 0.2641017645946704,
+      "basis_key": "dche_k9",
+      "depth": "depth3",
+      "gate_density_median": 0.6448822622497875,
+      "gate_floor": 0.4,
+      "random_control_scheme": "C7_FunctionalGram_RandomMatchedGate_s0",
+      "random_gap": 0.2641017645946704,
+      "rows": 5,
+      "scheme": "C21_FunctionalGram_CornerCheckerHybridDegreeRandomMatched_s0",
+      "task": "rotation_sensitive",
+      "taskwise_pass": 1
+    }
+  ],
+  "used_fake_data_rows": 0
+}
+```
+
+## 2026-07-03 05:11:49 +0800 Part C taskwise C2 formation
+
+```json
+{
+  "candidate_update_selection_used": 0,
+  "dominant_blocker": "taskwise_c2_or_random_gap_failed",
+  "error_rows": 0,
+  "gate_pass": 0,
+  "generated_at": "2026-07-03 05:11:49 +0800",
+  "held_test_usage": 0,
+  "metric_winner_selection_used": 0,
+  "ok_rows": 60,
+  "part": "C",
+  "passing_scheme_groups": [],
+  "route": "C_C2FormationTaskwiseFailed",
+  "row_count": 60,
+  "runtime_selector_used": 0,
+  "scheme_groups": [
+    {
+      "C2_accuracy_improvement_median": 0.5234375,
+      "C2_coverage_improvement_median": 0.17556355401484325,
+      "basis_key": "dche_k9",
+      "depth": "depth3",
+      "gate_density_median": 0.6046966894426282,
+      "gate_floor": 0.3,
+      "official_pass": 0,
+      "random_control_scheme": "C21_FunctionalGram_CornerCheckerHybridDegreeRandomMatched_s0",
+      "random_gap": -0.02962311116334604,
+      "rows": 10,
+      "scheme": "C20_FunctionalGram_CornerCheckerHybridDegreeEdgebankSNR_s0",
+      "taskwise_all_pass": 0
+    },
+    {
+      "C2_accuracy_improvement_median": 0.5234375,
+      "C2_coverage_improvement_median": 0.18068588554024245,
+      "basis_key": "dche_k9",
+      "depth": "depth3",
+      "gate_density_median": 0.6266865714970565,
+      "gate_floor": 0.35,
+      "official_pass": 0,
+      "random_control_scheme": "C21_FunctionalGram_CornerCheckerHybridDegreeRandomMatched_s0",
+      "random_gap": -0.02292403803903653,
+      "rows": 10,
+      "scheme": "C20_FunctionalGram_CornerCheckerHybridDegreeEdgebankSNR_s0",
+      "taskwise_all_pass": 0
+    },
+    {
+      "C2_accuracy_improvement_median": 0.51171875,
+      "C2_coverage_improvement_median": 0.16042050320675116,
+      "basis_key": "dche_k9",
+      "depth": "depth3",
+      "gate_density_median": 0.6522997325286266,
+      "gate_floor": 0.4,
+      "official_pass": 0,
+      "random_control_scheme": "C21_FunctionalGram_CornerCheckerHybridDegreeRandomMatched_s0",
+      "random_gap": -0.0013607958203465387,
+      "rows": 10,
+      "scheme": "C20_FunctionalGram_CornerCheckerHybridDegreeEdgebankSNR_s0",
+      "taskwise_all_pass": 1
+    },
+    {
+      "C2_accuracy_improvement_median": 0.5234375,
+      "C2_coverage_improvement_median": 0.2051866651781893,
+      "basis_key": "dche_k9",
+      "depth": "depth3",
+      "gate_density_median": 0.5927917959168556,
+      "gate_floor": 0.3,
+      "official_pass": 0,
+      "random_control_scheme": "C7_FunctionalGram_RandomMatchedGate_s0",
+      "random_gap": 0.2051866651781893,
+      "rows": 10,
+      "scheme": "C21_FunctionalGram_CornerCheckerHybridDegreeRandomMatched_s0",
+      "taskwise_all_pass": 0
+    },
+    {
+      "C2_accuracy_improvement_median": 0.5234375,
+      "C2_coverage_improvement_median": 0.20360992357927898,
+      "basis_key": "dche_k9",
+      "depth": "depth3",
+      "gate_density_median": 0.6203259582734768,
+      "gate_floor": 0.35,
+      "official_pass": 0,
+      "random_control_scheme": "C7_FunctionalGram_RandomMatchedGate_s0",
+      "random_gap": 0.20360992357927898,
+      "rows": 10,
+      "scheme": "C21_FunctionalGram_CornerCheckerHybridDegreeRandomMatched_s0",
+      "taskwise_all_pass": 0
+    },
+    {
+      "C2_accuracy_improvement_median": 0.515625,
+      "C2_coverage_improvement_median": 0.1617812990270977,
+      "basis_key": "dche_k9",
+      "depth": "depth3",
+      "gate_density_median": 0.645313963832127,
+      "gate_floor": 0.4,
+      "official_pass": 0,
+      "random_control_scheme": "C7_FunctionalGram_RandomMatchedGate_s0",
+      "random_gap": 0.1617812990270977,
+      "rows": 10,
+      "scheme": "C21_FunctionalGram_CornerCheckerHybridDegreeRandomMatched_s0",
+      "taskwise_all_pass": 0
+    }
+  ],
+  "taskwise_groups": [
+    {
+      "C2_accuracy_improvement_median": 0.453125,
+      "C2_coverage_improvement_median": -0.056041860863842885,
+      "basis_key": "dche_k9",
+      "depth": "depth3",
+      "gate_density_median": 0.6175353756795334,
+      "gate_floor": 0.3,
+      "random_control_scheme": "C21_FunctionalGram_CornerCheckerHybridDegreeRandomMatched_s0",
+      "random_gap": -0.03028284789797908,
+      "rows": 5,
+      "scheme": "C20_FunctionalGram_CornerCheckerHybridDegreeEdgebankSNR_s0",
+      "task": "local_patch_interaction",
+      "taskwise_pass": 0
+    },
+    {
+      "C2_accuracy_improvement_median": 0.59375,
+      "C2_coverage_improvement_median": 0.38136161465081386,
+      "basis_key": "dche_k9",
+      "depth": "depth3",
+      "gate_density_median": 0.5995305717405345,
+      "gate_floor": 0.3,
+      "random_control_scheme": "C21_FunctionalGram_CornerCheckerHybridDegreeRandomMatched_s0",
+      "random_gap": 0.07805860037478851,
+      "rows": 5,
+      "scheme": "C20_FunctionalGram_CornerCheckerHybridDegreeEdgebankSNR_s0",
+      "task": "rotation_sensitive",
+      "taskwise_pass": 1
+    },
+    {
+      "C2_accuracy_improvement_median": 0.4921875,
+      "C2_coverage_improvement_median": -0.019335632538059144,
+      "basis_key": "dche_k9",
+      "depth": "depth3",
+      "gate_density_median": 0.6432674196445285,
+      "gate_floor": 0.35,
+      "random_control_scheme": "C21_FunctionalGram_CornerCheckerHybridDegreeRandomMatched_s0",
+      "random_gap": 0.0125618377878709,
+      "rows": 5,
+      "scheme": "C20_FunctionalGram_CornerCheckerHybridDegreeEdgebankSNR_s0",
+      "task": "local_patch_interaction",
+      "taskwise_pass": 0
+    },
+    {
+      "C2_accuracy_improvement_median": 0.546875,
+      "C2_coverage_improvement_median": 0.23031917779007927,
+      "basis_key": "dche_k9",
+      "depth": "depth3",
+      "gate_density_median": 0.6223880771961482,
+      "gate_floor": 0.35,
+      "random_control_scheme": "C21_FunctionalGram_CornerCheckerHybridDegreeRandomMatched_s0",
+      "random_gap": -0.05772289921878837,
+      "rows": 5,
+      "scheme": "C20_FunctionalGram_CornerCheckerHybridDegreeEdgebankSNR_s0",
+      "task": "rotation_sensitive",
+      "taskwise_pass": 0
+    },
+    {
+      "C2_accuracy_improvement_median": 0.5,
+      "C2_coverage_improvement_median": 0.06363091863386217,
+      "basis_key": "dche_k9",
+      "depth": "depth3",
+      "gate_density_median": 0.663216059654951,
+      "gate_floor": 0.4,
+      "random_control_scheme": "C21_FunctionalGram_CornerCheckerHybridDegreeRandomMatched_s0",
+      "random_gap": 0.12672323535480245,
+      "rows": 5,
+      "scheme": "C20_FunctionalGram_CornerCheckerHybridDegreeEdgebankSNR_s0",
+      "task": "local_patch_interaction",
+      "taskwise_pass": 1
+    },
+    {
+      "C2_accuracy_improvement_median": 0.546875,
+      "C2_coverage_improvement_median": 0.29832908615935594,
+      "basis_key": "dche_k9",
+      "depth": "depth3",
+      "gate_density_median": 0.6494237149341242,
+      "gate_floor": 0.4,
+      "random_control_scheme": "C21_FunctionalGram_CornerCheckerHybridDegreeRandomMatched_s0",
+      "random_gap": 0.03194779217301402,
+      "rows": 5,
+      "scheme": "C20_FunctionalGram_CornerCheckerHybridDegreeEdgebankSNR_s0",
+      "task": "rotation_sensitive",
+      "taskwise_pass": 1
+    },
+    {
+      "C2_accuracy_improvement_median": 0.4765625,
+      "C2_coverage_improvement_median": -0.025759012965863803,
+      "basis_key": "dche_k9",
+      "depth": "depth3",
+      "gate_density_median": 0.6096031982865596,
+      "gate_floor": 0.3,
+      "random_control_scheme": "C7_FunctionalGram_RandomMatchedGate_s0",
+      "random_gap": -0.025759012965863803,
+      "rows": 5,
+      "scheme": "C21_FunctionalGram_CornerCheckerHybridDegreeRandomMatched_s0",
+      "task": "local_patch_interaction",
+      "taskwise_pass": 0
+    },
+    {
+      "C2_accuracy_improvement_median": 0.5546875,
+      "C2_coverage_improvement_median": 0.30330301427602535,
+      "basis_key": "dche_k9",
+      "depth": "depth3",
+      "gate_density_median": 0.5917213048785922,
+      "gate_floor": 0.3,
+      "random_control_scheme": "C7_FunctionalGram_RandomMatchedGate_s0",
+      "random_gap": 0.30330301427602535,
+      "rows": 5,
+      "scheme": "C21_FunctionalGram_CornerCheckerHybridDegreeRandomMatched_s0",
+      "task": "rotation_sensitive",
+      "taskwise_pass": 1
+    },
+    {
+      "C2_accuracy_improvement_median": 0.46875,
+      "C2_coverage_improvement_median": -0.031897470325930044,
+      "basis_key": "dche_k9",
+      "depth": "depth3",
+      "gate_density_median": 0.6335875254952245,
+      "gate_floor": 0.35,
+      "random_control_scheme": "C7_FunctionalGram_RandomMatchedGate_s0",
+      "random_gap": -0.031897470325930044,
+      "rows": 5,
+      "scheme": "C21_FunctionalGram_CornerCheckerHybridDegreeRandomMatched_s0",
+      "task": "local_patch_interaction",
+      "taskwise_pass": 0
+    },
+    {
+      "C2_accuracy_improvement_median": 0.5859375,
+      "C2_coverage_improvement_median": 0.28804207700886764,
+      "basis_key": "dche_k9",
+      "depth": "depth3",
+      "gate_density_median": 0.6182339989062814,
+      "gate_floor": 0.35,
+      "random_control_scheme": "C7_FunctionalGram_RandomMatchedGate_s0",
+      "random_gap": 0.28804207700886764,
+      "rows": 5,
+      "scheme": "C21_FunctionalGram_CornerCheckerHybridDegreeRandomMatched_s0",
+      "task": "rotation_sensitive",
+      "taskwise_pass": 1
+    },
+    {
+      "C2_accuracy_improvement_median": 0.4765625,
+      "C2_coverage_improvement_median": -0.06309231672094029,
+      "basis_key": "dche_k9",
+      "depth": "depth3",
+      "gate_density_median": 0.6632378734648231,
+      "gate_floor": 0.4,
+      "random_control_scheme": "C7_FunctionalGram_RandomMatchedGate_s0",
+      "random_gap": -0.06309231672094029,
+      "rows": 5,
+      "scheme": "C21_FunctionalGram_CornerCheckerHybridDegreeRandomMatched_s0",
+      "task": "local_patch_interaction",
+      "taskwise_pass": 0
+    },
+    {
+      "C2_accuracy_improvement_median": 0.546875,
+      "C2_coverage_improvement_median": 0.2663812939863419,
+      "basis_key": "dche_k9",
+      "depth": "depth3",
+      "gate_density_median": 0.6437931719753481,
+      "gate_floor": 0.4,
+      "random_control_scheme": "C7_FunctionalGram_RandomMatchedGate_s0",
+      "random_gap": 0.2663812939863419,
+      "rows": 5,
+      "scheme": "C21_FunctionalGram_CornerCheckerHybridDegreeRandomMatched_s0",
       "task": "rotation_sensitive",
       "taskwise_pass": 1
     }

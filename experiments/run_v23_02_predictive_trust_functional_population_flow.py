@@ -85,6 +85,8 @@ C_SCHEME_MAP: dict[str, str] = {
     "C17_FunctionalGram_CheckerPatchDegreeRandomMatched_s0": "E10_FunctionalGram_CheckerPatchDegreeRandomMatched_s0",
     "C18_FunctionalGram_VisualPatternDegreeEdgebankSNR_s0": "E11_FunctionalGram_VisualPatternDegreeEdgebankSNR_s0",
     "C19_FunctionalGram_VisualPatternDegreeRandomMatched_s0": "E12_FunctionalGram_VisualPatternDegreeRandomMatched_s0",
+    "C20_FunctionalGram_CornerCheckerHybridDegreeEdgebankSNR_s0": "E13_FunctionalGram_CornerCheckerHybridDegreeEdgebankSNR_s0",
+    "C21_FunctionalGram_CornerCheckerHybridDegreeRandomMatched_s0": "E14_FunctionalGram_CornerCheckerHybridDegreeRandomMatched_s0",
 }
 
 RANDOM_CONTROL_FOR_SCHEME: dict[str, str] = {
@@ -93,6 +95,7 @@ RANDOM_CONTROL_FOR_SCHEME: dict[str, str] = {
     "C12_FunctionalSobolev_DegreeEdgebankSNR_s1": "C15_FunctionalSobolev_RandomMatchedGate_s1",
     "C16_FunctionalGram_CheckerPatchDegreeEdgebankSNR_s0": "C17_FunctionalGram_CheckerPatchDegreeRandomMatched_s0",
     "C18_FunctionalGram_VisualPatternDegreeEdgebankSNR_s0": "C19_FunctionalGram_VisualPatternDegreeRandomMatched_s0",
+    "C20_FunctionalGram_CornerCheckerHybridDegreeEdgebankSNR_s0": "C21_FunctionalGram_CornerCheckerHybridDegreeRandomMatched_s0",
 }
 
 
@@ -632,6 +635,7 @@ def merge_part_c(args: argparse.Namespace) -> dict[str, Any]:
                 "C12_FunctionalSobolev_DegreeEdgebankSNR_s1",
                 "C16_FunctionalGram_CheckerPatchDegreeEdgebankSNR_s0",
                 "C18_FunctionalGram_VisualPatternDegreeEdgebankSNR_s0",
+                "C20_FunctionalGram_CornerCheckerHybridDegreeEdgebankSNR_s0",
             }
             and key[1] == "dche_k9"
             and key[2] == "depth3"
@@ -952,7 +956,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         finite_step_guard_examples=128,
         predictive_trust_scale=1.0,
     )
-    p.add_argument("--part-c-schemes", default="C0_AdamW_control,C1_FunctionalGram_AdamW_s0_no_Qpop,C2_FunctionalGram_DiagonalSNR_s0,C3_FunctionalGram_BlockSNR_layer_s0,C4_FunctionalGram_BlockSNR_degree_s0,C5_FunctionalGram_BlockSNR_edgebank_s0,C10_FunctionalSobolev_DegreeEdgebankSNR_s0p25,C11_FunctionalSobolev_DegreeEdgebankSNR_s0p5,C12_FunctionalSobolev_DegreeEdgebankSNR_s1,C13_FunctionalSobolev_RandomMatchedGate_s0p25,C14_FunctionalSobolev_RandomMatchedGate_s0p5,C15_FunctionalSobolev_RandomMatchedGate_s1,C16_FunctionalGram_CheckerPatchDegreeEdgebankSNR_s0,C17_FunctionalGram_CheckerPatchDegreeRandomMatched_s0,C18_FunctionalGram_VisualPatternDegreeEdgebankSNR_s0,C19_FunctionalGram_VisualPatternDegreeRandomMatched_s0,C6_FunctionalGram_BlockSNR_class_conditional_s0,C7_FunctionalGram_RandomMatchedGate_s0,C8_FunctionalGram_SameComputeNoOp_s0,C9_FunctionalGram_s1_derivative_diagnostic")
+    p.add_argument("--part-c-schemes", default="C0_AdamW_control,C1_FunctionalGram_AdamW_s0_no_Qpop,C2_FunctionalGram_DiagonalSNR_s0,C3_FunctionalGram_BlockSNR_layer_s0,C4_FunctionalGram_BlockSNR_degree_s0,C5_FunctionalGram_BlockSNR_edgebank_s0,C10_FunctionalSobolev_DegreeEdgebankSNR_s0p25,C11_FunctionalSobolev_DegreeEdgebankSNR_s0p5,C12_FunctionalSobolev_DegreeEdgebankSNR_s1,C13_FunctionalSobolev_RandomMatchedGate_s0p25,C14_FunctionalSobolev_RandomMatchedGate_s0p5,C15_FunctionalSobolev_RandomMatchedGate_s1,C16_FunctionalGram_CheckerPatchDegreeEdgebankSNR_s0,C17_FunctionalGram_CheckerPatchDegreeRandomMatched_s0,C18_FunctionalGram_VisualPatternDegreeEdgebankSNR_s0,C19_FunctionalGram_VisualPatternDegreeRandomMatched_s0,C20_FunctionalGram_CornerCheckerHybridDegreeEdgebankSNR_s0,C21_FunctionalGram_CornerCheckerHybridDegreeRandomMatched_s0,C6_FunctionalGram_BlockSNR_class_conditional_s0,C7_FunctionalGram_RandomMatchedGate_s0,C8_FunctionalGram_SameComputeNoOp_s0,C9_FunctionalGram_s1_derivative_diagnostic")
     p.add_argument("--part-c-seed-count", type=int, default=15)
     p.add_argument("--part-c-gate-floors", default="0.2,0.3,0.4")
     p.add_argument("--c-task-coverage-gate", type=float, default=0.03)

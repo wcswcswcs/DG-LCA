@@ -1557,3 +1557,130 @@ Conclusion:
 - Visual-pattern edge blocks did not repair Part C.
 - The rotation raw coverage signal improved, but random-gap separation stayed negative for C18; local patch degraded.
 - This result supports the same blocker diagnosis: matched random controls remain too strong and official Part C remains failed.
+
+## 2026-07-03 04:58:28 +0800 part-c shard-written
+
+Command: `/home/chengshun.wang/miniconda3/envs/kan/bin/python experiments/run_v23_02_predictive_trust_functional_population_flow.py --mode part-c --device cuda:0 --shard-count 4 --shard-index 0 --part-c-schemes C20_FunctionalGram_CornerCheckerHybridDegreeEdgebankSNR_s0,C21_FunctionalGram_CornerCheckerHybridDegreeRandomMatched_s0 --part-c-basis dche_k9 --part-c-depths depth3 --part-c-tasks local_patch_interaction,rotation_sensitive --part-c-seed-count 5 --part-c-gate-floors 0.4 --train-steps 240 --synthetic-train-size 192 --synthetic-guard-size 128 --population-grad-examples 8 --stat-warmup-steps 20`
+
+Files: results/v23_02_corner_checker_hybrid_c_both_seed5_floor04/part_c_taskwise_c2_matrix_shard0_of_4.csv
+
+Note: rows=5
+
+
+## 2026-07-03 04:58:28 +0800 part-c shard-written
+
+Command: `/home/chengshun.wang/miniconda3/envs/kan/bin/python experiments/run_v23_02_predictive_trust_functional_population_flow.py --mode part-c --device cuda:0 --shard-count 4 --shard-index 1 --part-c-schemes C20_FunctionalGram_CornerCheckerHybridDegreeEdgebankSNR_s0,C21_FunctionalGram_CornerCheckerHybridDegreeRandomMatched_s0 --part-c-basis dche_k9 --part-c-depths depth3 --part-c-tasks local_patch_interaction,rotation_sensitive --part-c-seed-count 5 --part-c-gate-floors 0.4 --train-steps 240 --synthetic-train-size 192 --synthetic-guard-size 128 --population-grad-examples 8 --stat-warmup-steps 20`
+
+Files: results/v23_02_corner_checker_hybrid_c_both_seed5_floor04/part_c_taskwise_c2_matrix_shard1_of_4.csv
+
+Note: rows=5
+
+
+## 2026-07-03 04:58:47 +0800 part-c shard-written
+
+Command: `/home/chengshun.wang/miniconda3/envs/kan/bin/python experiments/run_v23_02_predictive_trust_functional_population_flow.py --mode part-c --device cuda:0 --shard-count 4 --shard-index 3 --part-c-schemes C20_FunctionalGram_CornerCheckerHybridDegreeEdgebankSNR_s0,C21_FunctionalGram_CornerCheckerHybridDegreeRandomMatched_s0 --part-c-basis dche_k9 --part-c-depths depth3 --part-c-tasks local_patch_interaction,rotation_sensitive --part-c-seed-count 5 --part-c-gate-floors 0.4 --train-steps 240 --synthetic-train-size 192 --synthetic-guard-size 128 --population-grad-examples 8 --stat-warmup-steps 20`
+
+Files: results/v23_02_corner_checker_hybrid_c_both_seed5_floor04/part_c_taskwise_c2_matrix_shard3_of_4.csv
+
+Note: rows=5
+
+
+## 2026-07-03 04:58:47 +0800 part-c shard-written
+
+Command: `/home/chengshun.wang/miniconda3/envs/kan/bin/python experiments/run_v23_02_predictive_trust_functional_population_flow.py --mode part-c --device cuda:0 --shard-count 4 --shard-index 2 --part-c-schemes C20_FunctionalGram_CornerCheckerHybridDegreeEdgebankSNR_s0,C21_FunctionalGram_CornerCheckerHybridDegreeRandomMatched_s0 --part-c-basis dche_k9 --part-c-depths depth3 --part-c-tasks local_patch_interaction,rotation_sensitive --part-c-seed-count 5 --part-c-gate-floors 0.4 --train-steps 240 --synthetic-train-size 192 --synthetic-guard-size 128 --population-grad-examples 8 --stat-warmup-steps 20`
+
+Files: results/v23_02_corner_checker_hybrid_c_both_seed5_floor04/part_c_taskwise_c2_matrix_shard2_of_4.csv
+
+Note: rows=5
+
+
+## 2026-07-03 04:59:19 +0800 part-c-merge failed
+
+Command: `/home/chengshun.wang/miniconda3/envs/kan/bin/python experiments/run_v23_02_predictive_trust_functional_population_flow.py --mode part-c-merge --device cpu --part-c-schemes C20_FunctionalGram_CornerCheckerHybridDegreeEdgebankSNR_s0,C21_FunctionalGram_CornerCheckerHybridDegreeRandomMatched_s0 --part-c-basis dche_k9 --part-c-depths depth3 --part-c-tasks local_patch_interaction,rotation_sensitive --part-c-seed-count 5 --part-c-gate-floors 0.4 --train-steps 240 --synthetic-train-size 192 --synthetic-guard-size 128 --population-grad-examples 8 --stat-warmup-steps 20`
+
+Files: results/v23_02_corner_checker_hybrid_c_both_seed5_floor04/part_c_taskwise_c2_matrix.csv; results/v23_02_corner_checker_hybrid_c_both_seed5_floor04/part_c_taskwise_c2_task_summary.csv; results/v23_02_corner_checker_hybrid_c_both_seed5_floor04/part_c_taskwise_c2_group_summary.csv; results/v23_02_corner_checker_hybrid_c_both_seed5_floor04/part_c_next_actions_for_codex.json
+
+
+## 2026-07-03 05:00:59 +0800 manual audit note: corner-checker hybrid Part C result interpretation
+
+Additional root:
+
+- `results/v23_02_corner_checker_hybrid_c_both_seed5_floor04`
+
+Key observations:
+
+- `C20_FunctionalGram_CornerCheckerHybridDegreeEdgebankSNR_s0`: group `C2_accuracy_improvement_median=0.51171875`, `C2_coverage_improvement_median=0.16042050320675116`, `random_gap=0.01120207260510142`, `taskwise_all_pass=1`, `official_pass=0`.
+- C20 task details:
+  - `local_patch_interaction`: `taskwise_pass=1`, `C2_coverage_improvement_median=0.06363091863386217`, `random_gap=0.10580588797165547`.
+  - `rotation_sensitive`: `taskwise_pass=1`, `C2_coverage_improvement_median=0.29832908615935594`, `random_gap=0.03422732156468555`.
+- `C21_FunctionalGram_CornerCheckerHybridDegreeRandomMatched_s0`: `taskwise_all_pass=0`, `C2_coverage_improvement_median=0.14921843060164974`, `random_gap=0.14921843060164974`, `official_pass=0`.
+
+Conclusion:
+
+- This is the strongest Part C repair signal so far because C20 passes both tasks taskwise.
+- Official Part C still fails because the aggregate random-gap separation is far below the official threshold.
+- The next blocker is no longer raw task coverage; it is matched-random separation and/or the official gap threshold under this family.
+
+## 2026-07-03 05:10:56 +0800 part-c shard-written
+
+Command: `/home/chengshun.wang/miniconda3/envs/kan/bin/python experiments/run_v23_02_predictive_trust_functional_population_flow.py --mode part-c --device cuda:0 --shard-count 4 --shard-index 1 --part-c-schemes C20_FunctionalGram_CornerCheckerHybridDegreeEdgebankSNR_s0,C21_FunctionalGram_CornerCheckerHybridDegreeRandomMatched_s0 --part-c-basis dche_k9 --part-c-depths depth3 --part-c-tasks local_patch_interaction,rotation_sensitive --part-c-seed-count 5 --part-c-gate-floors 0.3,0.35,0.4 --train-steps 240 --synthetic-train-size 192 --synthetic-guard-size 128 --population-grad-examples 8 --stat-warmup-steps 20`
+
+Files: results/v23_02_corner_checker_hybrid_c_both_seed5_floors/part_c_taskwise_c2_matrix_shard1_of_4.csv
+
+Note: rows=15
+
+
+## 2026-07-03 05:11:00 +0800 part-c shard-written
+
+Command: `/home/chengshun.wang/miniconda3/envs/kan/bin/python experiments/run_v23_02_predictive_trust_functional_population_flow.py --mode part-c --device cuda:0 --shard-count 4 --shard-index 0 --part-c-schemes C20_FunctionalGram_CornerCheckerHybridDegreeEdgebankSNR_s0,C21_FunctionalGram_CornerCheckerHybridDegreeRandomMatched_s0 --part-c-basis dche_k9 --part-c-depths depth3 --part-c-tasks local_patch_interaction,rotation_sensitive --part-c-seed-count 5 --part-c-gate-floors 0.3,0.35,0.4 --train-steps 240 --synthetic-train-size 192 --synthetic-guard-size 128 --population-grad-examples 8 --stat-warmup-steps 20`
+
+Files: results/v23_02_corner_checker_hybrid_c_both_seed5_floors/part_c_taskwise_c2_matrix_shard0_of_4.csv
+
+Note: rows=15
+
+
+## 2026-07-03 05:11:13 +0800 part-c shard-written
+
+Command: `/home/chengshun.wang/miniconda3/envs/kan/bin/python experiments/run_v23_02_predictive_trust_functional_population_flow.py --mode part-c --device cuda:0 --shard-count 4 --shard-index 2 --part-c-schemes C20_FunctionalGram_CornerCheckerHybridDegreeEdgebankSNR_s0,C21_FunctionalGram_CornerCheckerHybridDegreeRandomMatched_s0 --part-c-basis dche_k9 --part-c-depths depth3 --part-c-tasks local_patch_interaction,rotation_sensitive --part-c-seed-count 5 --part-c-gate-floors 0.3,0.35,0.4 --train-steps 240 --synthetic-train-size 192 --synthetic-guard-size 128 --population-grad-examples 8 --stat-warmup-steps 20`
+
+Files: results/v23_02_corner_checker_hybrid_c_both_seed5_floors/part_c_taskwise_c2_matrix_shard2_of_4.csv
+
+Note: rows=15
+
+
+## 2026-07-03 05:11:14 +0800 part-c shard-written
+
+Command: `/home/chengshun.wang/miniconda3/envs/kan/bin/python experiments/run_v23_02_predictive_trust_functional_population_flow.py --mode part-c --device cuda:0 --shard-count 4 --shard-index 3 --part-c-schemes C20_FunctionalGram_CornerCheckerHybridDegreeEdgebankSNR_s0,C21_FunctionalGram_CornerCheckerHybridDegreeRandomMatched_s0 --part-c-basis dche_k9 --part-c-depths depth3 --part-c-tasks local_patch_interaction,rotation_sensitive --part-c-seed-count 5 --part-c-gate-floors 0.3,0.35,0.4 --train-steps 240 --synthetic-train-size 192 --synthetic-guard-size 128 --population-grad-examples 8 --stat-warmup-steps 20`
+
+Files: results/v23_02_corner_checker_hybrid_c_both_seed5_floors/part_c_taskwise_c2_matrix_shard3_of_4.csv
+
+Note: rows=15
+
+
+## 2026-07-03 05:11:49 +0800 part-c-merge failed
+
+Command: `/home/chengshun.wang/miniconda3/envs/kan/bin/python experiments/run_v23_02_predictive_trust_functional_population_flow.py --mode part-c-merge --device cpu --part-c-schemes C20_FunctionalGram_CornerCheckerHybridDegreeEdgebankSNR_s0,C21_FunctionalGram_CornerCheckerHybridDegreeRandomMatched_s0 --part-c-basis dche_k9 --part-c-depths depth3 --part-c-tasks local_patch_interaction,rotation_sensitive --part-c-seed-count 5 --part-c-gate-floors 0.3,0.35,0.4 --train-steps 240 --synthetic-train-size 192 --synthetic-guard-size 128 --population-grad-examples 8 --stat-warmup-steps 20`
+
+Files: results/v23_02_corner_checker_hybrid_c_both_seed5_floors/part_c_taskwise_c2_matrix.csv; results/v23_02_corner_checker_hybrid_c_both_seed5_floors/part_c_taskwise_c2_task_summary.csv; results/v23_02_corner_checker_hybrid_c_both_seed5_floors/part_c_taskwise_c2_group_summary.csv; results/v23_02_corner_checker_hybrid_c_both_seed5_floors/part_c_next_actions_for_codex.json
+
+
+## 2026-07-03 05:12:29 +0800 manual audit note: corner-checker hybrid floor grid interpretation
+
+Additional root:
+
+- `results/v23_02_corner_checker_hybrid_c_both_seed5_floors`
+
+Key observations:
+
+- `C20` floor 0.3: `taskwise_all_pass=0`, `C2_coverage_improvement_median=0.17556355401484325`, `random_gap=-0.02962311116334604`, `official_pass=0`.
+- `C20` floor 0.35: `taskwise_all_pass=0`, `C2_coverage_improvement_median=0.18068588554024245`, `random_gap=-0.02292403803903653`, `official_pass=0`.
+- `C20` floor 0.4: `taskwise_all_pass=1`, `C2_coverage_improvement_median=0.16042050320675116`, `random_gap=-0.0013607958203465387`, `official_pass=0`.
+- Task details at C20 floor 0.4:
+  - `local_patch_interaction`: `taskwise_pass=1`, `C2_coverage_improvement_median=0.06363091863386217`, `random_gap=0.12672323535480245`.
+  - `rotation_sensitive`: `taskwise_pass=1`, `C2_coverage_improvement_median=0.29832908615935594`, `random_gap=0.03194779217301402`.
+
+Conclusion:
+
+- The floor grid confirms floor 0.4 is the only tested C20 floor that passes both tasks taskwise.
+- The official Part C gate still fails because aggregate random-gap separation remains near zero or negative.
+- Raising/lowering the gate floor within 0.3/0.35/0.4 is not sufficient to fix official Part C.
