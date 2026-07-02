@@ -9,7 +9,7 @@ from typing import Iterable
 import torch
 
 from dgkan.fu.debt_conflict_veto import conflict_veto_gate
-from dgkan.fu.edge_sobolev_metrics import flatten_param_mode_weights, make_mode_weights, mode_band_slices
+from dgkan.fu.edge_sobolev_metrics import flatten_param_mode_weights, functional_edge_gram, make_mode_weights, mode_band_slices
 from dgkan.fu.population_risk_gate import block_snr_gate, diagonal_snr_gate
 
 
@@ -44,6 +44,10 @@ class EdgeSobolevPopulationFlow(torch.optim.Optimizer):
         eps: float = 1.0e-8,
         weight_decay: float = 0.0,
         sobolev_exponent: float = 1.0,
+        edge_metric_type: str = "mode_diag",
+        edge_weight_normalization: str = "median",
+        edge_weight_ridge: float = 0.0,
+        functional_gram_quadrature_points: int = 257,
         gate_beta: float = 2.0,
         gate_family: str = "diagonal",
         gate_floor: float = 0.0,
@@ -59,6 +63,10 @@ class EdgeSobolevPopulationFlow(torch.optim.Optimizer):
             eps=float(eps),
             weight_decay=float(weight_decay),
             sobolev_exponent=float(sobolev_exponent),
+            edge_metric_type=str(edge_metric_type),
+            edge_weight_normalization=str(edge_weight_normalization),
+            edge_weight_ridge=float(edge_weight_ridge),
+            functional_gram_quadrature_points=int(functional_gram_quadrature_points),
             gate_beta=float(gate_beta),
             gate_family=str(gate_family),
             gate_floor=float(gate_floor),
@@ -69,6 +77,7 @@ class EdgeSobolevPopulationFlow(torch.optim.Optimizer):
         super().__init__(list(params), defaults)
         self._observed_grads: dict[int, torch.Tensor] = {}
         self._observed_debt_grads: dict[int, dict[str, torch.Tensor]] = {}
+        self._gram_cache: dict[tuple[str, int, float, int, str, float, str, torch.dtype], tuple[torch.Tensor, torch.Tensor, float]] = {}
         self.last_stats = EdgeSobolevStepStats()
         self._validate_params()
 
@@ -100,11 +109,63 @@ class EdgeSobolevPopulationFlow(torch.optim.Optimizer):
             str(basis_key),
             k,
             exponent=float(group["sobolev_exponent"]),
-            normalization="median",
+            normalization=str(group.get("edge_weight_normalization", "median")),
+            ridge=float(group.get("edge_weight_ridge", 0.0)),
             device=param.device,
             dtype=torch.float64,
         )
         return flatten_param_mode_weights(param, mode_weights, mode_axis=axis).to(device=param.device, dtype=param.dtype)
+
+    def _functional_gram_for_param(self, param: torch.nn.Parameter, group: dict) -> tuple[torch.Tensor, torch.Tensor, float]:
+        basis_key = str(getattr(param, "_kan_basis_key", getattr(param, "_kan_basis_name", "dche_k5")))
+        k = int(getattr(param, "_kan_basis_order_or_freq_count", param.shape[-1] if param.ndim else 1))
+        cache_key = (
+            basis_key,
+            k,
+            float(group["sobolev_exponent"]),
+            int(group.get("functional_gram_quadrature_points", 257)),
+            str(group.get("edge_weight_normalization", "trace")),
+            float(group.get("edge_weight_ridge", 1.0e-6)),
+            str(param.device),
+            param.dtype,
+        )
+        cached = self._gram_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        gram = functional_edge_gram(
+            basis_key,
+            k,
+            sobolev_order=float(group["sobolev_exponent"]),
+            quadrature_points=int(group.get("functional_gram_quadrature_points", 257)),
+            normalization=str(group.get("edge_weight_normalization", "trace")),
+            ridge=float(group.get("edge_weight_ridge", 1.0e-6)),
+            device=param.device,
+            dtype=param.dtype,
+        )
+        vals, basis = torch.linalg.eigh(0.5 * (gram + gram.T))
+        eps = float(group["eps"])
+        inv_sqrt = (basis * vals.clamp_min(eps).rsqrt().reshape(1, -1)) @ basis.T
+        cond = float((vals.max().clamp_min(eps) / vals.min().clamp_min(eps)).detach().cpu().item()) if int(vals.numel()) else 1.0
+        cached = (gram, inv_sqrt, cond)
+        self._gram_cache[cache_key] = cached
+        return cached
+
+    def _apply_metric_inv_sqrt(self, tensor: torch.Tensor, param: torch.nn.Parameter, group: dict) -> torch.Tensor:
+        if str(group.get("edge_metric_type", "mode_diag")) != "functional_gram":
+            weights = self._weights_for_param(param, group).reshape_as(param).clamp_min(float(group["eps"]))
+            if tuple(tensor.shape) == tuple(param.shape):
+                return tensor / weights.sqrt()
+            return tensor / weights.reshape((1,) + tuple(param.shape)).sqrt()
+        _, inv_sqrt, _ = self._functional_gram_for_param(param, group)
+        axis = int(getattr(param, "_kan_mode_axis", -1))
+        if axis < 0:
+            axis += param.ndim
+        leading_example = int(tensor.ndim) == int(param.ndim) + 1
+        work = tensor.movedim(axis + (1 if leading_example else 0), -1)
+        orig_shape = tuple(work.shape)
+        flat = work.reshape(-1, int(inv_sqrt.shape[0]))
+        out = flat @ inv_sqrt.T.to(device=tensor.device, dtype=tensor.dtype)
+        return out.reshape(orig_shape).movedim(-1, axis + (1 if leading_example else 0))
 
     def _blocks_for_param(self, param: torch.nn.Parameter) -> list[list[int]]:
         basis_key = getattr(param, "_kan_basis_key", getattr(param, "_kan_basis_name", "dche_k5"))
@@ -120,8 +181,8 @@ class EdgeSobolevPopulationFlow(torch.optim.Optimizer):
         return blocks
 
     def _gate_from_observed(self, observed: torch.Tensor, weights: torch.Tensor, param: torch.nn.Parameter, group: dict) -> tuple[torch.Tensor, torch.Tensor]:
-        flat_weights = weights.to(device=observed.device, dtype=observed.dtype).reshape(1, -1)
-        white_obs = observed.reshape(int(observed.shape[0]), -1) / flat_weights.sqrt().clamp_min(float(group["eps"]))
+        white_tensor = self._apply_metric_inv_sqrt(observed, param, group)
+        white_obs = white_tensor.reshape(int(observed.shape[0]), -1)
         family = str(group.get("gate_family", "diagonal"))
         if family == "block":
             gres = block_snr_gate(white_obs.detach().cpu(), self._blocks_for_param(param), beta=float(group["gate_beta"]))
@@ -161,7 +222,11 @@ class EdgeSobolevPopulationFlow(torch.optim.Optimizer):
                     continue
                 grad = param.grad.detach()
                 weights = self._weights_for_param(param, group)
-                conds.append(float((weights.max() / weights.min().clamp_min(float(group["eps"]))).detach().cpu().item()))
+                if str(group.get("edge_metric_type", "mode_diag")) == "functional_gram":
+                    _, _, cond = self._functional_gram_for_param(param, group)
+                    conds.append(cond)
+                else:
+                    conds.append(float((weights.max() / weights.min().clamp_min(float(group["eps"]))).detach().cpu().item()))
                 state = self.state[param]
                 if len(state) == 0:
                     state["step"] = 0
@@ -170,8 +235,7 @@ class EdgeSobolevPopulationFlow(torch.optim.Optimizer):
                 state["step"] += 1
                 m = state["m"]
                 v = state["v"]
-                w_view = weights.reshape_as(param).clamp_min(float(group["eps"]))
-                grad_white = grad / w_view.sqrt()
+                grad_white = self._apply_metric_inv_sqrt(grad, param, group)
                 m.mul_(beta1).add_(grad_white, alpha=1.0 - beta1)
                 v.mul_(beta2).addcmul_(grad_white, grad_white, value=1.0 - beta2)
                 bias_correction1 = 1.0 - float(beta1) ** int(state["step"])
@@ -202,7 +266,7 @@ class EdgeSobolevPopulationFlow(torch.optim.Optimizer):
                                 preserved_energy.append(float(veto_summary.get("preserved_task_energy_fraction", 1.0)))
                 gate_density.append(float(gate.detach().mean().cpu().item()))
                 gate_values.append(gate.detach().reshape(-1).to(dtype=torch.float64).cpu())
-                update_raw = gate * update_white / w_view.sqrt()
+                update_raw = self._apply_metric_inv_sqrt(gate * update_white, param, group)
                 if float(group["weight_decay"]) != 0.0:
                     param.mul_(1.0 - float(group["lr"]) * float(group["weight_decay"]))
                 param.add_(update_raw, alpha=-float(group["lr"]))

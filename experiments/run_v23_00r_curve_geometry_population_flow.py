@@ -1162,11 +1162,13 @@ def data_op_drifts(model: v2293.TrueDeepPureKAN, before_mats: list[torch.Tensor]
 
 def parse_v23_scheme(scheme: str, *, safety_type: str = "") -> dict[str, Any]:
     text = str(scheme)
+    lower = text.lower()
     return {
-        "optimizer_family": "adamw" if text == "E0_AdamW_control" or "adamw_control" in text else "edge_sobolev",
-        "use_population_gate": int("snr" in text.lower() or "random" in text.lower()),
-        "gate_family": "block" if "block" in text.lower() else ("random_matched" if "random" in text.lower() else "diagonal"),
+        "optimizer_family": "adamw" if text == "E0_AdamW_control" or "adamw_control" in lower else "edge_sobolev",
+        "use_population_gate": int("snr" in lower or "random" in lower),
+        "gate_family": "block" if "block" in lower else ("random_matched" if "random" in lower else "diagonal"),
         "sobolev_exponent": scheme_sobolev_exponent(text),
+        "edge_metric_type": "functional_gram" if "functionalgram" in lower or "functional_gram" in lower else "mode_diag",
         "use_debt_veto": int("veto" in str(safety_type).lower()),
     }
 
@@ -1182,6 +1184,10 @@ def make_v23_optimizer(model: v2293.TrueDeepPureKAN, basis_key: str, scheme: str
         lr=float(args.edge_lr),
         weight_decay=float(args.weight_decay),
         sobolev_exponent=float(spec["sobolev_exponent"]),
+        edge_metric_type=str(spec["edge_metric_type"]),
+        edge_weight_normalization=str(args.edge_weight_normalization),
+        edge_weight_ridge=float(args.edge_weight_ridge),
+        functional_gram_quadrature_points=int(args.functional_gram_quadrature_points),
         gate_beta=float(args.snr_beta),
         gate_family=str(spec["gate_family"]),
         gate_floor=float(args.gate_floor),
@@ -1273,7 +1279,7 @@ def train_v23_scheme(
         "part_c_role": str(args.part_c_role),
         "forced_after_c_fail": part_c_allows_continuation(args)[1],
         "diagnostic_only": int(args.diagnostic_only),
-        "G_edge_type": "edge_sobolev_mode_diag",
+        "G_edge_type": str(spec["edge_metric_type"]),
         "snr_gate_type": spec["gate_family"] if spec["use_population_gate"] else "none",
         "sobolev_s": spec["sobolev_exponent"],
         "stat_warmup_steps": int(args.stat_warmup_steps),
@@ -1373,6 +1379,9 @@ def merge_part_e(args: argparse.Namespace) -> dict[str, Any]:
     summaries: list[dict[str, Any]] = []
     for key in sorted({(r.get("scheme"), r.get("basis_key"), r.get("depth")) for r in ok}):
         group = [r for r in ok if (r.get("scheme"), r.get("basis_key"), r.get("depth")) == key]
+        scheme_text = str(key[0])
+        scheme_lower = scheme_text.lower()
+        no_gate_scheme = scheme_text == "E0_AdamW_control" or ("snr" not in scheme_lower and "random" not in scheme_lower)
         coverage_med = median([r.get("C2_coverage_improvement") for r in group])
         accuracy_med = median([r.get("C2_accuracy_improvement") for r in group])
         rows_ge = sum(ival(r.get("visual_rows_ge_0p02")) for r in group)
@@ -1383,7 +1392,7 @@ def merge_part_e(args: argparse.Namespace) -> dict[str, Any]:
             and coverage_med >= float(args.c2_coverage_gate)
             and rows_ge >= math.ceil(float(args.c2_rows_ge_fraction) * len(group))
             and overhead <= float(args.max_overhead_ratio)
-            and (str(key[0]) in {"E0_AdamW_control", "E1_EdgeSobolev_AdamW_s0"} or 0.05 <= density <= 0.80)
+            and (no_gate_scheme or 0.05 <= density <= 0.80)
         )
         summaries.append(
             {
