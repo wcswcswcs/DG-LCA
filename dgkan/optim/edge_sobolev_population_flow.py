@@ -178,6 +178,23 @@ class EdgeSobolevPopulationFlow(torch.optim.Optimizer):
         if int(param.numel()) <= 0 or k <= 0:
             return []
         family = str((group or {}).get("gate_family", "block")).lower()
+        if "corner_checker_hybrid" in family or "cornercheckerhybrid" in family:
+            blocks = self._corner_checker_hybrid_blocks_for_param(param, group or {}, degree_bands="degree" in family)
+            if blocks:
+                return blocks
+            fallback = dict(group or {})
+            fallback["gate_family"] = "degree_edgebank" if "degree" in family else "edgebank"
+            return self._blocks_for_param(param, fallback)
+        if "visual_pattern" in family or "visualpattern" in family:
+            blocks = [
+                *self._diagonal_pattern_blocks_for_param(param, group or {}, degree_bands="degree" in family),
+                *self._checker_patch_blocks_for_param(param, group or {}, degree_bands="degree" in family),
+            ]
+            if blocks:
+                return blocks
+            fallback = dict(group or {})
+            fallback["gate_family"] = "degree_edgebank" if "degree" in family else "edgebank"
+            return self._blocks_for_param(param, fallback)
         if "checker_patch" in family or "checkerpatch" in family or "local_patch" in family or "localpatch" in family:
             blocks = self._checker_patch_blocks_for_param(param, group or {}, degree_bands="degree" in family)
             if blocks:
@@ -206,6 +223,100 @@ class EdgeSobolevPopulationFlow(torch.optim.Optimizer):
                 blocks.append(block)
         return blocks
 
+    def _edgebank_blocks_for_param(
+        self,
+        param: torch.nn.Parameter,
+        basis_key: str,
+        k: int,
+        *,
+        degree_bands: bool,
+        exclude_rows: set[int] | None = None,
+    ) -> list[list[int]]:
+        rows = max(1, int(param.numel()) // k)
+        excluded = exclude_rows or set()
+        if not degree_bands:
+            return [
+                list(range(row * k, min((row + 1) * k, int(param.numel()))))
+                for row in range(rows)
+                if row not in excluded
+            ]
+        bands = mode_band_slices(k, str(basis_key))
+        blocks: list[list[int]] = []
+        for row in range(rows):
+            if row in excluded:
+                continue
+            base = row * k
+            for mode_ids in bands.values():
+                block = [base + mode for mode in mode_ids if base + mode < int(param.numel())]
+                if block:
+                    blocks.append(block)
+        return blocks
+
+    def _corner_checker_hybrid_blocks_for_param(self, param: torch.nn.Parameter, group: dict, *, degree_bands: bool) -> list[list[int]]:
+        if int(getattr(param, "_kan_layer_id", -1)) != 0 or int(param.ndim) < 3:
+            basis_key = getattr(param, "_kan_basis_key", getattr(param, "_kan_basis_name", "dche_k5"))
+            k = int(getattr(param, "_kan_basis_order_or_freq_count", param.shape[-1] if param.ndim else 1))
+            return self._edgebank_blocks_for_param(param, str(basis_key), k, degree_bands=degree_bands)
+        corner_blocks = self._checker_patch_blocks_for_param(param, {**group, "gate_checker_anchor_mode": "corners"}, degree_bands=degree_bands)
+        if not corner_blocks:
+            return []
+        k = int(getattr(param, "_kan_basis_order_or_freq_count", param.shape[-1] if param.ndim else 1))
+        basis_key = getattr(param, "_kan_basis_key", getattr(param, "_kan_basis_name", "dche_k5"))
+        covered_rows = {int(idx) // max(1, k) for block in corner_blocks for idx in block}
+        return [
+            *corner_blocks,
+            *self._edgebank_blocks_for_param(param, str(basis_key), k, degree_bands=degree_bands, exclude_rows=covered_rows),
+        ]
+
+    def _image_edge_row_groups_for_coords(self, param: torch.nn.Parameter, group: dict, coords: Iterable[tuple[int, int]]) -> list[int]:
+        k = int(getattr(param, "_kan_basis_order_or_freq_count", param.shape[-1] if param.ndim else 1))
+        input_dim = int(param.shape[0]) if int(param.ndim) >= 1 else 0
+        side = int(group.get("gate_input_side", 0) or 0)
+        if side <= 0:
+            root = int(round(math.sqrt(max(1, input_dim))))
+            side = root if root * root == input_dim else 0
+        if side <= 0 or side * side != input_dim or k <= 0:
+            return []
+        row_count = max(1, int(param.numel()) // k)
+        rows_per_input = row_count // max(1, input_dim)
+        if rows_per_input <= 0:
+            return []
+        edge_rows: list[int] = []
+        for row, col in coords:
+            if 0 <= int(row) < side and 0 <= int(col) < side:
+                input_idx = int(row) * side + int(col)
+                start = input_idx * rows_per_input
+                edge_rows.extend(range(start, min(start + rows_per_input, row_count)))
+        return edge_rows
+
+    def _blocks_from_edge_rows(self, param: torch.nn.Parameter, group: dict, edge_rows: list[int], *, degree_bands: bool) -> list[list[int]]:
+        k = int(getattr(param, "_kan_basis_order_or_freq_count", param.shape[-1] if param.ndim else 1))
+        basis_key = getattr(param, "_kan_basis_key", getattr(param, "_kan_basis_name", "dche_k5"))
+        mode_groups = mode_band_slices(k, str(basis_key)).values() if degree_bands else [list(range(k))]
+        blocks: list[list[int]] = []
+        for mode_ids in mode_groups:
+            block = [edge_row * k + mode for edge_row in edge_rows for mode in mode_ids if edge_row * k + mode < int(param.numel())]
+            if block:
+                blocks.append(block)
+        return blocks
+
+    def _diagonal_pattern_blocks_for_param(self, param: torch.nn.Parameter, group: dict, *, degree_bands: bool) -> list[list[int]]:
+        if int(getattr(param, "_kan_layer_id", -1)) != 0 or int(param.ndim) < 3:
+            return []
+        input_dim = int(param.shape[0])
+        side = int(group.get("gate_input_side", 0) or 0)
+        if side <= 0:
+            root = int(round(math.sqrt(max(1, input_dim))))
+            side = root if root * root == input_dim else 0
+        if side <= 0 or side * side != input_dim:
+            return []
+        diag_rows = self._image_edge_row_groups_for_coords(param, group, ((idx, idx) for idx in range(side)))
+        anti_rows = self._image_edge_row_groups_for_coords(param, group, ((idx, side - 1 - idx) for idx in range(side)))
+        return [
+            *self._blocks_from_edge_rows(param, group, diag_rows, degree_bands=degree_bands),
+            *self._blocks_from_edge_rows(param, group, anti_rows, degree_bands=degree_bands),
+        ]
+
     def _checker_patch_blocks_for_param(self, param: torch.nn.Parameter, group: dict, *, degree_bands: bool) -> list[list[int]]:
         if int(getattr(param, "_kan_layer_id", -1)) != 0 or int(param.ndim) < 3:
             return []
@@ -224,7 +335,10 @@ class EdgeSobolevPopulationFlow(torch.optim.Optimizer):
         rows_per_input = row_count // max(1, input_dim)
         if rows_per_input <= 0:
             return []
-        anchors = list(range(1, max(2, side - patch_size), patch_size))
+        if str(group.get("gate_checker_anchor_mode", "")).lower() == "corners":
+            anchors = [1, side - patch_size - 1]
+        else:
+            anchors = list(range(1, max(2, side - patch_size), patch_size))
         if not anchors:
             anchors = [0]
         max_anchor = side - patch_size
@@ -239,16 +353,8 @@ class EdgeSobolevPopulationFlow(torch.optim.Optimizer):
                     ((top, left + 1), (top + 1, left)),
                 )
                 for coords in polarities:
-                    edge_rows: list[int] = []
-                    for row, col in coords:
-                        if 0 <= row < side and 0 <= col < side:
-                            input_idx = row * side + col
-                            start = input_idx * rows_per_input
-                            edge_rows.extend(range(start, min(start + rows_per_input, row_count)))
-                    for mode_ids in mode_groups:
-                        block = [edge_row * k + mode for edge_row in edge_rows for mode in mode_ids if edge_row * k + mode < int(param.numel())]
-                        if block:
-                            blocks.append(block)
+                    edge_rows = self._image_edge_row_groups_for_coords(param, group, coords)
+                    blocks.extend(self._blocks_from_edge_rows(param, group, edge_rows, degree_bands=degree_bands))
         return blocks
 
     @staticmethod
@@ -280,14 +386,14 @@ class EdgeSobolevPopulationFlow(torch.optim.Optimizer):
         base_family = self._base_family_for_random_match(family)
         block_group = dict(group)
         block_group["gate_family"] = base_family
-        if base_family == "block" or "edgebank" in base_family or "checker_patch" in base_family or "checkerpatch" in base_family or "local_patch" in base_family or "localpatch" in base_family:
+        if base_family == "block" or "edgebank" in base_family or "checker_patch" in base_family or "checkerpatch" in base_family or "local_patch" in base_family or "localpatch" in base_family or "visual_pattern" in base_family or "visualpattern" in base_family:
             blocks = self._blocks_for_param(param, block_group)
             gres = block_snr_gate(white_obs.detach().cpu(), blocks, beta=float(group["gate_beta"]))
         else:
             gres = diagonal_snr_gate(white_obs.detach().cpu(), beta=float(group["gate_beta"]))
         gate = gres.gate.to(device=param.device, dtype=param.dtype)
         if random_matched and int(gate.numel()) > 0:
-            if base_family == "block" or "edgebank" in base_family or "checker_patch" in base_family or "checkerpatch" in base_family or "local_patch" in base_family or "localpatch" in base_family:
+            if base_family == "block" or "edgebank" in base_family or "checker_patch" in base_family or "checkerpatch" in base_family or "local_patch" in base_family or "localpatch" in base_family or "visual_pattern" in base_family or "visualpattern" in base_family:
                 gate = self._permute_block_gate(gate, blocks)
             else:
                 perm = torch.randperm(int(gate.numel()), device=param.device)

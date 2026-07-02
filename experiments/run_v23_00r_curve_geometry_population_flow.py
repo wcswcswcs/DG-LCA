@@ -1414,7 +1414,13 @@ def finite_step_guarded_step(
 def parse_v23_scheme(scheme: str, *, safety_type: str = "") -> dict[str, Any]:
     text = str(scheme)
     lower = text.lower()
-    if "checkerpatch" in lower or "checker_patch" in lower or "localpatch" in lower or "local_patch" in lower:
+    if "cornercheckerhybrid" in lower or "corner_checker_hybrid" in lower:
+        base = "corner_checker_hybrid_degree_edgebank" if "degree" in lower else "corner_checker_hybrid_edgebank"
+        gate_family = f"{base}_random_matched" if "random" in lower else base
+    elif "visualpattern" in lower or "visual_pattern" in lower:
+        base = "visual_pattern_degree_edgebank" if "degree" in lower else "visual_pattern_edgebank"
+        gate_family = f"{base}_random_matched" if "random" in lower else base
+    elif "checkerpatch" in lower or "checker_patch" in lower or "localpatch" in lower or "local_patch" in lower:
         base = "checker_patch_degree_edgebank" if "degree" in lower else "checker_patch_edgebank"
         gate_family = f"{base}_random_matched" if "random" in lower else base
     elif "random" in lower:
