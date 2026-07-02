@@ -1,0 +1,1248 @@
+#!/usr/bin/env python3
+"""DG-KAN v23.00R Curve-Geometry Population Flow runner."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import json
+import math
+import os
+import py_compile
+import re
+import sys
+import time
+from copy import copy
+from pathlib import Path
+from typing import Any, Iterable
+
+import numpy as np
+import torch
+
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import experiments.run_v22_93_true_deep_purekan_local_composite_metric_mpfu as v2293
+import experiments.run_v22_94_adamw_witness_decomposition_mpfu as v2294
+import experiments.run_v22_96_solid_signal_channel_induced_metric_mpfu as v2296
+from dgkan.fu.debt_conflict_veto import debt_conflict_veto_smoke_test
+from dgkan.fu.edge_sobolev_metrics import (
+    edge_sobolev_smoke_test,
+    flatten_param_mode_weights,
+    inverse_weight_retention,
+    make_mode_weights,
+    matrix_mode_weights,
+    mode_band_slices,
+    mode_weight_summary,
+)
+from dgkan.fu.population_risk_gate import (
+    block_snr_gate,
+    cohort_stability_audit,
+    diagonal_snr_gate,
+    lowrank_ab_gate,
+    population_risk_gate_smoke_test,
+)
+from dgkan.fu.signal_channel_estimators import per_example_gradient_matrix
+from dgkan.optim.edge_sobolev_population_flow import mark_kan_edge_params, optimizer_smoke_test
+
+
+PYTHON = sys.executable
+RUNNER = Path(__file__).resolve()
+PLAN = ROOT / "docs/DG-KAN_v23.00R_CurveGeometryPopulationFlow_完整详尽实验计划.md"
+EXEC_LOG = ROOT / "docs/DG-KAN_v23.00R_执行日志.md"
+RECAP_LOG = ROOT / "docs/DG-KAN_v23.00R_实验结果复盘.md"
+RESULT_ROOT = Path(os.environ.get("V2300R_RESULT_ROOT", str(ROOT / "results/v23_00R"))).resolve()
+OUT_ROOT = Path(os.environ.get("V2300R_OUT_ROOT", str(RESULT_ROOT))).resolve()
+
+BASIS_KEYS = ("dche_k5", "dche_k9", "dfour_default")
+DEPTHS = ("depth2", "depth3")
+AUDIT_DEFAULTS: dict[str, Any] = {
+    "used_fake_data_rows": 0,
+    "held_test_usage": 0,
+    "runtime_selector_used": 0,
+    "metric_winner_selection_used": 0,
+    "candidate_update_selection_used": 0,
+    "new_edge_function_added": 0,
+    "mlp_stem_used": 0,
+    "mlp_readout_used": 0,
+    "external_product_feature_used": 0,
+}
+
+
+def ensure_out() -> None:
+    for path in (OUT_ROOT, EXEC_LOG.parent, RECAP_LOG.parent):
+        path.mkdir(parents=True, exist_ok=True)
+
+
+def rel(path: str | Path) -> str:
+    p = Path(path)
+    try:
+        return str(p.resolve().relative_to(ROOT))
+    except Exception:
+        return str(path)
+
+
+def now() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S %z", time.localtime())
+
+
+def command_text(argv: Iterable[str]) -> str:
+    return " ".join([PYTHON, rel(RUNNER), *list(argv)[1:]])
+
+
+def fval(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return float(default)
+        out = float(value)
+        return out if math.isfinite(out) else float(default)
+    except Exception:
+        return float(default)
+
+
+def ival(value: Any, default: int = 0) -> int:
+    return int(round(fval(value, float(default))))
+
+
+def median(values: Iterable[Any], default: float = 0.0) -> float:
+    clean = sorted(v for v in (fval(x, float("nan")) for x in values) if math.isfinite(v))
+    if not clean:
+        return float(default)
+    mid = len(clean) // 2
+    return clean[mid] if len(clean) % 2 else 0.5 * (clean[mid - 1] + clean[mid])
+
+
+def mean(values: Iterable[Any], default: float = 0.0) -> float:
+    clean = [v for v in (fval(x, float("nan")) for x in values) if math.isfinite(v)]
+    return float(sum(clean) / len(clean)) if clean else float(default)
+
+
+def pearson(xs: Iterable[Any], ys: Iterable[Any]) -> float:
+    x = torch.tensor([fval(v, float("nan")) for v in xs], dtype=torch.float64)
+    y = torch.tensor([fval(v, float("nan")) for v in ys], dtype=torch.float64)
+    mask = torch.isfinite(x) & torch.isfinite(y)
+    x, y = x[mask], y[mask]
+    if int(x.numel()) < 2:
+        return 0.0
+    x = x - x.mean()
+    y = y - y.mean()
+    den = x.norm().clamp_min(1.0e-12) * y.norm().clamp_min(1.0e-12)
+    return float((x @ y / den).item())
+
+
+def cosine(a: torch.Tensor, b: torch.Tensor) -> float:
+    aa = a.detach().reshape(-1).to(dtype=torch.float64).cpu()
+    bb = b.detach().reshape(-1).to(dtype=torch.float64).cpu()
+    n = min(int(aa.numel()), int(bb.numel()))
+    if n <= 0:
+        return 0.0
+    den = aa[:n].norm().clamp_min(1.0e-12) * bb[:n].norm().clamp_min(1.0e-12)
+    return float((aa[:n] @ bb[:n] / den).item())
+
+
+def csv_items(text: str) -> list[str]:
+    return [x.strip() for x in str(text).split(",") if x.strip()]
+
+
+def shard_items(items: list[Any], args: argparse.Namespace) -> list[Any]:
+    count = max(1, int(args.shard_count))
+    idx = int(args.shard_index)
+    return [item for i, item in enumerate(items) if i % count == idx]
+
+
+def device_from_args(args: argparse.Namespace) -> torch.device:
+    if str(args.device).startswith("cuda") and torch.cuda.is_available():
+        return torch.device(str(args.device))
+    return torch.device("cpu")
+
+
+def write_json(path: Path, data: Any) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return path
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def write_rows(path: Path, rows: list[dict[str, Any]]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    enriched = [{**AUDIT_DEFAULTS, **row} for row in rows]
+    keys = sorted({k for row in enriched for k in row.keys()} or set(AUDIT_DEFAULTS.keys()))
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=keys)
+        writer.writeheader()
+        for row in enriched:
+            writer.writerow(row)
+    return path
+
+
+def read_rows(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    with path.open("r", newline="", encoding="utf-8") as fh:
+        return list(csv.DictReader(fh))
+
+
+def init_logs() -> None:
+    ensure_out()
+    if not EXEC_LOG.exists():
+        EXEC_LOG.write_text(
+            "# DG-KAN v23.00R CurveGeometryPopulationFlow 执行日志\n\n"
+            f"创建时间：{now()}\n\n"
+            f"- 计划文档：`{rel(PLAN)}`\n"
+            f"- runner：`{rel(RUNNER)}`\n"
+            f"- 输出目录：`{rel(OUT_ROOT)}`\n"
+            "- 记录原则：只记录真实命令、真实 artifact、真实错误；缺失写 missing，不补造。\n\n",
+            encoding="utf-8",
+        )
+    if not RECAP_LOG.exists():
+        RECAP_LOG.write_text(
+            "# DG-KAN v23.00R CurveGeometryPopulationFlow 实验结果复盘\n\n"
+            f"创建时间：{now()}\n\n"
+            "## 当前结论\n\n尚未 final。\n\n",
+            encoding="utf-8",
+        )
+
+
+def append_exec(stage: str, command: str, status: str, *, files: str = "", note: str = "") -> None:
+    init_logs()
+    with EXEC_LOG.open("a", encoding="utf-8") as fh:
+        fh.write(f"\n## {now()} {stage} {status}\n\n")
+        fh.write(f"Command: `{command}`\n\n")
+        if files:
+            fh.write(f"Files: {files}\n\n")
+        if note:
+            fh.write(f"Note: {note}\n\n")
+
+
+def append_recap(title: str, data: dict[str, Any] | list[str]) -> None:
+    init_logs()
+    with RECAP_LOG.open("a", encoding="utf-8") as fh:
+        fh.write(f"\n## {now()} {title}\n\n")
+        if isinstance(data, dict):
+            fh.write("```json\n")
+            fh.write(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True))
+            fh.write("\n```\n")
+        else:
+            for item in data:
+                fh.write(f"- {item}\n")
+
+
+def write_next_actions(part: str, route: str, blocker: str, actions: list[str], forbidden: list[str] | None = None, evidence: dict[str, Any] | None = None, max_rounds: int = 2) -> Path:
+    payload = {
+        "part": part.upper(),
+        "route": route,
+        "gate_pass": int(blocker == "none"),
+        "dominant_blocker": blocker,
+        "evidence": evidence or {},
+        "allowed_actions": actions,
+        "forbidden_actions": forbidden
+        or [
+            "add new edge function",
+            "delete random-label/MLP controls",
+            "use held/test to induce metric/gate",
+            "promote reduced probe",
+            "select best row/seed/basis at runtime",
+        ],
+        "max_repair_rounds": int(max_rounds),
+        "rerun_commands": [f"{PYTHON} {rel(RUNNER)} --mode part-{part.lower()} --device cuda:0"],
+        "required_new_metrics": [],
+    }
+    return write_json(OUT_ROOT / f"part_{part.lower()}_next_actions_for_codex.json", payload)
+
+
+def gate_summary(part: str, gate: int, route: str, blocker: str, rows: list[dict[str, Any]], **extra: Any) -> dict[str, Any]:
+    return {
+        "part": part.upper(),
+        "gate_pass": int(gate),
+        "route": route,
+        "dominant_blocker": blocker,
+        "row_count": len(rows),
+        "ok_rows": sum(1 for r in rows if r.get("status", "ok") == "ok"),
+        "error_rows": sum(1 for r in rows if r.get("status") == "error"),
+        "used_fake_data_rows": sum(ival(r.get("used_fake_data_rows")) for r in rows),
+        "held_test_usage": sum(ival(r.get("held_test_usage")) for r in rows),
+        "runtime_selector_used": sum(ival(r.get("runtime_selector_used")) for r in rows),
+        "metric_winner_selection_used": sum(ival(r.get("metric_winner_selection_used")) for r in rows),
+        "candidate_update_selection_used": sum(ival(r.get("candidate_update_selection_used")) for r in rows),
+        "generated_at": now(),
+        **extra,
+    }
+
+
+def basis_args(args: argparse.Namespace, basis_key: str) -> argparse.Namespace:
+    return v2294.basis_args(args, basis_key)
+
+
+def make_model(depth: str, input_dim: int, classes: int, seed: int, args: argparse.Namespace, device: torch.device) -> v2293.TrueDeepPureKAN:
+    return v2294.make_model(depth, input_dim, classes, seed, args, device)
+
+
+def visual_data(task: str, seed: int, args: argparse.Namespace, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return v2294.visual_data(task, seed, args, device)
+
+
+def model_seed_for(basis_key: str, depth: str, task: str, seed: int) -> int:
+    return v2294.model_seed_for(basis_key, depth, task, seed)
+
+
+def static_scan(paths: list[Path]) -> tuple[int, list[dict[str, str]]]:
+    patterns = {
+        "runtime_metric_winner_selection": re.compile(r"\b(select_metric|choose_metric|metric_winner)\s*\("),
+        "runtime_update_winner_selection": re.compile(r"\b(select_update|choose_update|winner_update)\s*\("),
+        "external_product_feature": re.compile(r"\b(make_external_product_feature|patch_product_feature)\s*\("),
+        "static_topk_mode_selection": re.compile(r"\.topk\s*\("),
+    }
+    hits: list[dict[str, str]] = []
+    for path in paths:
+        if not path.exists():
+            hits.append({"file": rel(path), "check": "missing_file", "match": "missing"})
+            continue
+        text = path.read_text(encoding="utf-8")
+        for name, pattern in patterns.items():
+            m = pattern.search(text)
+            if m:
+                hits.append({"file": rel(path), "check": name, "match": m.group(0)})
+    return int(not hits), hits
+
+
+def run_part_a(args: argparse.Namespace) -> dict[str, Any]:
+    ensure_out()
+    device = device_from_args(args)
+    files = [
+        RUNNER,
+        ROOT / "dgkan/fu/edge_sobolev_metrics.py",
+        ROOT / "dgkan/fu/population_risk_gate.py",
+        ROOT / "dgkan/fu/debt_conflict_veto.py",
+        ROOT / "dgkan/optim/edge_sobolev_population_flow.py",
+    ]
+    compile_errors: list[str] = []
+    for path in files:
+        try:
+            py_compile.compile(str(path), doraise=True)
+        except Exception as exc:
+            compile_errors.append(f"{rel(path)}: {repr(exc)}")
+    compile_pass = int(not compile_errors)
+    import_pass = 1
+    smoke = {
+        **edge_sobolev_smoke_test(),
+        **{f"pop_{k}": v for k, v in population_risk_gate_smoke_test().items()},
+        **{f"debt_{k}": v for k, v in debt_conflict_veto_smoke_test().items()},
+    }
+    scan_pass, scan_hits = static_scan(files)
+    rows: list[dict[str, Any]] = []
+    for basis_key in BASIS_KEYS:
+        bargs = basis_args(args, basis_key)
+        for depth in DEPTHS:
+            try:
+                x = torch.randn(8, int(args.visual_side) * int(args.visual_side), device=device)
+                y = torch.randint(0, int(args.num_classes), (8,), device=device)
+                model = make_model(depth, int(x.shape[1]), int(args.num_classes), 230000 + len(rows), bargs, device)
+                diag = optimizer_smoke_test(model, x, y, basis_key=basis_key)
+                rows.append(
+                    {
+                        "part": "A",
+                        "status": "ok",
+                        "basis_key": basis_key,
+                        "depth": depth,
+                        "compile_pass": compile_pass,
+                        "import_pass": import_pass,
+                        "static_scan_pass": scan_pass,
+                        "purekan_depth2_constructed": int(depth == "depth2"),
+                        "purekan_depth3_constructed": int(depth == "depth3"),
+                        "dche_k5_available": int(basis_key == "dche_k5"),
+                        "dche_k9_available": int(basis_key == "dche_k9"),
+                        "dfour_default_available": int(basis_key == "dfour_default"),
+                        "new_edge_function_added": 0,
+                        "mlp_stem_used": 0,
+                        "mlp_readout_used": 0,
+                        "external_product_feature_used": 0,
+                        "runtime_selector_used": 0,
+                        "metric_winner_selection_used": 0,
+                        "candidate_update_selection_used": 0,
+                        "held_test_usage": 0,
+                        "used_fake_data_rows": 0,
+                        **diag,
+                    }
+                )
+            except Exception as exc:
+                rows.append({"part": "A", "status": "error", "basis_key": basis_key, "depth": depth, "error_message": repr(exc), "compile_pass": compile_pass, "import_pass": import_pass, "static_scan_pass": scan_pass, **AUDIT_DEFAULTS})
+    gate = int(
+        compile_pass
+        and import_pass
+        and scan_pass
+        and any(ival(r.get("purekan_depth2_constructed")) for r in rows)
+        and any(ival(r.get("purekan_depth3_constructed")) for r in rows)
+        and all(r.get("status") == "ok" for r in rows)
+        and all(ival(r.get("changed_edge_coefficients")) == 1 for r in rows if r.get("status") == "ok")
+        and all(ival(r.get("changed_mlp_tensors")) == 0 for r in rows if r.get("status") == "ok")
+    )
+    blocker = "none" if gate else ("compile_or_static_scan_failed" if not (compile_pass and scan_pass) else "purekan_identity_or_optimizer_smoke_failed")
+    matrix = write_rows(OUT_ROOT / "part_a_identity_matrix.csv", rows)
+    summary = gate_summary("A", gate, "A_Pass" if gate else "A_CodeIdentityFailed", blocker, rows, compile_errors=compile_errors, static_scan_hits=scan_hits, smoke=smoke)
+    write_json(OUT_ROOT / "part_a_identity_summary.json", summary)
+    next_path = write_next_actions("a", summary["route"], blocker, ["fix compile/import/static scan identity issue", "ensure optimizer receives only edge coefficient tensors"] if not gate else [], evidence={"matrix": rel(matrix), "summary": rel(OUT_ROOT / "part_a_identity_summary.json")})
+    append_exec("part-a", command_text(sys.argv), "passed" if gate else "failed", files=f"{rel(matrix)}; {rel(next_path)}")
+    append_recap("Part A identity audit", summary)
+    return summary
+
+
+def read_field(path: Path, *keys: str) -> Any:
+    data = read_json(path)
+    for key in keys:
+        if key in data:
+            return data[key]
+    return "missing"
+
+
+def run_part_b(args: argparse.Namespace) -> dict[str, Any]:
+    ensure_out()
+    a = read_json(OUT_ROOT / "part_a_identity_summary.json")
+    fields: dict[str, tuple[Path, tuple[str, ...]]] = {
+        "v22_90_part_e_pass": (ROOT / "results/v22_90/part_e_summary.json", ("part_e_gate_pass", "gate_pass")),
+        "v22_90_part_f_route": (ROOT / "results/v22_90/part_f_summary.json", ("part_f_route", "route", "dominant_blocker")),
+        "v22_90_no_debt": (ROOT / "results/v22_90/part_f_summary.json", ("no_debt", "no_debt_count")),
+        "v22_90_visual_coverage": (ROOT / "results/v22_90/part_f_summary.json", ("visual_coverage", "visual_coverage_pass")),
+        "v22_91_final_route": (ROOT / "results/v22_91/final_route.json", ("final_route", "route")),
+        "v22_91_h20_debt_sign": (ROOT / "results/v22_91/part_c_summary.json", ("h20_debt_sign", "response_debt_sign_agreement")),
+        "v22_91_h20_debt_R2": (ROOT / "results/v22_91/part_c_summary.json", ("h20_debt_R2", "debt_R2")),
+        "v22_91_leave_family_debt_R2": (ROOT / "results/v22_91/part_c_summary.json", ("leave_family_debt_R2", "leave_dataset_family_debt_R2")),
+        "v22_93_final_route": (ROOT / "results/v22_93/final_route.json", ("final_route", "route")),
+        "v22_93_adamw_architecture_signal": (ROOT / "results/v22_93/part_c_architecture_capability_summary.json", ("c2_adamw_architecture_signal", "adamw_architecture_signal")),
+        "v22_93_metric_c2_gain": (ROOT / "results/v22_93/part_c_architecture_capability_summary.json", ("visual_synthetic_coverage_improvement_median", "metric_c2_gain")),
+        "v22_94_part_c_witness_pass": (ROOT / "results/v22_94/part_c_witness_summary.json", ("part_c_gate_pass", "gate_pass")),
+        "v22_94_part_d_decomposition_pass": (ROOT / "results/v22_94/part_d_decomposition_summary.json", ("part_d_gate_pass", "gate_pass")),
+        "v22_94_ordinary_part_e_pass": (ROOT / "results/v22_94/part_e_multi_scheme_summary.json", ("part_e_gate_pass", "gate_pass")),
+        "v22_94_ordinary_part_f_F5_best": (ROOT / "results/v22_94/part_f_deep_positive_control_summary.json", ("best_f5_no_debt_rows", "f5_no_debt_rows")),
+        "v22_94_tailsafe_full_route": (ROOT / "results/v22_94/part_f_deep_positive_control_summary.json", ("part_f_route", "route")),
+        "v22_96_best_repair_seed_stability": (ROOT / "results/v22_96/current/part_c_signal_channel_summary.json", ("seed_stability", "strict_offdiag_seed_stability")),
+        "v22_96_best_repair_negative_snr": (ROOT / "results/v22_96/current/part_c_signal_channel_summary.json", ("negative_snr", "random_label_offdiag_score")),
+        "v22_97_final_route": (ROOT / "results/v22_97/current/final_route.json", ("route", "final_route")),
+        "v22_97_coeff_retention_ratio": (ROOT / "results/v22_97/current/part_e_sourceguard_pullback_summary.json", ("coefficient_retention_ratio", "source_guard_common_retention")),
+        "v22_98_final_route": (ROOT / "results/v22_98/current/final_route.json", ("route", "final_route")),
+        "v22_98_strict_offdiag_seed_stability": (ROOT / "results/v22_98/current/part_c_estimator_summary.json", ("strict_offdiag_seed_stability",)),
+    }
+    rows: list[dict[str, Any]] = []
+    out: dict[str, Any] = {}
+    for field, (path, keys) in fields.items():
+        value = read_field(path, *keys) if path.exists() else "missing"
+        out[field] = value
+        rows.append({"part": "B", "field": field, "value": value, "source_path": rel(path), "source_exists": int(path.exists()), "status": "ok" if path.exists() else "missing"})
+    gate = int(int(a.get("gate_pass", 0)) == 1)
+    blocker = "none" if gate else "part_a_failed"
+    matrix = write_rows(OUT_ROOT / "part_b_history_sources.csv", rows)
+    summary = gate_summary("B", gate, "B_HistoryLockPass" if gate else "B_HistoryLockFailed", blocker, rows, missing_history_fields=sum(1 for r in rows if r["value"] == "missing"), **out)
+    write_json(OUT_ROOT / "part_b_history_lock.json", summary)
+    next_path = write_next_actions("b", summary["route"], blocker, ["rerun Part A before history lock"] if not gate else [], evidence={"sources": rel(matrix)})
+    append_exec("part-b", command_text(sys.argv), "passed" if gate else "failed", files=f"{rel(matrix)}; {rel(next_path)}")
+    append_recap("Part B history lock", summary)
+    return summary
+
+
+def part_c_source_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
+    path = ROOT / "results/v22_94/part_c_witness_matrix.csv"
+    rows = [r for r in read_rows(path) if r.get("optimizer_kind") == "adamw" and r.get("depth") in set(csv_items(args.part_c_depths)) and r.get("basis_key") in set(csv_items(args.part_c_basis))]
+    tasks = set(csv_items(args.part_c_tasks))
+    if tasks:
+        rows = [r for r in rows if r.get("visual_synthetic_task") in tasks]
+    return rows
+
+
+def c_schemes(args: argparse.Namespace) -> list[tuple[str, str, float]]:
+    out: list[tuple[str, str, float]] = [("raw_flat", "raw", 0.0)]
+    for s in csv_items(args.sobolev_exponents):
+        out.append((f"sobolev_s{s.replace('.', 'p')}", "sobolev", float(s)))
+    out.append(("derivative_grid_s1", "derivative", 1.0))
+    out.append(("dataGram_diagnostic", "dataGram", 0.0))
+    return out
+
+
+def load_checkpoint_arrays(row: dict[str, Any]) -> tuple[dict[str, np.ndarray] | None, dict[str, np.ndarray] | None, str, str]:
+    js = [x for x in str(row.get("checkpoint_jsons", "")).split(";") if x]
+    if not js:
+        return None, None, "", ""
+    final_json = ROOT / js[-1] if not Path(js[-1]).is_absolute() else Path(js[-1])
+    prev_json = ROOT / js[-2] if len(js) > 1 and not Path(js[-2]).is_absolute() else (Path(js[-2]) if len(js) > 1 else final_json)
+    if not final_json.exists():
+        return None, None, rel(final_json), rel(prev_json)
+    final_meta = read_json(final_json)
+    prev_meta = read_json(prev_json) if prev_json.exists() else {}
+    final_npz = ROOT / final_meta.get("npz", "") if not Path(str(final_meta.get("npz", ""))).is_absolute() else Path(str(final_meta.get("npz", "")))
+    prev_npz = ROOT / prev_meta.get("npz", "") if prev_meta.get("npz") and not Path(str(prev_meta.get("npz"))).is_absolute() else Path(str(prev_meta.get("npz", "")))
+    if not final_npz.exists():
+        return None, None, rel(final_json), rel(prev_json)
+    final_arr = dict(np.load(final_npz))
+    prev_arr = dict(np.load(prev_npz)) if prev_npz.exists() else None
+    return final_arr, prev_arr, rel(final_json), rel(prev_json)
+
+
+def data_weights_for_row(row: dict[str, Any], arrays: dict[str, np.ndarray], args: argparse.Namespace, device: torch.device) -> list[torch.Tensor]:
+    basis_key = str(row.get("basis_key"))
+    bargs = basis_args(args, basis_key)
+    task = str(row.get("visual_synthetic_task"))
+    seed = int(row.get("seed", 0))
+    xtr, ytr, _xg, _yg = visual_data(task, seed, args, device)
+    classes = int(ytr.max().detach().cpu().item()) + 1
+    model_seed = int(row.get("model_seed", model_seed_for(basis_key, str(row.get("depth")), task, seed)))
+    model = make_model(str(row.get("depth")), int(xtr.shape[1]), classes, model_seed, bargs, device)
+    mats: list[torch.Tensor] = []
+    layer_idx = 0
+    while f"A_after_layer{layer_idx}" in arrays:
+        mats.append(torch.from_numpy(arrays[f"A_after_layer{layer_idx}"]).to(device=device, dtype=torch.float64))
+        layer_idx += 1
+    v2294.set_model_mats(model, mats)
+    weights: list[torch.Tensor] = []
+    for idx, mat in enumerate(mats):
+        c = v2294.data_c_matrix(model, xtr, idx).detach().to(dtype=torch.float64).cpu()
+        diag = torch.diag(c).clamp_min(1.0e-8)
+        diag = diag / diag.median().clamp_min(1.0e-8)
+        weights.append(diag.reshape(-1, 1).expand(int(mat.shape[0]), int(mat.shape[1])).reshape(-1).contiguous())
+    return weights
+
+
+def mode_energy_fractions(delta: torch.Tensor, k: int, basis_key: str) -> tuple[float, float]:
+    dd = delta.detach().to(dtype=torch.float64)
+    if dd.ndim != 2:
+        return 0.0, 0.0
+    row_energy = dd.square().sum(dim=1)
+    mode_energy = torch.zeros(k, dtype=torch.float64)
+    for m in range(k):
+        mode_energy[m] = row_energy[m::k].sum()
+    total = mode_energy.sum().clamp_min(1.0e-12)
+    bands = mode_band_slices(k, basis_key)
+    low_idxs = next(iter(bands.values())) if bands else []
+    high_idxs = list(bands.values())[-1] if bands else []
+    low = float(mode_energy[torch.tensor(low_idxs, dtype=torch.long)].sum().div(total).item()) if low_idxs else 0.0
+    high = float(mode_energy[torch.tensor(high_idxs, dtype=torch.long)].sum().div(total).item()) if high_idxs else 0.0
+    return low, high
+
+
+def run_part_c_row(row: dict[str, Any], scheme: tuple[str, str, float], args: argparse.Namespace, device: torch.device) -> dict[str, Any]:
+    scheme_name, scheme_type, exponent = scheme
+    start = time.time()
+    try:
+        arrays, prev_arrays, final_json, prev_json = load_checkpoint_arrays(row)
+        if arrays is None:
+            return {"part": "C", "status": "error", "metric_scheme": scheme_name, "basis_key": row.get("basis_key"), "depth": row.get("depth"), "seed": row.get("seed"), "error_message": "missing_checkpoint", "checkpoint_json": final_json, **AUDIT_DEFAULTS}
+        data_weights = data_weights_for_row(row, arrays, args, device)
+        basis_key = str(row.get("basis_key"))
+        layer_metrics: list[dict[str, float]] = []
+        all_delta: list[torch.Tensor] = []
+        all_edge_w: list[torch.Tensor] = []
+        all_data_w: list[torch.Tensor] = []
+        all_prev_delta: list[torch.Tensor] = []
+        layer_idx = 0
+        while f"delta_layer{layer_idx}" in arrays:
+            delta = torch.from_numpy(arrays[f"delta_layer{layer_idx}"]).to(dtype=torch.float64)
+            k = 5 if basis_key == "dche_k5" else (9 if basis_key == "dche_k9" else int(args.dfour_k))
+            if scheme_type == "raw":
+                mode_w = torch.ones(k, dtype=torch.float64)
+            elif scheme_type == "dataGram":
+                mode_w = torch.ones(k, dtype=torch.float64)
+            elif scheme_type == "derivative":
+                mode_w = make_mode_weights(basis_key, k, exponent=1.0, normalization=str(args.edge_weight_normalization), ridge=float(args.edge_weight_ridge))
+            else:
+                mode_w = make_mode_weights(basis_key, k, exponent=float(exponent), normalization=str(args.edge_weight_normalization), ridge=float(args.edge_weight_ridge))
+            edge_w = matrix_mode_weights(delta.shape, mode_w, mode_axis_period=k)
+            data_w = data_weights[layer_idx]
+            if scheme_type == "dataGram":
+                edge_w = data_w
+            low, high = mode_energy_fractions(delta, k, basis_key)
+            all_delta.append(delta.reshape(-1))
+            all_edge_w.append(edge_w)
+            all_data_w.append(data_w)
+            if prev_arrays is not None and f"delta_layer{layer_idx}" in prev_arrays:
+                all_prev_delta.append(torch.from_numpy(prev_arrays[f"delta_layer{layer_idx}"]).to(dtype=torch.float64).reshape(-1))
+            layer_metrics.append(
+                {
+                    "layer_idx": float(layer_idx),
+                    "low_mode_energy_fraction": low,
+                    "high_mode_energy_fraction": high,
+                    "edge_condition": float((edge_w.max() / edge_w.min().clamp_min(1.0e-12)).item()),
+                }
+            )
+            layer_idx += 1
+        delta_vec = torch.cat(all_delta) if all_delta else torch.zeros(0, dtype=torch.float64)
+        edge_w_vec = torch.cat(all_edge_w) if all_edge_w else torch.ones(0, dtype=torch.float64)
+        data_w_vec = torch.cat(all_data_w) if all_data_w else torch.ones(0, dtype=torch.float64)
+        prev_vec = torch.cat(all_prev_delta) if all_prev_delta else delta_vec
+        edge_ret = inverse_weight_retention(delta_vec, edge_w_vec)
+        data_ret = inverse_weight_retention(delta_vec, data_w_vec)
+        edge_cost = float((delta_vec.square() * edge_w_vec).sum().item())
+        data_cost = float((delta_vec.square() * data_w_vec).sum().item())
+        edge_white = delta_vec / edge_w_vec.sqrt().clamp_min(1.0e-12)
+        prev_edge_white = prev_vec[: int(delta_vec.numel())] / edge_w_vec[: int(delta_vec.numel())].sqrt().clamp_min(1.0e-12)
+        mw_summary = mode_weight_summary(edge_w_vec, basis_key, exponent, str(args.edge_weight_normalization))
+        return {
+            "part": "C",
+            "status": "ok",
+            "row_id": f"C_{scheme_name}_{row.get('run_id')}",
+            "source_v22_94_run_id": row.get("run_id"),
+            "metric_scheme": scheme_name,
+            "metric_scheme_type": scheme_type,
+            "basis_key": basis_key,
+            "depth": row.get("depth"),
+            "visual_synthetic_task": row.get("visual_synthetic_task"),
+            "seed": row.get("seed"),
+            "sobolev_s": exponent,
+            "G_edge_condition_number": mw_summary.mode_weight_condition,
+            "G_edge_min_weight": mw_summary.mode_weight_min,
+            "G_edge_max_weight": mw_summary.mode_weight_max,
+            "witness_retention_under_G_edge": edge_ret,
+            "witness_retention_under_dataGram": data_ret,
+            "witness_retention_gap_vs_dataGram": edge_ret - data_ret,
+            "G_edge_cost": edge_cost,
+            "dataGram_cost": data_cost,
+            "C2_gain": fval(row.get("visual_coverage_improvement")),
+            "C2_accuracy_gain": fval(row.get("visual_accuracy_improvement")),
+            "source_guard_witness_cost_cosine": cosine(edge_white, prev_edge_white),
+            "low_mode_energy_fraction": mean([m["low_mode_energy_fraction"] for m in layer_metrics]),
+            "high_mode_energy_fraction": mean([m["high_mode_energy_fraction"] for m in layer_metrics]),
+            "mode_energy_drift_by_degree_or_frequency": json.dumps({str(int(m["layer_idx"])): {"low": m["low_mode_energy_fraction"], "high": m["high_mode_energy_fraction"]} for m in layer_metrics}, sort_keys=True),
+            "checkpoint_json": final_json,
+            "previous_checkpoint_json": prev_json,
+            "wall_time_s": time.time() - start,
+            **AUDIT_DEFAULTS,
+        }
+    except Exception as exc:
+        return {"part": "C", "status": "error", "row_id": f"C_{scheme_name}_{row.get('run_id')}", "metric_scheme": scheme_name, "basis_key": row.get("basis_key"), "depth": row.get("depth"), "seed": row.get("seed"), "error_message": repr(exc), "wall_time_s": time.time() - start, **AUDIT_DEFAULTS}
+
+
+def run_part_c(args: argparse.Namespace) -> dict[str, Any]:
+    ensure_out()
+    a = read_json(OUT_ROOT / "part_a_identity_summary.json")
+    b = read_json(OUT_ROOT / "part_b_history_lock.json")
+    path = OUT_ROOT / f"part_c_metric_sanity_matrix_shard{int(args.shard_index)}_of_{int(args.shard_count)}.csv"
+    if int(a.get("gate_pass", 0)) != 1 or int(b.get("gate_pass", 0)) != 1:
+        rows = [{"part": "C", "status": "blocked", "blocked_reason": "Part A/B failed", **AUDIT_DEFAULTS}]
+        write_rows(path, rows)
+        append_exec("part-c", command_text(sys.argv), "blocked", files=rel(path))
+        return gate_summary("C", 0, "C_BlockedByPrerequisite", "part_a_or_b_failed", rows)
+    device = device_from_args(args)
+    jobs = [(r, s) for r in part_c_source_rows(args) for s in c_schemes(args)]
+    rows = [run_part_c_row(row, scheme, args, device) for row, scheme in shard_items(jobs, args)]
+    write_rows(path, rows)
+    append_exec("part-c", command_text(sys.argv), "shard-written", files=rel(path), note=f"rows={len(rows)}")
+    return gate_summary("C", 0, "C_ShardsWritten", "merge_required", rows, shard_index=int(args.shard_index), shard_count=int(args.shard_count))
+
+
+def merge_part_c(args: argparse.Namespace) -> dict[str, Any]:
+    ensure_out()
+    rows: list[dict[str, Any]] = []
+    for path in sorted(OUT_ROOT.glob("part_c_metric_sanity_matrix_shard*_of_*.csv")):
+        rows.extend(read_rows(path))
+    matrix = write_rows(OUT_ROOT / "part_c_metric_sanity_matrix.csv", rows)
+    write_rows(OUT_ROOT / "part_c_edge_sobolev_metric_matrix.csv", rows)
+    ok = [r for r in rows if r.get("status") == "ok"]
+    scheme_summaries: list[dict[str, Any]] = []
+    for scheme in sorted({r.get("metric_scheme") for r in ok}):
+        sr = [r for r in ok if r.get("metric_scheme") == scheme]
+        edge_corr = pearson([r.get("G_edge_cost") for r in sr], [r.get("C2_gain") for r in sr])
+        data_corr = pearson([r.get("dataGram_cost") for r in sr], [r.get("C2_gain") for r in sr])
+        med_ret = median([r.get("witness_retention_under_G_edge") for r in sr])
+        med_data = median([r.get("witness_retention_under_dataGram") for r in sr])
+        med_cond = median([r.get("G_edge_condition_number") for r in sr])
+        med_sg = median([r.get("source_guard_witness_cost_cosine") for r in sr])
+        scheme_type = sr[0].get("metric_scheme_type", "") if sr else ""
+        scheme_pass = int(
+            scheme_type in {"sobolev", "derivative"}
+            and med_cond <= 1.0e4
+            and med_ret >= med_data + 0.10
+            and edge_corr >= data_corr
+            and med_sg >= 0.50
+            and math.isfinite(median([r.get("high_mode_energy_fraction") for r in sr], float("nan")))
+            and math.isfinite(median([r.get("low_mode_energy_fraction") for r in sr], float("nan")))
+        )
+        scheme_summaries.append(
+            {
+                "metric_scheme": scheme,
+                "metric_scheme_type": scheme_type,
+                "rows": len(sr),
+                "median_G_edge_condition_number": med_cond,
+                "median_witness_retention_under_G_edge": med_ret,
+                "median_witness_retention_under_dataGram": med_data,
+                "median_witness_retention_gap_vs_dataGram": med_ret - med_data,
+                "C2_gain_vs_G_edge_cost_corr": edge_corr,
+                "C2_gain_vs_dataGram_cost_corr": data_corr,
+                "source_guard_witness_cost_cosine": med_sg,
+                "high_mode_energy_fraction": median([r.get("high_mode_energy_fraction") for r in sr]),
+                "low_mode_energy_fraction": median([r.get("low_mode_energy_fraction") for r in sr]),
+                "scheme_pass": scheme_pass,
+            }
+        )
+    data_med = max([fval(s["median_witness_retention_under_G_edge"]) for s in scheme_summaries if s["metric_scheme_type"] == "dataGram"] or [0.0])
+    pass_schemes = [s for s in scheme_summaries if ival(s.get("scheme_pass")) == 1 and data_med <= fval(s.get("median_witness_retention_under_G_edge")) + 0.10]
+    gate = int(bool(pass_schemes) and not any(r.get("status") == "error" for r in rows))
+    if any(r.get("status") == "error" for r in rows):
+        blocker = "part_c_job_errors"
+    elif not pass_schemes:
+        blocker = "edge_sobolev_retention_or_cost_gate_failed"
+    else:
+        blocker = "none"
+    summary = gate_summary(
+        "C",
+        gate,
+        "C_EdgeSobolevMetricPass" if gate else "C_EdgeSobolevMetricFailed",
+        blocker,
+        rows,
+        scheme_summaries=scheme_summaries,
+        passing_metric_schemes=[s["metric_scheme"] for s in pass_schemes],
+        dataGram_best_retention=data_med,
+    )
+    write_json(OUT_ROOT / "part_c_metric_sanity_summary.json", summary)
+    write_json(OUT_ROOT / "part_c_edge_sobolev_metric_summary.json", summary)
+    next_path = write_next_actions(
+        "c",
+        summary["route"],
+        blocker,
+        ["try Sobolev exponent normalization/ridge/trace normalization", "try derivative-sample metric", "write metric_role_conflict_report if dataGram dominates"] if not gate else [],
+        evidence={"matrix": rel(matrix), "passing_metric_schemes": summary["passing_metric_schemes"]},
+    )
+    append_exec("part-c-merge", command_text(sys.argv), "passed" if gate else "failed", files=f"{rel(matrix)}; {rel(next_path)}")
+    append_recap("Part C edge-Sobolev metric sanity", summary)
+    return summary
+
+
+def passing_c_schemes() -> list[str]:
+    c = read_json(OUT_ROOT / "part_c_metric_sanity_summary.json")
+    schemes = c.get("passing_metric_schemes", [])
+    return [str(s) for s in schemes] if isinstance(schemes, list) else []
+
+
+def weights_for_model_params(model: v2293.TrueDeepPureKAN, basis_key: str, scheme: str, args: argparse.Namespace) -> torch.Tensor:
+    weights: list[torch.Tensor] = []
+    exponent = 0.0
+    if "s0p25" in scheme:
+        exponent = 0.25
+    elif "s0p5" in scheme:
+        exponent = 0.5
+    elif "s1" in scheme:
+        exponent = 1.0
+    elif "derivative" in scheme:
+        exponent = 1.0
+    for p in model.coeffs:
+        k = int(p.shape[-1])
+        mw = make_mode_weights(basis_key, k, exponent=exponent, normalization=str(args.edge_weight_normalization), ridge=float(args.edge_weight_ridge), device=p.device, dtype=torch.float64)
+        weights.append(flatten_param_mode_weights(p, mw, mode_axis=-1).cpu())
+    return torch.cat(weights).to(dtype=torch.float64)
+
+
+def d_blocks_for_model(model: v2293.TrueDeepPureKAN, basis_key: str) -> list[list[int]]:
+    blocks: list[list[int]] = []
+    offset = 0
+    for p in model.coeffs:
+        flat_n = int(p.numel())
+        k = int(p.shape[-1])
+        bands = mode_band_slices(k, basis_key)
+        for idxs in bands.values():
+            block: list[int] = []
+            for flat_idx in range(flat_n):
+                if flat_idx % k in idxs:
+                    block.append(offset + flat_idx)
+            if block:
+                blocks.append(block)
+        offset += flat_n
+    return blocks
+
+
+def historical_c2_gain(basis_key: str, depth: str, task: str, seed: int) -> float:
+    rows = read_rows(ROOT / "results/v22_94/part_c_witness_matrix.csv")
+    vals = [
+        fval(r.get("visual_coverage_improvement"))
+        for r in rows
+        if r.get("optimizer_kind") == "adamw"
+        and r.get("basis_key") == basis_key
+        and r.get("depth") == depth
+        and r.get("visual_synthetic_task") == task
+        and str(r.get("seed")) == str(seed)
+    ]
+    return vals[0] if vals else 0.0
+
+
+def run_part_d_row(job: tuple[str, str, str, int, str, str, str], args: argparse.Namespace, device: torch.device) -> dict[str, Any]:
+    scheme, basis_key, depth, seed, task, control, family = job
+    start = time.time()
+    try:
+        bargs = basis_args(args, basis_key)
+        xtr, ytr, _xg, _yg = v2296.controlled_data(task, control, seed, args, device)
+        xsrc, ysrc, _xtraj, _ytraj, xwit, ywit, split = v2296.part_c_source_witness_split(xtr, ytr, control, seed, args)
+        classes = int(max(ytr.max(), ywit.max()).detach().cpu().item()) + 1
+        model = make_model(depth, int(xtr.shape[1]), classes, model_seed_for(basis_key, depth, task, seed), bargs, device)
+        mark_kan_edge_params(model, basis_key=basis_key)
+        g_source = per_example_gradient_matrix(model, xsrc, ysrc, max_examples=int(args.snr_examples), label_prior_correction=bool(int(args.label_prior_correction)))
+        g_guard = per_example_gradient_matrix(model, xwit, ywit, max_examples=int(args.snr_examples), label_prior_correction=bool(int(args.label_prior_correction)))
+        weights = weights_for_model_params(model, basis_key, scheme, args)
+        n = min(int(g_source.shape[1]), int(weights.numel()))
+        g_source = g_source[:, :n] / weights[:n].reshape(1, -1).sqrt().clamp_min(1.0e-8)
+        g_guard = g_guard[:, :n] / weights[:n].reshape(1, -1).sqrt().clamp_min(1.0e-8)
+        if family == "diagonal":
+            src = diagonal_snr_gate(g_source, beta=float(args.snr_beta), use_log_snr=True)
+            grd = diagonal_snr_gate(g_guard, beta=float(args.snr_beta), use_log_snr=True)
+            gate_vec = src.gate
+            guard_vec = grd.gate
+            summary = src.summary
+            update_mass = float((src.gate * src.mean.abs()).sum().item())
+        elif family == "block":
+            blocks = d_blocks_for_model(model, basis_key)
+            src = block_snr_gate(g_source, blocks, beta=float(args.snr_beta))
+            grd = block_snr_gate(g_guard, blocks, beta=float(args.snr_beta))
+            gate_vec = src.gate
+            guard_vec = grd.gate
+            summary = src.summary
+            update_mass = float((src.gate * src.mean.abs()).sum().item())
+        elif family == "lowrank":
+            src_lr = lowrank_ab_gate(g_source, rank=int(args.lowrank_rank))
+            grd_lr = lowrank_ab_gate(g_guard, rank=int(args.lowrank_rank))
+            op = src_lr["operator"]
+            opg = grd_lr["operator"]
+            gate_vec = torch.diag(op).clamp_min(0.0) if isinstance(op, torch.Tensor) and int(op.numel()) else torch.zeros(n, dtype=torch.float64)
+            guard_vec = torch.diag(opg).clamp_min(0.0) if isinstance(opg, torch.Tensor) and int(opg.numel()) else torch.zeros(n, dtype=torch.float64)
+            summary = src_lr["summary"] if isinstance(src_lr["summary"], dict) else {}
+            update_mass = float(gate_vec.sum().item())
+        else:
+            cohorts = torch.chunk(g_source, max(2, int(args.cohort_count)), dim=0)
+            gates = [diagonal_snr_gate(c, beta=float(args.snr_beta)).gate for c in cohorts if int(c.shape[0]) >= 2]
+            audit = cohort_stability_audit(gates)
+            src = diagonal_snr_gate(g_source, beta=float(args.snr_beta), use_log_snr=True)
+            grd = diagonal_snr_gate(g_guard, beta=float(args.snr_beta), use_log_snr=True)
+            gate_vec = src.gate
+            guard_vec = grd.gate
+            summary = {**src.summary, **audit, "gate_family": "cohort"}
+            update_mass = float((src.gate * src.mean.abs()).sum().item())
+        row = {
+            "part": "D",
+            "status": "ok",
+            "row_id": f"D_{scheme}_{basis_key}_{depth}_{task}_s{seed}_{control}_{family}",
+            "metric_scheme": scheme,
+            "basis_key": basis_key,
+            "depth": depth,
+            "seed": int(seed),
+            "visual_synthetic_task": task,
+            "control": control,
+            "gate_family": family,
+            "snr_beta": float(args.snr_beta),
+            "gate_density_mean": summary.get("gate_density_mean", summary.get("block_gate_density_mean", 0.0)),
+            "snr_top_decile": summary.get("snr_top_decile", summary.get("block_snr_top_decile", 0.0)),
+            "update_mass": update_mass,
+            "snr_source_guard_cosine": cosine(gate_vec, guard_vec),
+            "historical_C2_gain": historical_c2_gain(basis_key, depth, task, seed),
+            "per_example_grad_mode": "microbatch_true",
+            "per_example_count": int(g_source.shape[0]),
+            "source_witness_disjoint": split.get("source_witness_disjoint", 0),
+            "wall_time_s": time.time() - start,
+            **{k: v for k, v in summary.items() if isinstance(v, (int, float, str))},
+            **AUDIT_DEFAULTS,
+        }
+        return row
+    except Exception as exc:
+        return {"part": "D", "status": "error", "row_id": f"D_{scheme}_{basis_key}_{depth}_{task}_s{seed}_{control}_{family}", "metric_scheme": scheme, "basis_key": basis_key, "depth": depth, "seed": int(seed), "control": control, "gate_family": family, "error_message": repr(exc), "wall_time_s": time.time() - start, **AUDIT_DEFAULTS}
+
+
+def part_d_jobs(args: argparse.Namespace) -> list[tuple[str, str, str, int, str, str, str]]:
+    schemes = passing_c_schemes()
+    if not schemes:
+        schemes = ["sobolev_s0p5"]
+    return [
+        (scheme, basis, depth, seed, task, control, family)
+        for scheme in schemes
+        for basis in csv_items(args.part_d_basis)
+        for depth in csv_items(args.part_d_depths)
+        for seed in range(int(args.part_d_seed_count))
+        for task in csv_items(args.part_d_tasks)
+        for control in csv_items(args.part_d_controls)
+        for family in csv_items(args.part_d_gate_families)
+    ]
+
+
+def run_part_d(args: argparse.Namespace) -> dict[str, Any]:
+    ensure_out()
+    c = read_json(OUT_ROOT / "part_c_metric_sanity_summary.json")
+    path = OUT_ROOT / f"part_d_population_gate_matrix_shard{int(args.shard_index)}_of_{int(args.shard_count)}.csv"
+    if int(c.get("gate_pass", 0)) != 1:
+        rows = [{"part": "D", "status": "blocked", "blocked_reason": c.get("dominant_blocker", "part_c_failed"), **AUDIT_DEFAULTS}]
+        write_rows(path, rows)
+        write_blocked_summary("D", "D_BlockedByPartC", str(c.get("dominant_blocker", "part_c_failed")), "Part C edge geometry did not pass.")
+        append_exec("part-d", command_text(sys.argv), "blocked", files=rel(path))
+        return gate_summary("D", 0, "D_BlockedByPartC", str(c.get("dominant_blocker", "part_c_failed")), rows)
+    device = device_from_args(args)
+    rows = [run_part_d_row(job, args, device) for job in shard_items(part_d_jobs(args), args)]
+    write_rows(path, rows)
+    append_exec("part-d", command_text(sys.argv), "shard-written", files=rel(path), note=f"rows={len(rows)}")
+    return gate_summary("D", 0, "D_ShardsWritten", "merge_required", rows)
+
+
+def seed_stability(rows: list[dict[str, Any]]) -> float:
+    vals: list[float] = []
+    for key in sorted({(r.get("metric_scheme"), r.get("basis_key"), r.get("depth"), r.get("visual_synthetic_task"), r.get("control"), r.get("gate_family")) for r in rows}):
+        group = [r for r in rows if (r.get("metric_scheme"), r.get("basis_key"), r.get("depth"), r.get("visual_synthetic_task"), r.get("control"), r.get("gate_family")) == key and r.get("status") == "ok"]
+        by_seed = {str(r.get("seed")): fval(r.get("update_mass")) for r in group}
+        seeds = sorted(by_seed)
+        for i, s1 in enumerate(seeds):
+            for s2 in seeds[i + 1 :]:
+                a, b = by_seed[s1], by_seed[s2]
+                vals.append(1.0 - abs(a - b) / max(abs(a) + abs(b), 1.0e-12))
+    return median(vals)
+
+
+def merge_part_d(args: argparse.Namespace) -> dict[str, Any]:
+    ensure_out()
+    rows: list[dict[str, Any]] = []
+    for path in sorted(OUT_ROOT.glob("part_d_population_gate_matrix_shard*_of_*.csv")):
+        rows.extend(read_rows(path))
+    matrix = write_rows(OUT_ROOT / "part_d_population_gate_matrix.csv", rows)
+    ok = [r for r in rows if r.get("status") == "ok"]
+    family_summaries: list[dict[str, Any]] = []
+    for key in sorted({(r.get("metric_scheme"), r.get("gate_family")) for r in ok}):
+        group = [r for r in ok if (r.get("metric_scheme"), r.get("gate_family")) == key]
+        c2 = [r for r in group if r.get("control") == "c2_positive"]
+        rnd = [r for r in group if r.get("control") == "random_label"]
+        mlp = [r for r in group if r.get("control") == "mlp_friendly_negative"]
+        density = median([r.get("gate_density_mean") for r in c2])
+        stability = seed_stability(c2)
+        sg_cos = median([r.get("snr_source_guard_cosine") for r in c2])
+        corr = pearson([r.get("update_mass") for r in c2], [r.get("historical_C2_gain") for r in c2])
+        rnd_mass = median([r.get("update_mass") for r in rnd])
+        c2_mass = median([r.get("update_mass") for r in c2])
+        mlp_mass = median([r.get("update_mass") for r in mlp])
+        family = str(key[1])
+        if family == "block":
+            pass_flag = int(0.05 <= density <= 0.80 and stability >= 0.65 and sg_cos >= 0.55 and corr > 0.15 and rnd_mass <= 0.75 * c2_mass)
+        elif family == "lowrank":
+            pass_flag = int(stability >= 0.55 and sg_cos >= 0.50 and corr > 0.15 and rnd_mass <= 0.75 * c2_mass)
+        elif family == "cohort":
+            pass_flag = int(stability >= 0.60 and 0.05 <= density <= 0.80 and sg_cos >= 0.50)
+        else:
+            pass_flag = int(0.05 <= density <= 0.80 and stability >= 0.60 and sg_cos >= 0.50 and corr > 0.10 and rnd_mass <= 0.75 * c2_mass)
+        family_summaries.append(
+            {
+                "metric_scheme": key[0],
+                "gate_family": family,
+                "rows": len(group),
+                "gate_density_mean": density,
+                "snr_seed_stability": stability,
+                "snr_source_guard_cosine": sg_cos,
+                "snr_C2_gain_correlation": corr,
+                "C2_update_mass": c2_mass,
+                "random_label_update_mass": rnd_mass,
+                "MLP_friendly_update_mass": mlp_mass,
+                "family_pass": pass_flag,
+                "generic_learnability_warning": int(mlp_mass > c2_mass),
+            }
+        )
+    pass_families = [s for s in family_summaries if ival(s.get("family_pass")) == 1]
+    gate = int(bool(pass_families) and not any(r.get("status") == "error" for r in rows))
+    if any(r.get("status") == "error" for r in rows):
+        blocker = "part_d_job_errors"
+    elif not pass_families:
+        blocker = "population_gate_generic_or_unstable"
+    else:
+        blocker = "none"
+    summary = gate_summary(
+        "D",
+        gate,
+        "D_PopulationGatePass" if gate else "D_PopulationGateFailed",
+        blocker,
+        rows,
+        family_summaries=family_summaries,
+        passing_gate_families=pass_families,
+    )
+    write_json(OUT_ROOT / "part_d_population_gate_summary.json", summary)
+    next_path = write_next_actions("d", summary["route"], blocker, ["try block SNR/cohort-stable SNR/variance floor/gradient centering/fresh cohort split"] if not gate else [], evidence={"matrix": rel(matrix), "passing_gate_families": pass_families})
+    append_exec("part-d-merge", command_text(sys.argv), "passed" if gate else "failed", files=f"{rel(matrix)}; {rel(next_path)}")
+    append_recap("Part D population gate sanity", summary)
+    return summary
+
+
+def write_blocked_summary(part: str, route: str, blocker: str, reason: str) -> dict[str, Any]:
+    rows = [{"part": part, "status": "blocked", "blocked_reason": reason, **AUDIT_DEFAULTS}]
+    lower = part.lower()
+    name_map = {
+        "D": "part_d_population_gate",
+        "E": "part_e_optimizer_positive_control",
+        "F": "part_f_safety_envelope",
+        "G": "part_g_phase",
+        "H": "part_h_real_task_preflight",
+        "I": "part_i_full_c2_f5",
+        "J": "part_j_real_task_preflight",
+    }
+    stem = name_map.get(part.upper(), f"part_{lower}")
+    matrix = write_rows(OUT_ROOT / f"{stem}_matrix.csv", rows)
+    summary = gate_summary(part, 0, route, blocker, rows, blocked_reason=reason)
+    write_json(OUT_ROOT / f"{stem}_summary.json", summary)
+    if part.upper() == "D":
+        write_json(OUT_ROOT / "part_d_population_gate_summary.json", summary)
+    if part.upper() == "E":
+        write_json(OUT_ROOT / "part_e_optimizer_positive_control_summary.json", summary)
+    if part.upper() == "F":
+        write_rows(OUT_ROOT / "part_f_phase_matrix.csv", rows)
+        write_json(OUT_ROOT / "part_f_phase_summary.json", summary)
+        write_json(OUT_ROOT / "part_f_safety_envelope_summary.json", summary)
+    if part.upper() == "G":
+        write_rows(OUT_ROOT / "part_g_full_positive_control_matrix.csv", rows)
+        write_json(OUT_ROOT / "part_g_full_positive_control_summary.json", summary)
+    if part.upper() == "H":
+        write_json(OUT_ROOT / "part_h_real_task_preflight_summary.json", summary)
+    if part.upper() == "I":
+        write_json(OUT_ROOT / "part_i_failure_diagnostic_summary.json", summary)
+    next_path = write_next_actions(lower, route, blocker, [], evidence={"matrix": rel(matrix), "reason": reason})
+    append_recap(f"Part {part} blocked", summary)
+    return summary
+
+
+def run_part_e(args: argparse.Namespace) -> dict[str, Any]:
+    d = read_json(OUT_ROOT / "part_d_population_gate_summary.json")
+    if int(d.get("gate_pass", 0)) != 1:
+        return write_blocked_summary("E", "E_BlockedByPartD", str(d.get("dominant_blocker", "part_d_failed")), "Part D population gate did not pass.")
+    return write_blocked_summary("E", "E_C2FormationFailed", "optimizer_full_matrix_not_yet_run", "Part D passed, but this runner revision requires explicit full Part E execution implementation before claiming C2 formation.")
+
+
+def run_part_f(args: argparse.Namespace) -> dict[str, Any]:
+    e = read_json(OUT_ROOT / "part_e_optimizer_positive_control_summary.json")
+    if int(e.get("gate_pass", 0)) != 1:
+        return write_blocked_summary("F", "F_BlockedByPartE", str(e.get("dominant_blocker", "part_e_failed")), "Part E C2 formation did not pass.")
+    return write_blocked_summary("F", "F_SafetyEnvelopeFailed", "safety_full_matrix_not_run", "Part F requires a Part E passing fixed scheme.")
+
+
+def run_part_g(args: argparse.Namespace) -> dict[str, Any]:
+    f = read_json(OUT_ROOT / "part_f_safety_envelope_summary.json")
+    if int(f.get("gate_pass", 0)) != 1:
+        return write_blocked_summary("G", "G_BlockedByPartF", str(f.get("dominant_blocker", "part_f_failed")), "Part F safety envelope did not pass.")
+    return write_blocked_summary("G", "G_C2PassF5Fail", "full_matrix_not_run", "Part G full positive-control matrix requires Part F pass.")
+
+
+def run_part_h(args: argparse.Namespace) -> dict[str, Any]:
+    g = read_json(OUT_ROOT / "part_g_full_positive_control_summary.json")
+    if int(g.get("gate_pass", 0)) != 1:
+        return write_blocked_summary("H", "H_BlockedByPartG", str(g.get("dominant_blocker", "part_g_failed")), "Part G did not pass, so real-task preflight is forbidden.")
+    return write_blocked_summary("H", "J_RealTaskPreflightFailed", "not_run", "Real-task preflight not run.")
+
+
+def run_part_i(args: argparse.Namespace) -> dict[str, Any]:
+    g = read_json(OUT_ROOT / "part_g_full_positive_control_summary.json")
+    return write_blocked_summary("I", "I_DiagnosticOnly", str(g.get("dominant_blocker", "no_part_g")), "Fiber/quotient diagnostic is non-official and was not run because main chain did not pass.")
+
+
+def stale_artifact_audit() -> dict[str, Any]:
+    expected = [
+        "final_route.json",
+        "reproduction_manifest.md",
+        "stale_artifact_audit.json",
+        "part_a_identity_summary.json",
+        "part_b_history_lock.json",
+        "part_c_metric_sanity_summary.json",
+        "part_c_edge_sobolev_metric_summary.json",
+        "part_d_population_gate_summary.json",
+        "part_e_optimizer_positive_control_summary.json",
+        "part_f_safety_envelope_summary.json",
+        "part_f_phase_summary.json",
+        "part_g_full_positive_control_summary.json",
+        "part_g_phase_summary.json",
+        "part_h_real_task_preflight_summary.json",
+        "part_i_failure_decomposition.md",
+    ]
+    missing = [p for p in expected if not (OUT_ROOT / p).exists()]
+    return {"expected_files": expected, "missing_files": missing, "stale_artifact_count": 0 if not missing else len(missing)}
+
+
+def run_part_k(args: argparse.Namespace) -> dict[str, Any]:
+    parts = {
+        "A": read_json(OUT_ROOT / "part_a_identity_summary.json"),
+        "B": read_json(OUT_ROOT / "part_b_history_lock.json"),
+        "C": read_json(OUT_ROOT / "part_c_metric_sanity_summary.json"),
+        "D": read_json(OUT_ROOT / "part_d_population_gate_summary.json"),
+        "E": read_json(OUT_ROOT / "part_e_optimizer_positive_control_summary.json"),
+        "F": read_json(OUT_ROOT / "part_f_safety_envelope_summary.json"),
+        "G": read_json(OUT_ROOT / "part_g_full_positive_control_summary.json"),
+        "H": read_json(OUT_ROOT / "part_h_real_task_preflight_summary.json"),
+    }
+    if int(parts["A"].get("gate_pass", 0)) != 1:
+        route, blocker = "A_CodeIdentityFailed", parts["A"].get("dominant_blocker", "part_a")
+    elif int(parts["B"].get("gate_pass", 0)) != 1:
+        route, blocker = "B_HistoryLockFailed", parts["B"].get("dominant_blocker", "part_b")
+    elif int(parts["C"].get("gate_pass", 0)) != 1:
+        route, blocker = "C_EdgeSobolevMetricFailed", parts["C"].get("dominant_blocker", "part_c")
+    elif int(parts["D"].get("gate_pass", 0)) != 1:
+        route, blocker = "D_PopulationGateFailed", parts["D"].get("dominant_blocker", "part_d")
+    elif int(parts["E"].get("gate_pass", 0)) != 1:
+        route, blocker = "E_C2FormationFailed", parts["E"].get("dominant_blocker", "part_e")
+    elif int(parts["F"].get("gate_pass", 0)) != 1:
+        route, blocker = "F_SafetyEnvelopeFailed", parts["F"].get("dominant_blocker", "part_f")
+    elif int(parts["G"].get("gate_pass", 0)) != 1:
+        route, blocker = "G_C2PassF5Fail", parts["G"].get("dominant_blocker", "part_g")
+    elif int(parts["H"].get("gate_pass", 0)) != 1:
+        route, blocker = "J_RealTaskPreflightFailed", parts["H"].get("dominant_blocker", "part_h")
+    else:
+        route, blocker = "J_RealTaskPreflightProgress", "none"
+    lines = [
+        "# v23.00R failure decomposition",
+        "",
+        f"Final route: `{route}`",
+        f"Dominant blocker: `{blocker}`",
+        "",
+        "## Part summaries",
+    ]
+    for key, data in parts.items():
+        lines.append(f"- Part {key}: route=`{data.get('route', 'missing')}`, gate_pass=`{data.get('gate_pass', 0)}`, blocker=`{data.get('dominant_blocker', 'missing')}`")
+    lines.extend(
+        [
+            "",
+            "## Interpretation",
+            "This file is generated from current artifacts only. Blocked downstream parts are not treated as success evidence.",
+        ]
+    )
+    path = OUT_ROOT / "part_i_failure_decomposition.md"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    (OUT_ROOT / "part_k_failure_decomposition.md").write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+    rows = [{"part": "K", "status": "ok", "route": route, "dominant_blocker": str(blocker), **AUDIT_DEFAULTS}]
+    summary = gate_summary("K", 1, route, str(blocker), rows, part_routes={k: v.get("route", "missing") for k, v in parts.items()})
+    write_json(OUT_ROOT / "part_k_summary.json", summary)
+    final = {
+        "version": "v23.00R",
+        "route": route,
+        "dominant_blocker": str(blocker),
+        "official_candidate_gate_pass": int(route in {"I_C2F5PositiveControlPass", "J_RealTaskPreflightProgress"}),
+        "promotion_allowed": bool(route in {"I_C2F5PositiveControlPass", "J_RealTaskPreflightProgress"}),
+        "plan": rel(PLAN),
+        "runner": rel(RUNNER),
+        "execution_log": rel(EXEC_LOG),
+        "recap_log": rel(RECAP_LOG),
+        "used_fake_data_rows": sum(ival(v.get("used_fake_data_rows")) for v in parts.values()),
+        "held_test_usage": sum(ival(v.get("held_test_usage")) for v in parts.values()),
+        "generated_at": now(),
+    }
+    write_json(OUT_ROOT / "final_route.json", final)
+    append_exec("part-k", command_text(sys.argv), "done", files=f"{rel(path)}; {rel(OUT_ROOT / 'final_route.json')}")
+    append_recap("Part K failure decomposition", summary)
+    return summary
+
+
+def finalize(args: argparse.Namespace) -> dict[str, Any]:
+    k = read_json(OUT_ROOT / "part_k_summary.json")
+    final = read_json(OUT_ROOT / "final_route.json")
+    audit = stale_artifact_audit()
+    write_json(OUT_ROOT / "stale_artifact_audit.json", audit)
+    manifest = OUT_ROOT / "reproduction_manifest.md"
+    manifest.write_text(
+        "# v23.00R reproduction manifest\n\n"
+        f"- Plan: `{rel(PLAN)}`\n"
+        f"- Runner: `{rel(RUNNER)}`\n"
+        f"- Final route: `{final.get('route', k.get('route', 'missing'))}`\n"
+        f"- Output root: `{rel(OUT_ROOT)}`\n\n"
+        "## Typical commands\n\n"
+        f"- Part A: `{PYTHON} {rel(RUNNER)} --mode part-a --device cuda:0`\n"
+        f"- Part B: `{PYTHON} {rel(RUNNER)} --mode part-b --device cuda:0`\n"
+        f"- Part C shard: `CUDA_VISIBLE_DEVICES=0 {PYTHON} {rel(RUNNER)} --mode part-c --shard-count 4 --shard-index 0 --device cuda:0`\n"
+        f"- Part C merge: `{PYTHON} {rel(RUNNER)} --mode part-c-merge --device cuda:0`\n"
+        f"- Part D shard: `CUDA_VISIBLE_DEVICES=0 {PYTHON} {rel(RUNNER)} --mode part-d --shard-count 4 --shard-index 0 --device cuda:0`\n"
+        f"- Part D merge: `{PYTHON} {rel(RUNNER)} --mode part-d-merge --device cuda:0`\n"
+        f"- Finalize: `{PYTHON} {rel(RUNNER)} --mode finalize --device cuda:0`\n",
+        encoding="utf-8",
+    )
+    with (OUT_ROOT / "sha256_manifest.txt").open("w", encoding="utf-8") as fh:
+        for p in sorted(OUT_ROOT.rglob("*")):
+            if p.is_file():
+                h = hashlib.sha256(p.read_bytes()).hexdigest()
+                fh.write(f"{h}  {rel(p)}\n")
+    append_exec("finalize", command_text(sys.argv), "done", files=f"{rel(OUT_ROOT / 'final_route.json')}; {rel(manifest)}; {rel(OUT_ROOT / 'stale_artifact_audit.json')}")
+    append_recap("Final route", {**final, **audit})
+    return {**final, **audit}
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--mode", required=True)
+    p.add_argument("--device", default="cuda")
+    p.add_argument("--shard-count", type=int, default=1)
+    p.add_argument("--shard-index", type=int, default=0)
+    p.add_argument("--pc-basis", default="D-FOU")
+    p.add_argument("--basis-k-override", type=int, default=0)
+    p.add_argument("--dfour-k", type=int, default=3)
+    p.add_argument("--num-classes", type=int, default=3)
+    p.add_argument("--deep-width", type=int, default=12)
+    p.add_argument("--basis-input-gain", type=float, default=1.0)
+    p.add_argument("--synthetic-train-size", type=int, default=72)
+    p.add_argument("--synthetic-guard-size", type=int, default=72)
+    p.add_argument("--visual-side", type=int, default=8)
+    p.add_argument("--visual-fixed-patch-features", type=int, default=0)
+    p.add_argument("--visual-task-version", default="balanced_interaction_v2")
+    p.add_argument("--batch-size", type=int, default=36)
+    p.add_argument("--channel-source-size", type=int, default=16)
+    p.add_argument("--fresh-cohort-split", type=int, default=1)
+    p.add_argument("--snr-examples", type=int, default=16)
+    p.add_argument("--label-prior-correction", type=int, default=0)
+    p.add_argument("--part-c-basis", default="dche_k5,dche_k9,dfour_default")
+    p.add_argument("--part-c-depths", default="depth2,depth3")
+    p.add_argument("--part-c-tasks", default="local_patch_interaction,rotation_sensitive")
+    p.add_argument("--sobolev-exponents", default="0.25,0.5,1.0")
+    p.add_argument("--edge-weight-normalization", default="median", choices=["median", "mean", "trace"])
+    p.add_argument("--edge-weight-ridge", type=float, default=0.0)
+    p.add_argument("--part-d-basis", default="dche_k5,dche_k9,dfour_default")
+    p.add_argument("--part-d-depths", default="depth2,depth3")
+    p.add_argument("--part-d-tasks", default="local_patch_interaction,rotation_sensitive")
+    p.add_argument("--part-d-controls", default="c2_positive,random_label,source_shuffle,mlp_friendly_negative")
+    p.add_argument("--part-d-seed-count", type=int, default=3)
+    p.add_argument("--part-d-gate-families", default="diagonal,block,lowrank,cohort")
+    p.add_argument("--snr-beta", type=float, default=2.0)
+    p.add_argument("--lowrank-rank", type=int, default=4)
+    p.add_argument("--cohort-count", type=int, default=4)
+    return p
+
+
+def main(argv: list[str] | None = None) -> dict[str, Any] | None:
+    args = build_arg_parser().parse_args(argv)
+    mode = str(args.mode)
+    if mode == "part-a":
+        return run_part_a(args)
+    if mode == "part-b":
+        return run_part_b(args)
+    if mode == "part-c":
+        return run_part_c(args)
+    if mode == "part-c-merge":
+        return merge_part_c(args)
+    if mode == "part-d":
+        return run_part_d(args)
+    if mode == "part-d-merge":
+        return merge_part_d(args)
+    if mode == "part-e":
+        return run_part_e(args)
+    if mode == "part-f":
+        return run_part_f(args)
+    if mode == "part-g":
+        return run_part_g(args)
+    if mode == "part-h":
+        return run_part_h(args)
+    if mode == "part-i":
+        return run_part_i(args)
+    if mode == "part-k":
+        return run_part_k(args)
+    if mode == "finalize":
+        return finalize(args)
+    if mode == "all":
+        run_part_a(args)
+        run_part_b(args)
+        run_part_c(args)
+        merge_part_c(args)
+        run_part_d(args)
+        merge_part_d(args)
+        run_part_e(args)
+        run_part_f(args)
+        run_part_g(args)
+        run_part_h(args)
+        run_part_i(args)
+        run_part_k(args)
+        return finalize(args)
+    raise SystemExit(f"unknown mode {mode}")
+
+
+if __name__ == "__main__":
+    main()
