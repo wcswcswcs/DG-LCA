@@ -8,14 +8,20 @@ from typing import Iterable
 
 import torch
 
-from dgkan.fu.edge_sobolev_metrics import flatten_param_mode_weights, make_mode_weights
-from dgkan.fu.population_risk_gate import diagonal_snr_gate
+from dgkan.fu.debt_conflict_veto import conflict_veto_gate
+from dgkan.fu.edge_sobolev_metrics import flatten_param_mode_weights, make_mode_weights, mode_band_slices
+from dgkan.fu.population_risk_gate import block_snr_gate, diagonal_snr_gate
 
 
 @dataclass
 class EdgeSobolevStepStats:
     step: int = 0
     gate_density_mean: float = 1.0
+    gate_density_median: float = 1.0
+    gate_density_p10: float = 1.0
+    gate_density_p90: float = 1.0
+    veto_density_mean: float = 0.0
+    preserved_task_energy_fraction: float = 1.0
     mode_weight_condition_max: float = 1.0
     edge_params_updated: int = 0
     non_edge_params_seen: int = 0
@@ -39,7 +45,11 @@ class EdgeSobolevPopulationFlow(torch.optim.Optimizer):
         weight_decay: float = 0.0,
         sobolev_exponent: float = 1.0,
         gate_beta: float = 2.0,
+        gate_family: str = "diagonal",
+        gate_floor: float = 0.0,
+        stat_warmup_steps: int = 0,
         use_population_gate: bool = False,
+        use_debt_veto: bool = False,
         strict_edge_params: bool = True,
     ) -> None:
         self.strict_edge_params = bool(strict_edge_params)
@@ -50,10 +60,15 @@ class EdgeSobolevPopulationFlow(torch.optim.Optimizer):
             weight_decay=float(weight_decay),
             sobolev_exponent=float(sobolev_exponent),
             gate_beta=float(gate_beta),
+            gate_family=str(gate_family),
+            gate_floor=float(gate_floor),
+            stat_warmup_steps=int(stat_warmup_steps),
             use_population_gate=bool(use_population_gate),
+            use_debt_veto=bool(use_debt_veto),
         )
         super().__init__(list(params), defaults)
         self._observed_grads: dict[int, torch.Tensor] = {}
+        self._observed_debt_grads: dict[int, dict[str, torch.Tensor]] = {}
         self.last_stats = EdgeSobolevStepStats()
         self._validate_params()
 
@@ -69,8 +84,13 @@ class EdgeSobolevPopulationFlow(torch.optim.Optimizer):
     def observe_per_example_gradients(self, param: torch.nn.Parameter, grads: torch.Tensor) -> None:
         self._observed_grads[id(param)] = grads.detach().to(device=param.device, dtype=param.dtype)
 
+    def observe_debt_per_example_gradients(self, component: str, param: torch.nn.Parameter, grads: torch.Tensor) -> None:
+        by_component = self._observed_debt_grads.setdefault(id(param), {})
+        by_component[str(component)] = grads.detach().to(device=param.device, dtype=param.dtype)
+
     def clear_observed_gradients(self) -> None:
         self._observed_grads.clear()
+        self._observed_debt_grads.clear()
 
     def _weights_for_param(self, param: torch.nn.Parameter, group: dict) -> torch.Tensor:
         basis_key = getattr(param, "_kan_basis_key", getattr(param, "_kan_basis_name", "dche_k5"))
@@ -86,6 +106,36 @@ class EdgeSobolevPopulationFlow(torch.optim.Optimizer):
         )
         return flatten_param_mode_weights(param, mode_weights, mode_axis=axis).to(device=param.device, dtype=param.dtype)
 
+    def _blocks_for_param(self, param: torch.nn.Parameter) -> list[list[int]]:
+        basis_key = getattr(param, "_kan_basis_key", getattr(param, "_kan_basis_name", "dche_k5"))
+        k = int(getattr(param, "_kan_basis_order_or_freq_count", param.shape[-1] if param.ndim else 1))
+        if int(param.numel()) <= 0 or k <= 0:
+            return []
+        blocks: list[list[int]] = []
+        bands = mode_band_slices(k, str(basis_key))
+        for mode_ids in bands.values():
+            block = [idx for idx in range(int(param.numel())) if idx % k in mode_ids]
+            if block:
+                blocks.append(block)
+        return blocks
+
+    def _gate_from_observed(self, observed: torch.Tensor, weights: torch.Tensor, param: torch.nn.Parameter, group: dict) -> tuple[torch.Tensor, torch.Tensor]:
+        flat_weights = weights.to(device=observed.device, dtype=observed.dtype).reshape(1, -1)
+        white_obs = observed.reshape(int(observed.shape[0]), -1) / flat_weights.sqrt().clamp_min(float(group["eps"]))
+        family = str(group.get("gate_family", "diagonal"))
+        if family == "block":
+            gres = block_snr_gate(white_obs.detach().cpu(), self._blocks_for_param(param), beta=float(group["gate_beta"]))
+        else:
+            gres = diagonal_snr_gate(white_obs.detach().cpu(), beta=float(group["gate_beta"]))
+        gate = gres.gate.to(device=param.device, dtype=param.dtype)
+        if family == "random_matched" and int(gate.numel()) > 0:
+            perm = torch.randperm(int(gate.numel()), device=param.device)
+            gate = gate[perm]
+        if float(group.get("gate_floor", 0.0)) > 0.0:
+            floor = float(group["gate_floor"])
+            gate = gate * (1.0 - floor) + floor
+        return gate.reshape_as(param), gres.mean.to(device=param.device, dtype=param.dtype).reshape(-1)
+
     @torch.no_grad()
     def step(self, closure=None):  # type: ignore[override]
         loss = None
@@ -93,6 +143,9 @@ class EdgeSobolevPopulationFlow(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
         gate_density: list[float] = []
+        gate_values: list[torch.Tensor] = []
+        veto_density: list[float] = []
+        preserved_energy: list[float] = []
         conds: list[float] = []
         updated = 0
         non_edge = 0
@@ -121,24 +174,48 @@ class EdgeSobolevPopulationFlow(torch.optim.Optimizer):
                 grad_white = grad / w_view.sqrt()
                 m.mul_(beta1).add_(grad_white, alpha=1.0 - beta1)
                 v.mul_(beta2).addcmul_(grad_white, grad_white, value=1.0 - beta2)
-                update_white = m / (v.sqrt() + float(group["eps"]))
+                bias_correction1 = 1.0 - float(beta1) ** int(state["step"])
+                bias_correction2 = 1.0 - float(beta2) ** int(state["step"])
+                m_hat = m / max(bias_correction1, float(group["eps"]))
+                v_hat = v / max(bias_correction2, float(group["eps"]))
+                update_white = m_hat / (v_hat.sqrt() + float(group["eps"]))
                 gate = torch.ones_like(update_white)
+                task_mu = grad_white.detach().reshape(-1)
                 if bool(group["use_population_gate"]):
                     observed = self._observed_grads.get(id(param))
-                    if observed is not None and observed.ndim >= 2:
-                        flat_weights = weights.to(device=observed.device, dtype=observed.dtype)
-                        white_obs = observed.reshape(int(observed.shape[0]), -1) / flat_weights.reshape(1, -1).sqrt().clamp_min(float(group["eps"]))
-                        gres = diagonal_snr_gate(white_obs.detach().cpu(), beta=float(group["gate_beta"]))
-                        gate = gres.gate.to(device=param.device, dtype=param.dtype).reshape_as(param)
+                    warmup = int(state["step"]) <= int(group.get("stat_warmup_steps", 0))
+                    if observed is not None and observed.ndim >= 2 and not warmup:
+                        gate, task_mu = self._gate_from_observed(observed, weights, param, group)
+                        if bool(group.get("use_debt_veto", False)):
+                            debt_gates: dict[str, torch.Tensor] = {}
+                            debt_mus: dict[str, torch.Tensor] = {}
+                            for component, debt_obs in self._observed_debt_grads.get(id(param), {}).items():
+                                if debt_obs is None or debt_obs.ndim < 2:
+                                    continue
+                                dgate, dmu = self._gate_from_observed(debt_obs, weights, param, group)
+                                debt_gates[component] = dgate.reshape(-1)
+                                debt_mus[component] = dmu.reshape(-1)
+                            if debt_gates:
+                                flat_gate, veto_summary = conflict_veto_gate(gate.reshape(-1), task_mu.reshape(-1), debt_gates, debt_mus)
+                                gate = flat_gate.to(device=param.device, dtype=param.dtype).reshape_as(param)
+                                veto_density.append(float(veto_summary.get("veto_density_mean", 0.0)))
+                                preserved_energy.append(float(veto_summary.get("preserved_task_energy_fraction", 1.0)))
                 gate_density.append(float(gate.detach().mean().cpu().item()))
+                gate_values.append(gate.detach().reshape(-1).to(dtype=torch.float64).cpu())
                 update_raw = gate * update_white / w_view.sqrt()
                 if float(group["weight_decay"]) != 0.0:
                     param.mul_(1.0 - float(group["lr"]) * float(group["weight_decay"]))
                 param.add_(update_raw, alpha=-float(group["lr"]))
                 updated += 1
+        all_gate = torch.cat(gate_values) if gate_values else torch.zeros(0, dtype=torch.float64)
         self.last_stats = EdgeSobolevStepStats(
             step=max([int(self.state[p].get("step", 0)) for group in self.param_groups for p in group["params"] if p in self.state] or [0]),
             gate_density_mean=float(sum(gate_density) / len(gate_density)) if gate_density else 0.0,
+            gate_density_median=float(torch.quantile(all_gate, 0.5).item()) if int(all_gate.numel()) else 0.0,
+            gate_density_p10=float(torch.quantile(all_gate, 0.1).item()) if int(all_gate.numel()) else 0.0,
+            gate_density_p90=float(torch.quantile(all_gate, 0.9).item()) if int(all_gate.numel()) else 0.0,
+            veto_density_mean=float(sum(veto_density) / len(veto_density)) if veto_density else 0.0,
+            preserved_task_energy_fraction=float(sum(preserved_energy) / len(preserved_energy)) if preserved_energy else 1.0,
             mode_weight_condition_max=max(conds or [1.0]),
             edge_params_updated=updated,
             non_edge_params_seen=non_edge,
@@ -160,12 +237,9 @@ class EdgeSobolevSNRFU(EdgeSobolevPopulationFlow):
 
 
 class EdgeSobolevSNRFUWithDebtVeto(EdgeSobolevSNRFU):
-    """Placeholder class for the debt-veto variant.
-
-    The debt-veto gate is computed in ``dgkan.fu.debt_conflict_veto`` and can be
-    wired into observed gate tensors by future Part F code. The class exists so
-    Part A/import audits can distinguish the intended optimizer family.
-    """
+    def __init__(self, params: Iterable[torch.nn.Parameter], **kwargs) -> None:
+        kwargs["use_debt_veto"] = True
+        super().__init__(params, **kwargs)
 
 
 def mark_kan_edge_params(model: torch.nn.Module, *, basis_key: str) -> None:

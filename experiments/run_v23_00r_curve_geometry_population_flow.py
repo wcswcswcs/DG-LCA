@@ -19,6 +19,7 @@ from typing import Any, Iterable
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -32,6 +33,11 @@ from dgkan.fu.debt_conflict_veto import debt_conflict_veto_smoke_test
 from dgkan.fu.edge_sobolev_metrics import (
     edge_sobolev_smoke_test,
     flatten_param_mode_weights,
+    functional_edge_gram,
+    functional_gram_condition,
+    functional_gram_cost,
+    functional_gram_inverse_retention,
+    functional_gram_whitened_vector,
     inverse_weight_retention,
     make_mode_weights,
     matrix_mode_weights,
@@ -46,7 +52,7 @@ from dgkan.fu.population_risk_gate import (
     population_risk_gate_smoke_test,
 )
 from dgkan.fu.signal_channel_estimators import per_example_gradient_matrix
-from dgkan.optim.edge_sobolev_population_flow import mark_kan_edge_params, optimizer_smoke_test
+from dgkan.optim.edge_sobolev_population_flow import EdgeSobolevAdamW, EdgeSobolevSNRFU, EdgeSobolevSNRFUWithDebtVeto, mark_kan_edge_params, optimizer_smoke_test
 
 
 PYTHON = sys.executable
@@ -462,6 +468,8 @@ def c_schemes(args: argparse.Namespace) -> list[tuple[str, str, float]]:
     out: list[tuple[str, str, float]] = [("raw_flat", "raw", 0.0)]
     for s in csv_items(args.sobolev_exponents):
         out.append((f"sobolev_s{s.replace('.', 'p')}", "sobolev", float(s)))
+    for s in csv_items(args.functional_gram_exponents):
+        out.append((f"functional_gram_s{s.replace('.', 'p')}", "functional_gram", float(s)))
     out.append(("derivative_grid_s1", "derivative", 1.0))
     out.append(("dataGram_diagnostic", "dataGram", 0.0))
     return out
@@ -541,6 +549,10 @@ def run_part_c_row(row: dict[str, Any], scheme: tuple[str, str, float], args: ar
         all_edge_w: list[torch.Tensor] = []
         all_data_w: list[torch.Tensor] = []
         all_prev_delta: list[torch.Tensor] = []
+        dense_edge_costs: list[float] = []
+        dense_edge_retentions: list[float] = []
+        dense_edge_whites: list[torch.Tensor] = []
+        dense_prev_edge_whites: list[torch.Tensor] = []
         layer_idx = 0
         while f"delta_layer{layer_idx}" in arrays:
             delta = torch.from_numpy(arrays[f"delta_layer{layer_idx}"]).to(dtype=torch.float64)
@@ -549,6 +561,16 @@ def run_part_c_row(row: dict[str, Any], scheme: tuple[str, str, float], args: ar
                 mode_w = torch.ones(k, dtype=torch.float64)
             elif scheme_type == "dataGram":
                 mode_w = torch.ones(k, dtype=torch.float64)
+            elif scheme_type == "functional_gram":
+                gram = functional_edge_gram(
+                    basis_key,
+                    k,
+                    sobolev_order=float(exponent),
+                    quadrature_points=int(args.functional_gram_quadrature_points),
+                    normalization=str(args.edge_weight_normalization),
+                    ridge=float(args.edge_weight_ridge) if float(args.edge_weight_ridge) > 0.0 else 1.0e-6,
+                )
+                mode_w = torch.diag(gram).to(dtype=torch.float64)
             elif scheme_type == "derivative":
                 mode_w = make_mode_weights(basis_key, k, exponent=1.0, normalization=str(args.edge_weight_normalization), ridge=float(args.edge_weight_ridge))
             else:
@@ -557,18 +579,25 @@ def run_part_c_row(row: dict[str, Any], scheme: tuple[str, str, float], args: ar
             data_w = data_weights[layer_idx]
             if scheme_type == "dataGram":
                 edge_w = data_w
+            if scheme_type == "functional_gram":
+                dense_edge_costs.append(functional_gram_cost(delta, gram, mode_axis_period=k))
+                dense_edge_retentions.append(functional_gram_inverse_retention(delta, gram, mode_axis_period=k))
+                dense_edge_whites.append(functional_gram_whitened_vector(delta, gram, mode_axis_period=k))
             low, high = mode_energy_fractions(delta, k, basis_key)
             all_delta.append(delta.reshape(-1))
             all_edge_w.append(edge_w)
             all_data_w.append(data_w)
             if prev_arrays is not None and f"delta_layer{layer_idx}" in prev_arrays:
-                all_prev_delta.append(torch.from_numpy(prev_arrays[f"delta_layer{layer_idx}"]).to(dtype=torch.float64).reshape(-1))
+                prev_delta = torch.from_numpy(prev_arrays[f"delta_layer{layer_idx}"]).to(dtype=torch.float64)
+                all_prev_delta.append(prev_delta.reshape(-1))
+                if scheme_type == "functional_gram":
+                    dense_prev_edge_whites.append(functional_gram_whitened_vector(prev_delta, gram, mode_axis_period=k))
             layer_metrics.append(
                 {
                     "layer_idx": float(layer_idx),
                     "low_mode_energy_fraction": low,
                     "high_mode_energy_fraction": high,
-                    "edge_condition": float((edge_w.max() / edge_w.min().clamp_min(1.0e-12)).item()),
+                    "edge_condition": functional_gram_condition(gram) if scheme_type == "functional_gram" else float((edge_w.max() / edge_w.min().clamp_min(1.0e-12)).item()),
                 }
             )
             layer_idx += 1
@@ -576,12 +605,12 @@ def run_part_c_row(row: dict[str, Any], scheme: tuple[str, str, float], args: ar
         edge_w_vec = torch.cat(all_edge_w) if all_edge_w else torch.ones(0, dtype=torch.float64)
         data_w_vec = torch.cat(all_data_w) if all_data_w else torch.ones(0, dtype=torch.float64)
         prev_vec = torch.cat(all_prev_delta) if all_prev_delta else delta_vec
-        edge_ret = inverse_weight_retention(delta_vec, edge_w_vec)
+        edge_ret = mean(dense_edge_retentions) if scheme_type == "functional_gram" else inverse_weight_retention(delta_vec, edge_w_vec)
         data_ret = inverse_weight_retention(delta_vec, data_w_vec)
-        edge_cost = float((delta_vec.square() * edge_w_vec).sum().item())
+        edge_cost = float(sum(dense_edge_costs)) if scheme_type == "functional_gram" else float((delta_vec.square() * edge_w_vec).sum().item())
         data_cost = float((delta_vec.square() * data_w_vec).sum().item())
-        edge_white = delta_vec / edge_w_vec.sqrt().clamp_min(1.0e-12)
-        prev_edge_white = prev_vec[: int(delta_vec.numel())] / edge_w_vec[: int(delta_vec.numel())].sqrt().clamp_min(1.0e-12)
+        edge_white = torch.cat(dense_edge_whites) if scheme_type == "functional_gram" and dense_edge_whites else delta_vec / edge_w_vec.sqrt().clamp_min(1.0e-12)
+        prev_edge_white = torch.cat(dense_prev_edge_whites) if scheme_type == "functional_gram" and dense_prev_edge_whites else prev_vec[: int(delta_vec.numel())] / edge_w_vec[: int(delta_vec.numel())].sqrt().clamp_min(1.0e-12)
         mw_summary = mode_weight_summary(edge_w_vec, basis_key, exponent, str(args.edge_weight_normalization))
         return {
             "part": "C",
@@ -655,7 +684,7 @@ def merge_part_c(args: argparse.Namespace) -> dict[str, Any]:
         med_sg = median([r.get("source_guard_witness_cost_cosine") for r in sr])
         scheme_type = sr[0].get("metric_scheme_type", "") if sr else ""
         scheme_pass = int(
-            scheme_type in {"sobolev", "derivative"}
+            scheme_type in {"sobolev", "derivative", "functional_gram"}
             and med_cond <= 1.0e4
             and med_ret >= med_data + 0.10
             and edge_corr >= data_corr
@@ -719,16 +748,37 @@ def passing_c_schemes() -> list[str]:
     return [str(s) for s in schemes] if isinstance(schemes, list) else []
 
 
+def part_c_allows_continuation(args: argparse.Namespace) -> tuple[bool, int, str]:
+    c = read_json(OUT_ROOT / "part_c_metric_sanity_summary.json")
+    c_pass = int(c.get("gate_pass", 0)) == 1
+    if c_pass:
+        return True, 0, "part_c_pass"
+    if str(getattr(args, "part_c_role", "hard")) == "sanity":
+        return True, 1, str(c.get("dominant_blocker", "part_c_failed"))
+    return False, 0, str(c.get("dominant_blocker", "part_c_failed"))
+
+
+def scheme_sobolev_exponent(scheme: str) -> float:
+    text = str(scheme)
+    match = re.search(r"s([0-9]+)(?:p([0-9]+))?", text)
+    if not match:
+        return 0.0
+    whole = match.group(1)
+    frac = match.group(2) or ""
+    return float(f"{whole}.{frac}") if frac else float(whole)
+
+
+def continuation_metric_schemes(args: argparse.Namespace) -> list[str]:
+    schemes = passing_c_schemes()
+    if schemes:
+        return schemes
+    return csv_items(getattr(args, "continuation_metric_schemes", "sobolev_s0p0"))
+
+
 def weights_for_model_params(model: v2293.TrueDeepPureKAN, basis_key: str, scheme: str, args: argparse.Namespace) -> torch.Tensor:
     weights: list[torch.Tensor] = []
-    exponent = 0.0
-    if "s0p25" in scheme:
-        exponent = 0.25
-    elif "s0p5" in scheme:
-        exponent = 0.5
-    elif "s1" in scheme:
-        exponent = 1.0
-    elif "derivative" in scheme:
+    exponent = scheme_sobolev_exponent(scheme)
+    if "derivative" in scheme:
         exponent = 1.0
     for p in model.coeffs:
         k = int(p.shape[-1])
@@ -823,6 +873,8 @@ def run_part_d_row(job: tuple[str, str, str, int, str, str, str], args: argparse
             "part": "D",
             "status": "ok",
             "row_id": f"D_{scheme}_{basis_key}_{depth}_{task}_s{seed}_{control}_{family}",
+            "part_c_role": str(getattr(args, "part_c_role", "hard")),
+            "forced_after_c_fail": part_c_allows_continuation(args)[1],
             "metric_scheme": scheme,
             "basis_key": basis_key,
             "depth": depth,
@@ -849,9 +901,7 @@ def run_part_d_row(job: tuple[str, str, str, int, str, str, str], args: argparse
 
 
 def part_d_jobs(args: argparse.Namespace) -> list[tuple[str, str, str, int, str, str, str]]:
-    schemes = passing_c_schemes()
-    if not schemes:
-        schemes = ["sobolev_s0p5"]
+    schemes = continuation_metric_schemes(args)
     return [
         (scheme, basis, depth, seed, task, control, family)
         for scheme in schemes
@@ -866,19 +916,21 @@ def part_d_jobs(args: argparse.Namespace) -> list[tuple[str, str, str, int, str,
 
 def run_part_d(args: argparse.Namespace) -> dict[str, Any]:
     ensure_out()
-    c = read_json(OUT_ROOT / "part_c_metric_sanity_summary.json")
+    _c = read_json(OUT_ROOT / "part_c_metric_sanity_summary.json")
     path = OUT_ROOT / f"part_d_population_gate_matrix_shard{int(args.shard_index)}_of_{int(args.shard_count)}.csv"
-    if int(c.get("gate_pass", 0)) != 1:
-        rows = [{"part": "D", "status": "blocked", "blocked_reason": c.get("dominant_blocker", "part_c_failed"), **AUDIT_DEFAULTS}]
+    c_continue, forced_after_c_fail, c_reason = part_c_allows_continuation(args)
+    if not c_continue:
+        rows = [{"part": "D", "status": "blocked", "blocked_reason": c_reason, **AUDIT_DEFAULTS}]
         write_rows(path, rows)
-        write_blocked_summary("D", "D_BlockedByPartC", str(c.get("dominant_blocker", "part_c_failed")), "Part C edge geometry did not pass.")
+        write_blocked_summary("D", "D_BlockedByPartC", c_reason, "Part C edge geometry did not pass and --part-c-role was hard.")
         append_exec("part-d", command_text(sys.argv), "blocked", files=rel(path))
-        return gate_summary("D", 0, "D_BlockedByPartC", str(c.get("dominant_blocker", "part_c_failed")), rows)
+        return gate_summary("D", 0, "D_BlockedByPartC", c_reason, rows)
     device = device_from_args(args)
     rows = [run_part_d_row(job, args, device) for job in shard_items(part_d_jobs(args), args)]
     write_rows(path, rows)
-    append_exec("part-d", command_text(sys.argv), "shard-written", files=rel(path), note=f"rows={len(rows)}")
-    return gate_summary("D", 0, "D_ShardsWritten", "merge_required", rows)
+    note = f"rows={len(rows)}; part_c_role={getattr(args, 'part_c_role', 'hard')}; forced_after_c_fail={forced_after_c_fail}; c_reason={c_reason}"
+    append_exec("part-d", command_text(sys.argv), "shard-written", files=rel(path), note=note)
+    return gate_summary("D", 0, "D_ShardsWritten", "merge_required", rows, part_c_role=str(getattr(args, "part_c_role", "hard")), forced_after_c_fail=forced_after_c_fail, part_c_reason=c_reason)
 
 
 def seed_stability(rows: list[dict[str, Any]]) -> float:
@@ -953,6 +1005,8 @@ def merge_part_d(args: argparse.Namespace) -> dict[str, Any]:
         "D_PopulationGatePass" if gate else "D_PopulationGateFailed",
         blocker,
         rows,
+        part_c_role=str(getattr(args, "part_c_role", "hard")),
+        forced_after_c_fail=max([ival(r.get("forced_after_c_fail")) for r in rows] or [0]),
         family_summaries=family_summaries,
         passing_gate_families=pass_families,
     )
@@ -999,18 +1053,517 @@ def write_blocked_summary(part: str, route: str, blocker: str, reason: str) -> d
     return summary
 
 
+def synthetic_data(teacher: str, seed: int, args: argparse.Namespace, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return v2294.synthetic_data(teacher, seed, args, device)
+
+
+def coeff_vector(model: v2293.TrueDeepPureKAN) -> torch.Tensor:
+    parts = [p.detach().reshape(-1).to(dtype=torch.float64).cpu() for p in model.coeffs]
+    return torch.cat(parts) if parts else torch.zeros(0, dtype=torch.float64)
+
+
+def split_flat_grads(flat: torch.Tensor, params: list[torch.nn.Parameter]) -> list[torch.Tensor]:
+    out: list[torch.Tensor] = []
+    offset = 0
+    for param in params:
+        n = int(param.numel())
+        out.append(flat[:, offset : offset + n].reshape(int(flat.shape[0]), *tuple(param.shape)).contiguous())
+        offset += n
+    return out
+
+
+def observe_task_gradients(opt: EdgeSobolevSNRFU, model: v2293.TrueDeepPureKAN, x: torch.Tensor, y: torch.Tensor, args: argparse.Namespace) -> tuple[int, float, float, int, int]:
+    flat = per_example_gradient_matrix(model, x, y, max_examples=int(args.population_grad_examples), label_prior_correction=bool(int(args.label_prior_correction)))
+    nan_count = int(torch.isnan(flat).sum().item()) if int(flat.numel()) else 0
+    inf_count = int(torch.isinf(flat).sum().item()) if int(flat.numel()) else 0
+    norms = flat.norm(dim=1) if flat.ndim == 2 and int(flat.shape[0]) else torch.zeros(0, dtype=torch.float64)
+    params = list(model.coeffs)
+    for param, grads in zip(params, split_flat_grads(flat, params)):
+        opt.observe_per_example_gradients(param, grads.to(device=param.device, dtype=param.dtype))
+    return (
+        int(flat.shape[0]) if flat.ndim == 2 else 0,
+        float(norms.median().item()) if int(norms.numel()) else 0.0,
+        float(torch.quantile(norms, 0.95).item()) if int(norms.numel()) else 0.0,
+        nan_count,
+        inf_count,
+    )
+
+
+def debt_component_loss(logits: torch.Tensor, y: torch.Tensor, component: str, baseline: dict[str, float] | None = None, budget: float = 0.0) -> torch.Tensor:
+    prob = F.softmax(logits.float(), dim=1)
+    one_hot = F.one_hot(y.long(), num_classes=int(logits.shape[1])).to(dtype=prob.dtype)
+    true_prob = prob.gather(1, y.long().reshape(-1, 1)).reshape(-1)
+    if component == "Brier":
+        return (prob - one_hot).square().sum(dim=1).mean()
+    if component == "ECE":
+        conf = prob.max(dim=1).values
+        correct = (prob.argmax(dim=1) == y.long()).to(dtype=prob.dtype)
+        return (conf - correct).square().mean()
+    if component in {"tail95", "tail99"}:
+        q = 0.95 if component == "tail95" else 0.99
+        k = max(1, int(math.ceil(float(q) * int(true_prob.numel()))))
+        sorted_risk = torch.sort(1.0 - true_prob).values
+        tail = sorted_risk[min(k - 1, int(sorted_risk.numel()) - 1) :].mean()
+        target = float((baseline or {}).get(component, 0.0)) + float(budget)
+        return F.relu(tail - target).square()
+    if component == "margin10":
+        true_logit = logits.float().gather(1, y.long().reshape(-1, 1)).reshape(-1)
+        other_logits = logits.float().clone()
+        other_logits.scatter_(1, y.long().reshape(-1, 1), float("-inf"))
+        margin = true_logit - other_logits.max(dim=1).values
+        k = max(1, int(math.ceil(0.10 * int(margin.numel()))))
+        low_margin = torch.sort(margin).values[:k].mean()
+        floor = float((baseline or {}).get(component, 0.0)) - float(budget)
+        return F.relu(floor - low_margin).square()
+    return logits.float().sum() * 0.0
+
+
+def per_example_debt_gradient_matrix(model: torch.nn.Module, x: torch.Tensor, y: torch.Tensor, component: str, *, max_examples: int, baseline: dict[str, float], budget: float) -> torch.Tensor:
+    rows: list[torch.Tensor] = []
+    params = list(getattr(model, "coeffs", list(model.parameters())))
+    n = min(int(max_examples), int(x.shape[0]))
+    for idx in range(n):
+        logits = model(x[idx : idx + 1])
+        loss = debt_component_loss(logits, y[idx : idx + 1], component, baseline=baseline, budget=budget)
+        grads = torch.autograd.grad(loss, params, retain_graph=False, allow_unused=True)
+        rows.append(torch.cat([(torch.zeros_like(p) if g is None else g).detach().reshape(-1).to(dtype=torch.float64) for g, p in zip(grads, params)]).cpu())
+    return torch.stack(rows, dim=0).to(dtype=torch.float64) if rows else torch.zeros((0, 0), dtype=torch.float64)
+
+
+def observe_debt_gradients(opt: EdgeSobolevSNRFUWithDebtVeto, model: v2293.TrueDeepPureKAN, x: torch.Tensor, y: torch.Tensor, args: argparse.Namespace, baseline: dict[str, float], *, randomize_alignment: bool = False) -> dict[str, float | int | str]:
+    params = list(model.coeffs)
+    components = csv_items(args.debt_veto_components)
+    out: dict[str, float | int | str] = {"debt_veto_components": ",".join(components)}
+    for component in components:
+        flat = per_example_debt_gradient_matrix(model, x, y, component, max_examples=int(args.debt_grad_examples), baseline=baseline, budget=float(args.no_debt_budget))
+        if randomize_alignment and flat.ndim == 2 and int(flat.shape[1]) > 0:
+            perm = torch.randperm(int(flat.shape[1]))
+            flat = flat[:, perm]
+        for param, grads in zip(params, split_flat_grads(flat, params)):
+            opt.observe_debt_per_example_gradients(component, param, grads.to(device=param.device, dtype=param.dtype))
+        out[f"{component}_debt_grad_norm"] = float(flat.norm().item()) if int(flat.numel()) else 0.0
+    return out
+
+
+def data_op_drifts(model: v2293.TrueDeepPureKAN, before_mats: list[torch.Tensor], x: torch.Tensor, args: argparse.Namespace) -> tuple[float, float]:
+    data_drifts: list[float] = []
+    op_drifts: list[float] = []
+    after_mats = v2294.param_mats(model)
+    for layer_idx, (a0, a1) in enumerate(zip(before_mats, after_mats)):
+        try:
+            c_data = v2294.data_c_matrix(model, x, layer_idx)
+            data_drifts.append(v2294.log_spectral_drift(v2294.composite_metric(a0, c_data), v2294.composite_metric(a1, c_data)))
+            mode_diag = v2294.mode_metric_diag(model, layer_idx, args)
+            op_drifts.append(v2294.log_spectral_drift(v2294.op_spectrum(a0, mode_diag), v2294.op_spectrum(a1, mode_diag)))
+        except Exception:
+            continue
+    return max(data_drifts or [0.0]), max(op_drifts or [0.0])
+
+
+def parse_v23_scheme(scheme: str, *, safety_type: str = "") -> dict[str, Any]:
+    text = str(scheme)
+    return {
+        "optimizer_family": "adamw" if text == "E0_AdamW_control" or "adamw_control" in text else "edge_sobolev",
+        "use_population_gate": int("snr" in text.lower() or "random" in text.lower()),
+        "gate_family": "block" if "block" in text.lower() else ("random_matched" if "random" in text.lower() else "diagonal"),
+        "sobolev_exponent": scheme_sobolev_exponent(text),
+        "use_debt_veto": int("veto" in str(safety_type).lower()),
+    }
+
+
+def make_v23_optimizer(model: v2293.TrueDeepPureKAN, basis_key: str, scheme: str, args: argparse.Namespace, *, safety_type: str = ""):
+    mark_kan_edge_params(model, basis_key=basis_key)
+    spec = parse_v23_scheme(scheme, safety_type=safety_type)
+    if spec["optimizer_family"] == "adamw":
+        return torch.optim.AdamW(model.parameters(), lr=float(args.adamw_lr), weight_decay=float(args.weight_decay)), spec
+    cls = EdgeSobolevSNRFUWithDebtVeto if spec["use_debt_veto"] else (EdgeSobolevSNRFU if spec["use_population_gate"] else EdgeSobolevAdamW)
+    opt = cls(
+        list(model.coeffs),
+        lr=float(args.edge_lr),
+        weight_decay=float(args.weight_decay),
+        sobolev_exponent=float(spec["sobolev_exponent"]),
+        gate_beta=float(args.snr_beta),
+        gate_family=str(spec["gate_family"]),
+        gate_floor=float(args.gate_floor),
+        stat_warmup_steps=int(args.stat_warmup_steps),
+    )
+    return opt, spec
+
+
+def train_v23_scheme(
+    scheme: str,
+    basis_key: str,
+    depth: str,
+    teacher_type: str,
+    task: str,
+    seed: int,
+    args: argparse.Namespace,
+    device: torch.device,
+    *,
+    part: str,
+    safety_type: str = "",
+) -> dict[str, Any]:
+    start = time.time()
+    bargs = basis_args(args, basis_key)
+    if teacher_type == "c2_visual_synthetic":
+        xtr, ytr, xg, yg = visual_data(task, seed, args, device)
+    elif teacher_type == "f5_no_debt_calibration":
+        xtr, ytr, xg, yg = synthetic_data("c1a_shallow_additive", seed + 50000, args, device)
+    else:
+        xtr, ytr, xg, yg = synthetic_data(teacher_type, seed, args, device)
+    classes = int(max(ytr.max(), yg.max()).detach().cpu().item()) + 1
+    model_seed = 2305000 + BASIS_KEYS.index(basis_key) * 100000 + (2 if depth == "depth2" else 3) * 10000 + int(seed)
+    model = make_model(depth, int(xtr.shape[1]), classes, model_seed, bargs, device)
+    opt, spec = make_v23_optimizer(model, basis_key, scheme, args, safety_type=safety_type)
+    before = v2293.metrics_for_model(model, xg, yg)
+    before_train = v2293.metrics_for_model(model, xtr, ytr)
+    before_vec = coeff_vector(model)
+    before_mats = v2294.param_mats(model)
+    gate_trace: list[float] = []
+    veto_trace: list[float] = []
+    preserved_trace: list[float] = []
+    grad_norm_median: list[float] = []
+    grad_norm_p95: list[float] = []
+    grad_nan_count = 0
+    grad_inf_count = 0
+    per_example_count = 0
+    debt_diag: dict[str, float | int | str] = {}
+    for step in range(1, int(args.train_steps) + 1):
+        xb, yb = v2293.v2289.iter_train_batches(xtr, ytr, step - 1, int(args.batch_size), int(seed))
+        opt.zero_grad(set_to_none=True)
+        if isinstance(opt, EdgeSobolevSNRFU):
+            pe_count, gmed, gp95, nnan, ninf = observe_task_gradients(opt, model, xb, yb, args)
+            per_example_count = max(per_example_count, pe_count)
+            grad_norm_median.append(gmed)
+            grad_norm_p95.append(gp95)
+            grad_nan_count += nnan
+            grad_inf_count += ninf
+            if isinstance(opt, EdgeSobolevSNRFUWithDebtVeto):
+                debt_diag = observe_debt_gradients(opt, model, xb, yb, args, before_train, randomize_alignment="random" in str(safety_type).lower())
+        loss = F.cross_entropy(model(xb).float(), yb.long())
+        loss.backward()
+        opt.step()
+        if hasattr(opt, "last_stats"):
+            gate_trace.append(float(opt.last_stats.gate_density_mean))
+            veto_trace.append(float(opt.last_stats.veto_density_mean))
+            preserved_trace.append(float(opt.last_stats.preserved_task_energy_fraction))
+    after = v2293.metrics_for_model(model, xg, yg)
+    after_train = v2293.metrics_for_model(model, xtr, ytr)
+    after_vec = coeff_vector(model)
+    data_drift, op_drift = data_op_drifts(model, before_mats, xtr, bargs)
+    component_deltas = {
+        "Brier": after.get("brier", 0.0) - before.get("brier", 0.0),
+        "ECE": after.get("ece", 0.0) - before.get("ece", 0.0),
+        "tail95": after.get("tail95", 0.0) - before.get("tail95", 0.0),
+        "tail99": after.get("tail99", 0.0) - before.get("tail99", 0.0),
+        "margin10": after.get("margin10", 0.0) - before.get("margin10", 0.0),
+    }
+    no_debt = int(all(float(component_deltas[k]) <= float(args.no_debt_budget) for k in component_deltas))
+    return {
+        "part": part,
+        "status": "ok",
+        "scheme": scheme,
+        "safety_type": safety_type,
+        "basis_key": basis_key,
+        "depth": depth,
+        "teacher_type": teacher_type,
+        "visual_synthetic_task": task,
+        "seed": int(seed),
+        "train_steps": int(args.train_steps),
+        "part_c_role": str(args.part_c_role),
+        "forced_after_c_fail": part_c_allows_continuation(args)[1],
+        "diagnostic_only": int(args.diagnostic_only),
+        "G_edge_type": "edge_sobolev_mode_diag",
+        "snr_gate_type": spec["gate_family"] if spec["use_population_gate"] else "none",
+        "sobolev_s": spec["sobolev_exponent"],
+        "stat_warmup_steps": int(args.stat_warmup_steps),
+        "gate_floor": float(args.gate_floor),
+        "gate_density_mean": mean(gate_trace, 1.0 if not spec["use_population_gate"] else 0.0),
+        "gate_density_median": median(gate_trace, 1.0 if not spec["use_population_gate"] else 0.0),
+        "gate_density_p10": float(np.quantile(gate_trace, 0.10)) if gate_trace else 0.0,
+        "gate_density_p90": float(np.quantile(gate_trace, 0.90)) if gate_trace else 0.0,
+        "veto_density_mean": mean(veto_trace),
+        "preserved_task_energy_fraction": mean(preserved_trace, 1.0),
+        "C2_accuracy_initial": before["accuracy"],
+        "C2_accuracy_final": after["accuracy"],
+        "C2_accuracy_improvement": after["accuracy"] - before["accuracy"],
+        "C2_coverage_initial": before["coverage_CVaR25"],
+        "C2_coverage_final": after["coverage_CVaR25"],
+        "C2_coverage_improvement": after["coverage_CVaR25"] - before["coverage_CVaR25"],
+        "visual_rows_ge_0p02": int(after["coverage_CVaR25"] - before["coverage_CVaR25"] >= 0.02),
+        "guard_NLL_before": before["nll"],
+        "guard_NLL_after": after["nll"],
+        "guard_NLL_delta": after["nll"] - before["nll"],
+        "guard_accuracy": after["accuracy"],
+        "Brier_delta": component_deltas["Brier"],
+        "ECE_delta": component_deltas["ECE"],
+        "tail95_delta": component_deltas["tail95"],
+        "tail99_delta": component_deltas["tail99"],
+        "margin10_delta": component_deltas["margin10"],
+        "no_debt_row": no_debt,
+        "F5_no_debt": no_debt,
+        "train_Brier_delta": after_train.get("brier", 0.0) - before_train.get("brier", 0.0),
+        "train_ECE_delta": after_train.get("ece", 0.0) - before_train.get("ece", 0.0),
+        "train_tail95_delta": after_train.get("tail95", 0.0) - before_train.get("tail95", 0.0),
+        "train_tail99_delta": after_train.get("tail99", 0.0) - before_train.get("tail99", 0.0),
+        "train_margin10_delta": after_train.get("margin10", 0.0) - before_train.get("margin10", 0.0),
+        "mode_spectrum_drift": float((after_vec - before_vec).norm().div(before_vec.norm().clamp_min(1.0e-12)).item()) if int(before_vec.numel()) else 0.0,
+        "dataGram_drift": data_drift,
+        "operator_norm_drift": op_drift,
+        "wall_time_s": time.time() - start,
+        "per_example_grad_mode": "microbatch_true" if spec["use_population_gate"] else "not_used",
+        "per_example_count": per_example_count,
+        "cohort_count": 0,
+        "cohort_size_min": 0,
+        "cohort_size_max": 0,
+        "grad_nan_count": grad_nan_count,
+        "grad_inf_count": grad_inf_count,
+        "grad_norm_median": median(grad_norm_median),
+        "grad_norm_p95": median(grad_norm_p95),
+        "new_edge_function_added": 0,
+        "mlp_stem_used": 0,
+        "mlp_readout_used": 0,
+        "external_product_feature_used": 0,
+        **debt_diag,
+        **v2294.basis_audit_fields(basis_key, model),
+        **AUDIT_DEFAULTS,
+    }
+
+
+def part_e_jobs(args: argparse.Namespace) -> list[tuple[str, str, str, str, int]]:
+    return [
+        (scheme, basis, depth, task, seed)
+        for scheme in csv_items(args.part_e_schemes)
+        for basis in csv_items(args.part_e_basis)
+        for depth in csv_items(args.part_e_depths)
+        for task in csv_items(args.part_e_tasks)
+        for seed in range(int(args.part_e_seed_count))
+    ]
+
+
 def run_part_e(args: argparse.Namespace) -> dict[str, Any]:
     d = read_json(OUT_ROOT / "part_d_population_gate_summary.json")
-    if int(d.get("gate_pass", 0)) != 1:
-        return write_blocked_summary("E", "E_BlockedByPartD", str(d.get("dominant_blocker", "part_d_failed")), "Part D population gate did not pass.")
-    return write_blocked_summary("E", "E_C2FormationFailed", "optimizer_full_matrix_not_yet_run", "Part D passed, but this runner revision requires explicit full Part E execution implementation before claiming C2 formation.")
+    if int(d.get("gate_pass", 0)) != 1 and not int(args.force_part_e_after_d_fail):
+        return write_blocked_summary("E", "E_BlockedByPartD", str(d.get("dominant_blocker", "part_d_failed")), "Part D population gate did not pass and --force-part-e-after-d-fail=0.")
+    device = device_from_args(args)
+    rows = [
+        train_v23_scheme(scheme, basis, depth, "c2_visual_synthetic", task, seed, args, device, part="E")
+        for scheme, basis, depth, task, seed in shard_items(part_e_jobs(args), args)
+    ]
+    path = OUT_ROOT / f"part_e_optimizer_positive_control_matrix_shard{int(args.shard_index)}_of_{int(args.shard_count)}.csv"
+    write_rows(path, rows)
+    append_exec("part-e", command_text(sys.argv), "shard-written", files=rel(path), note=f"rows={len(rows)}; force_after_d_fail={int(args.force_part_e_after_d_fail)}")
+    return gate_summary("E", 0, "E_ShardsWritten", "merge_required", rows)
+
+
+def merge_part_e(args: argparse.Namespace) -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    for path in sorted(OUT_ROOT.glob("part_e_optimizer_positive_control_matrix_shard*_of_*.csv")):
+        rows.extend(read_rows(path))
+    e0_times = {
+        (r.get("basis_key"), r.get("depth"), r.get("visual_synthetic_task"), str(r.get("seed"))): fval(r.get("wall_time_s"), 1.0)
+        for r in rows
+        if str(r.get("scheme")) == "E0_AdamW_control" and r.get("status") == "ok"
+    }
+    for row in rows:
+        key = (row.get("basis_key"), row.get("depth"), row.get("visual_synthetic_task"), str(row.get("seed")))
+        row["overhead_ratio"] = fval(row.get("wall_time_s")) / max(e0_times.get(key, fval(row.get("wall_time_s"), 1.0)), 1.0e-12)
+    matrix = write_rows(OUT_ROOT / "part_e_optimizer_positive_control_matrix.csv", rows)
+    ok = [r for r in rows if r.get("status") == "ok"]
+    summaries: list[dict[str, Any]] = []
+    for key in sorted({(r.get("scheme"), r.get("basis_key"), r.get("depth")) for r in ok}):
+        group = [r for r in ok if (r.get("scheme"), r.get("basis_key"), r.get("depth")) == key]
+        coverage_med = median([r.get("C2_coverage_improvement") for r in group])
+        accuracy_med = median([r.get("C2_accuracy_improvement") for r in group])
+        rows_ge = sum(ival(r.get("visual_rows_ge_0p02")) for r in group)
+        density = median([r.get("gate_density_mean") for r in group], 1.0)
+        overhead = median([r.get("overhead_ratio") for r in group], 1.0)
+        gate = int(
+            group
+            and coverage_med >= float(args.c2_coverage_gate)
+            and rows_ge >= math.ceil(float(args.c2_rows_ge_fraction) * len(group))
+            and overhead <= float(args.max_overhead_ratio)
+            and (str(key[0]) in {"E0_AdamW_control", "E1_EdgeSobolev_AdamW_s0"} or 0.05 <= density <= 0.80)
+        )
+        summaries.append(
+            {
+                "scheme": key[0],
+                "basis_key": key[1],
+                "depth": key[2],
+                "rows": len(group),
+                "C2_coverage_improvement_median": coverage_med,
+                "C2_accuracy_improvement_median": accuracy_med,
+                "visual_rows_ge_0p02": rows_ge,
+                "gate_density_mean": density,
+                "overhead_ratio_median": overhead,
+                "scheme_gate_pass": gate,
+            }
+        )
+    pass_groups = [s for s in summaries if ival(s.get("scheme_gate_pass")) == 1 and str(s.get("scheme")) != "E0_AdamW_control"]
+    gate = int(bool(pass_groups) and not any(r.get("status") == "error" for r in rows))
+    blocker = "none" if gate else ("part_e_job_errors" if any(r.get("status") == "error" for r in rows) else "c2_formation_or_gate_density_failed")
+    summary = gate_summary(
+        "E",
+        gate,
+        "E_C2FormationPass" if gate else "E_C2FormationFailed",
+        blocker,
+        rows,
+        part_c_role=str(args.part_c_role),
+        forced_after_c_fail=max([ival(r.get("forced_after_c_fail")) for r in rows] or [0]),
+        diagnostic_only=int(args.diagnostic_only),
+        seed_count=int(args.part_e_seed_count),
+        scheme_groups=summaries,
+        passing_scheme_groups=pass_groups,
+    )
+    write_json(OUT_ROOT / "part_e_optimizer_positive_control_summary.json", summary)
+    next_path = write_next_actions("e", summary["route"], blocker, [] if gate else ["try gate_floor 0.05/0.10, stat warmup 5/10, block gate, lower Sobolev exponent"], evidence={"matrix": rel(matrix), "passing_scheme_groups": pass_groups})
+    append_exec("part-e-merge", command_text(sys.argv), "passed" if gate else "failed", files=f"{rel(matrix)}; {rel(next_path)}")
+    append_recap("Part E optimizer positive-control", summary)
+    return summary
+
+
+def part_f_base_groups(args: argparse.Namespace) -> list[dict[str, Any]]:
+    e = read_json(OUT_ROOT / "part_e_optimizer_positive_control_summary.json")
+    groups = e.get("passing_scheme_groups", [])
+    if isinstance(groups, list) and groups:
+        return [dict(g, forced_after_e_fail=0) for g in groups]
+    out = []
+    for scheme in csv_items(args.part_f_base_schemes):
+        for basis in csv_items(args.part_f_basis):
+            for depth in csv_items(args.part_f_depths):
+                out.append({"scheme": scheme, "basis_key": basis, "depth": depth, "forced_after_e_fail": 1})
+    return out
+
+
+def part_f_jobs(args: argparse.Namespace) -> list[dict[str, Any]]:
+    jobs: list[dict[str, Any]] = []
+    requested = set(csv_items(args.part_f_parts))
+    for group_idx, group in enumerate(part_f_base_groups(args)):
+        for safety in csv_items(args.part_f_safety_schemes):
+            if "F3" in requested:
+                for task in csv_items(args.part_f_tasks):
+                    for seed in range(int(args.part_f_c2_seed_count)):
+                        jobs.append({"group_idx": group_idx, "scheme": group["scheme"], "basis_key": group["basis_key"], "depth": group["depth"], "forced_after_e_fail": group.get("forced_after_e_fail", 0), "part": "F3", "safety_type": safety, "teacher_type": "c2_visual_synthetic", "task": task, "seed": seed})
+            if "F5" in requested:
+                for seed in range(int(args.part_f_seed_count)):
+                    jobs.append({"group_idx": group_idx, "scheme": group["scheme"], "basis_key": group["basis_key"], "depth": group["depth"], "forced_after_e_fail": group.get("forced_after_e_fail", 0), "part": "F5", "safety_type": safety, "teacher_type": "f5_no_debt_calibration", "task": "", "seed": seed})
+    return jobs
 
 
 def run_part_f(args: argparse.Namespace) -> dict[str, Any]:
     e = read_json(OUT_ROOT / "part_e_optimizer_positive_control_summary.json")
-    if int(e.get("gate_pass", 0)) != 1:
-        return write_blocked_summary("F", "F_BlockedByPartE", str(e.get("dominant_blocker", "part_e_failed")), "Part E C2 formation did not pass.")
-    return write_blocked_summary("F", "F_SafetyEnvelopeFailed", "safety_full_matrix_not_run", "Part F requires a Part E passing fixed scheme.")
+    if int(e.get("gate_pass", 0)) != 1 and not int(args.force_part_f_after_e_fail):
+        return write_blocked_summary("F", "F_BlockedByPartE", str(e.get("dominant_blocker", "part_e_failed")), "Part E C2 formation did not pass and --force-part-f-after-e-fail=0.")
+    device = device_from_args(args)
+    rows: list[dict[str, Any]] = []
+    for job in shard_items(part_f_jobs(args), args):
+        try:
+            row = train_v23_scheme(
+                str(job["scheme"]),
+                str(job["basis_key"]),
+                str(job["depth"]),
+                str(job["teacher_type"]),
+                str(job["task"]),
+                int(job["seed"]),
+                args,
+                device,
+                part=str(job["part"]),
+                safety_type=str(job["safety_type"]),
+            )
+            row["group_idx"] = int(job["group_idx"])
+            row["forced_after_e_fail"] = int(job.get("forced_after_e_fail", 0))
+            rows.append(row)
+        except Exception as exc:
+            rows.append({"part": str(job.get("part", "F")), "status": "error", "error_message": repr(exc), **job, **AUDIT_DEFAULTS})
+    path = OUT_ROOT / f"part_f_safety_envelope_matrix_shard{int(args.shard_index)}_of_{int(args.shard_count)}.csv"
+    write_rows(path, rows)
+    append_exec("part-f", command_text(sys.argv), "shard-written", files=rel(path), note=f"rows={len(rows)}; force_after_e_fail={int(args.force_part_f_after_e_fail)}")
+    return gate_summary("F", 0, "F_ShardsWritten", "merge_required", rows)
+
+
+def merge_part_f(args: argparse.Namespace) -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    for path in sorted(OUT_ROOT.glob("part_f_safety_envelope_matrix_shard*_of_*.csv")):
+        rows.extend(read_rows(path))
+    matrix = write_rows(OUT_ROOT / "part_f_safety_envelope_matrix.csv", rows)
+    write_rows(OUT_ROOT / "part_f_phase_matrix.csv", rows)
+    ok = [r for r in rows if r.get("status") == "ok"]
+    group_summaries: list[dict[str, Any]] = []
+    for key in sorted({(r.get("group_idx"), r.get("scheme"), r.get("basis_key"), r.get("depth"), r.get("safety_type")) for r in ok}):
+        group = [r for r in ok if (r.get("group_idx"), r.get("scheme"), r.get("basis_key"), r.get("depth"), r.get("safety_type")) == key]
+        f3 = [r for r in group if r.get("part") == "F3"]
+        f5 = [r for r in group if r.get("part") == "F5"]
+        f0 = [r for r in ok if r.get("scheme") == key[1] and r.get("basis_key") == key[2] and r.get("depth") == key[3] and r.get("safety_type") == "F0_no_safety_control" and r.get("part") == "F3"]
+        c2_med = median([r.get("C2_coverage_improvement") for r in f3])
+        c2_base = median([r.get("C2_coverage_improvement") for r in f0], c2_med)
+        retention = c2_med / max(abs(c2_base), 1.0e-12) if f3 else 0.0
+        f5_count = sum(ival(r.get("F5_no_debt")) for r in f5)
+        component_nonpos = sum(
+            int(
+                fval(r.get("Brier_delta")) <= float(args.no_debt_budget)
+                and fval(r.get("ECE_delta")) <= float(args.no_debt_budget)
+                and fval(r.get("tail95_delta")) <= float(args.no_debt_budget)
+                and fval(r.get("tail99_delta")) <= float(args.no_debt_budget)
+                and fval(r.get("margin10_delta")) <= float(args.no_debt_budget)
+            )
+            for r in f5
+        )
+        random_count = max(
+            [
+                sum(
+                    ival(rr.get("F5_no_debt"))
+                    for rr in ok
+                    if rr.get("scheme") == key[1]
+                    and rr.get("basis_key") == key[2]
+                    and rr.get("depth") == key[3]
+                    and rr.get("safety_type") == "F6_random_debt_veto_control"
+                    and rr.get("part") == "F5"
+                )
+            ]
+            or [0]
+        )
+        random_gap = f5_count - random_count
+        gate = int(f5 and f5_count >= int(args.f5_diagnostic_gate) and retention >= 0.80 and random_gap > 0)
+        group_summaries.append(
+            {
+                "group_idx": ival(key[0]),
+                "scheme": key[1],
+                "basis_key": key[2],
+                "depth": key[3],
+                "safety_type": key[4],
+                "rows": len(group),
+                "F5_no_debt_count": f5_count,
+                "component_non_positive_rows": component_nonpos,
+                "C2_coverage_improvement_after_veto_median": c2_med,
+                "C2_retention_ratio_vs_no_safety": retention,
+                "veto_density_mean": median([r.get("veto_density_mean") for r in group]),
+                "random_veto_matched_gap": random_gap,
+                "part_f_group_gate_pass": gate,
+            }
+        )
+    pass_groups = [g for g in group_summaries if ival(g.get("part_f_group_gate_pass")) == 1 and str(g.get("safety_type")) not in {"F0_no_safety_control", "F6_random_debt_veto_control"}]
+    gate = int(bool(pass_groups) and not any(r.get("status") == "error" for r in rows))
+    blocker = "none" if gate else ("part_f_job_errors" if any(r.get("status") == "error" for r in rows) else "f5_no_debt_or_c2_retention_failed")
+    summary = gate_summary(
+        "F",
+        gate,
+        "F_SafetyEnvelopePass" if gate else "F_SafetyEnvelopeFailed",
+        blocker,
+        rows,
+        part_c_role=str(args.part_c_role),
+        forced_after_c_fail=max([ival(r.get("forced_after_c_fail")) for r in rows] or [0]),
+        forced_after_e_fail=max([ival(r.get("forced_after_e_fail")) for r in rows] or [0]),
+        diagnostic_only=int(args.diagnostic_only),
+        seed_count=int(args.part_f_seed_count),
+        group_summaries=group_summaries,
+        passing_part_f_groups=pass_groups,
+    )
+    write_json(OUT_ROOT / "part_f_safety_envelope_summary.json", summary)
+    write_json(OUT_ROOT / "part_f_phase_summary.json", summary)
+    next_path = write_next_actions("f", summary["route"], blocker, [] if gate else ["component-wise veto threshold", "block-local veto", "debt SNR diagnostic", "finite-step guard veto"], evidence={"matrix": rel(matrix), "passing_part_f_groups": pass_groups})
+    append_exec("part-f-merge", command_text(sys.argv), "passed" if gate else "failed", files=f"{rel(matrix)}; {rel(next_path)}")
+    append_recap("Part F safety envelope", summary)
+    return summary
 
 
 def run_part_g(args: argparse.Namespace) -> dict[str, Any]:
@@ -1167,9 +1720,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--pc-basis", default="D-FOU")
     p.add_argument("--basis-k-override", type=int, default=0)
     p.add_argument("--dfour-k", type=int, default=3)
+    p.add_argument("--input-dim", type=int, default=12)
     p.add_argument("--num-classes", type=int, default=3)
     p.add_argument("--deep-width", type=int, default=12)
+    p.add_argument("--mlp-hidden", type=int, default=24)
     p.add_argument("--basis-input-gain", type=float, default=1.0)
+    p.add_argument("--smoothness", type=float, default=1.0e-4)
     p.add_argument("--synthetic-train-size", type=int, default=72)
     p.add_argument("--synthetic-guard-size", type=int, default=72)
     p.add_argument("--visual-side", type=int, default=8)
@@ -1180,10 +1736,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--fresh-cohort-split", type=int, default=1)
     p.add_argument("--snr-examples", type=int, default=16)
     p.add_argument("--label-prior-correction", type=int, default=0)
+    p.add_argument("--part-c-role", default="hard", choices=["hard", "sanity"])
+    p.add_argument("--diagnostic-only", type=int, default=0)
+    p.add_argument("--continuation-metric-schemes", default="sobolev_s0p0")
     p.add_argument("--part-c-basis", default="dche_k5,dche_k9,dfour_default")
     p.add_argument("--part-c-depths", default="depth2,depth3")
     p.add_argument("--part-c-tasks", default="local_patch_interaction,rotation_sensitive")
     p.add_argument("--sobolev-exponents", default="0.25,0.5,1.0")
+    p.add_argument("--functional-gram-exponents", default="")
+    p.add_argument("--functional-gram-quadrature-points", type=int, default=257)
     p.add_argument("--edge-weight-normalization", default="median", choices=["median", "mean", "trace"])
     p.add_argument("--edge-weight-ridge", type=float, default=0.0)
     p.add_argument("--part-d-basis", default="dche_k5,dche_k9,dfour_default")
@@ -1195,6 +1756,35 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--snr-beta", type=float, default=2.0)
     p.add_argument("--lowrank-rank", type=int, default=4)
     p.add_argument("--cohort-count", type=int, default=4)
+    p.add_argument("--adamw-lr", type=float, default=0.02)
+    p.add_argument("--edge-lr", type=float, default=0.02)
+    p.add_argument("--weight-decay", type=float, default=1.0e-4)
+    p.add_argument("--population-grad-examples", type=int, default=8)
+    p.add_argument("--debt-grad-examples", type=int, default=8)
+    p.add_argument("--debt-veto-components", default="Brier,ECE,tail95,tail99,margin10")
+    p.add_argument("--gate-floor", type=float, default=0.0)
+    p.add_argument("--stat-warmup-steps", type=int, default=5)
+    p.add_argument("--train-steps", type=int, default=40)
+    p.add_argument("--no-debt-budget", type=float, default=0.01)
+    p.add_argument("--part-e-schemes", default="E0_AdamW_control,E1_EdgeSobolev_AdamW_s0,E3_EdgeSobolev_DiagonalSNR_s0,E4_EdgeSobolev_BlockSNR_s0,E6_RandomMatchedGate_Control_s0")
+    p.add_argument("--part-e-basis", default="dche_k9")
+    p.add_argument("--part-e-depths", default="depth3")
+    p.add_argument("--part-e-tasks", default="local_patch_interaction,rotation_sensitive")
+    p.add_argument("--part-e-seed-count", type=int, default=3)
+    p.add_argument("--force-part-e-after-d-fail", type=int, default=0)
+    p.add_argument("--c2-coverage-gate", type=float, default=0.02)
+    p.add_argument("--c2-rows-ge-fraction", type=float, default=0.50)
+    p.add_argument("--max-overhead-ratio", type=float, default=2.0)
+    p.add_argument("--part-f-base-schemes", default="E3_EdgeSobolev_DiagonalSNR_s0")
+    p.add_argument("--part-f-basis", default="dche_k9")
+    p.add_argument("--part-f-depths", default="depth3")
+    p.add_argument("--part-f-tasks", default="local_patch_interaction,rotation_sensitive")
+    p.add_argument("--part-f-safety-schemes", default="F0_no_safety_control,F2_component_conflict_veto,F6_random_debt_veto_control")
+    p.add_argument("--part-f-parts", default="F3,F5")
+    p.add_argument("--part-f-c2-seed-count", type=int, default=3)
+    p.add_argument("--part-f-seed-count", type=int, default=15)
+    p.add_argument("--force-part-f-after-e-fail", type=int, default=0)
+    p.add_argument("--f5-diagnostic-gate", type=int, default=10)
     return p
 
 
@@ -1215,8 +1805,12 @@ def main(argv: list[str] | None = None) -> dict[str, Any] | None:
         return merge_part_d(args)
     if mode == "part-e":
         return run_part_e(args)
+    if mode == "part-e-merge":
+        return merge_part_e(args)
     if mode == "part-f":
         return run_part_f(args)
+    if mode == "part-f-merge":
+        return merge_part_f(args)
     if mode == "part-g":
         return run_part_g(args)
     if mode == "part-h":

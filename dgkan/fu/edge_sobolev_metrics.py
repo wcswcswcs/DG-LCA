@@ -11,6 +11,7 @@ import math
 from typing import Iterable
 
 import torch
+from dgkan.models.fc_purekan_primitives import _basis_derivative, _basis_eval
 
 
 EPS = 1.0e-12
@@ -135,6 +136,111 @@ def matrix_mode_weights(matrix_shape: Iterable[int], mode_weights: torch.Tensor,
         raise ValueError(f"mode weight length {int(ww.numel())} does not match period {k}")
     row_weights = ww.repeat(int(math.ceil(rows / k)))[:rows]
     return row_weights.reshape(rows, 1).expand(rows, cols).reshape(-1).contiguous()
+
+
+def basis_name_for_key(basis_key: str) -> str:
+    key = str(basis_key).lower()
+    return "fourier_lowfreq" if "four" in key or "fou" in key else "chebyshev"
+
+
+def functional_edge_gram(
+    basis_key: str,
+    k: int,
+    *,
+    sobolev_order: float = 1.0,
+    quadrature_points: int = 257,
+    normalization: str = "trace",
+    ridge: float = 1.0e-6,
+    device: torch.device | None = None,
+    dtype: torch.dtype = torch.float64,
+) -> torch.Tensor:
+    """Numerically estimate the edge-function Hilbert/Sobolev Gram.
+
+    The Gram is built from the same fixed primitive basis used by PureKAN:
+
+    ``G = int psi psi^T du + sobolev_order * int psi' psi'^T du``.
+
+    This is a dense KxK Gram in function space, not a diagonal mode proxy.
+    """
+
+    kk = int(k)
+    if kk <= 0:
+        return torch.empty((0, 0), device=device, dtype=dtype)
+    n = max(8, int(quadrature_points))
+    z = torch.linspace(-1.0, 1.0, n, device=device, dtype=dtype)
+    centers = torch.linspace(-1.0, 1.0, kk, device=device, dtype=dtype)
+    scales = torch.tensor([max(0.2, 2.0 / max(1, kk - 1))], device=device, dtype=dtype)
+    basis_name = basis_name_for_key(basis_key)
+    phi = _basis_eval(z, basis_name, kk, centers, scales).reshape(n, kk).to(dtype=dtype)
+    dphi = _basis_derivative(z, basis_name, kk, centers, scales).reshape(n, kk).to(dtype=dtype)
+    dz = 2.0 / float(max(1, n - 1))
+    weights = torch.ones(n, device=device, dtype=dtype) * dz
+    weights[0] *= 0.5
+    weights[-1] *= 0.5
+    gram = phi.T @ (phi * weights.reshape(-1, 1))
+    if float(sobolev_order) > 0.0:
+        gram = gram + float(sobolev_order) * (dphi.T @ (dphi * weights.reshape(-1, 1)))
+    gram = 0.5 * (gram + gram.T)
+    if str(normalization) == "trace":
+        gram = gram / (torch.trace(gram).div(float(max(1, kk))).clamp_min(EPS))
+    elif str(normalization) == "mean":
+        gram = gram / gram.mean().abs().clamp_min(EPS)
+    else:
+        gram = gram / torch.diag(gram).median().clamp_min(EPS)
+    if float(ridge) > 0.0:
+        gram = gram + float(ridge) * torch.eye(kk, device=device, dtype=dtype)
+    return 0.5 * (gram + gram.T)
+
+
+def functional_gram_condition(gram: torch.Tensor, eps: float = EPS) -> float:
+    if int(gram.numel()) == 0:
+        return 0.0
+    vals = torch.linalg.eigvalsh(0.5 * (gram + gram.T)).to(dtype=torch.float64)
+    return _safe_float(vals.max().clamp_min(eps) / vals.min().clamp_min(eps))
+
+
+def _matrix_to_edge_vectors(matrix: torch.Tensor, k: int) -> torch.Tensor:
+    mat = matrix.detach().to(dtype=torch.float64)
+    rows, cols = int(mat.shape[0]), int(mat.shape[1])
+    kk = int(k)
+    edge_count = int(math.ceil(rows / kk))
+    padded_rows = edge_count * kk
+    if padded_rows != rows:
+        pad = torch.zeros((padded_rows - rows, cols), dtype=mat.dtype, device=mat.device)
+        mat = torch.cat([mat, pad], dim=0)
+    return mat.reshape(edge_count, kk, cols).permute(0, 2, 1).reshape(edge_count * cols, kk)
+
+
+def functional_gram_cost(matrix: torch.Tensor, gram: torch.Tensor, *, mode_axis_period: int) -> float:
+    vecs = _matrix_to_edge_vectors(matrix, int(mode_axis_period))
+    if int(vecs.numel()) == 0:
+        return 0.0
+    g = gram.to(device=vecs.device, dtype=vecs.dtype)
+    return _safe_float((vecs @ g * vecs).sum())
+
+
+def functional_gram_whitened_vector(matrix: torch.Tensor, gram: torch.Tensor, *, mode_axis_period: int, eps: float = EPS) -> torch.Tensor:
+    vecs = _matrix_to_edge_vectors(matrix, int(mode_axis_period))
+    if int(vecs.numel()) == 0:
+        return torch.zeros(0, dtype=torch.float64)
+    g = gram.to(device=vecs.device, dtype=vecs.dtype)
+    vals, vec_basis = torch.linalg.eigh(0.5 * (g + g.T))
+    inv_sqrt = (vec_basis * vals.clamp_min(float(eps)).rsqrt().reshape(1, -1)) @ vec_basis.T
+    white = vecs @ inv_sqrt.T
+    return white.reshape(-1).contiguous()
+
+
+def functional_gram_inverse_retention(matrix: torch.Tensor, gram: torch.Tensor, *, mode_axis_period: int, eps: float = EPS) -> float:
+    vecs = _matrix_to_edge_vectors(matrix, int(mode_axis_period))
+    if int(vecs.numel()) == 0:
+        return 0.0
+    g = gram.to(device=vecs.device, dtype=vecs.dtype)
+    vals, vec_basis = torch.linalg.eigh(0.5 * (g + g.T))
+    inv = (vec_basis * vals.clamp_min(float(eps)).reciprocal().reshape(1, -1)) @ vec_basis.T
+    energy = vecs.square().sum().clamp_min(float(eps))
+    low_cost_energy = (vecs @ inv * vecs).sum()
+    normalizer = torch.trace(inv).div(float(max(1, int(g.shape[0])))).clamp_min(float(eps))
+    return _safe_float(low_cost_energy / (energy * normalizer))
 
 
 def edge_sobolev_whiten(x: torch.Tensor, weights: torch.Tensor, eps: float = EPS) -> torch.Tensor:
