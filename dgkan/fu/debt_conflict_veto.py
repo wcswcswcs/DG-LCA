@@ -43,6 +43,8 @@ def conflict_veto_gate(
     task_mu: torch.Tensor,
     debt_gates: Mapping[str, torch.Tensor],
     debt_mus: Mapping[str, torch.Tensor],
+    *,
+    conflict_mode: str = "legacy_positive",
 ) -> tuple[torch.Tensor, dict[str, float | int | str]]:
     """Apply component-wise conflict veto.
 
@@ -63,15 +65,20 @@ def conflict_veto_gate(
             debt_gate = debt_gate[: int(tg.numel())]
             if int(debt_gate.numel()) < int(tg.numel()):
                 debt_gate = torch.nn.functional.pad(debt_gate, (0, int(tg.numel()) - int(debt_gate.numel())))
-        cos_pos = positive_cosine(task_mu, debt_mus[name])
+        cosine = task_debt_cosine(task_mu, debt_mus[name])
+        if str(conflict_mode) in {"descent_negative", "corrected_descent"}:
+            cos_pos = torch.tensor(max(0.0, -float(cosine)), dtype=torch.float64)
+        else:
+            cos_pos = torch.tensor(max(0.0, float(cosine)), dtype=torch.float64)
         veto = debt_gate.clamp(0.0, 1.0) * cos_pos.square()
         max_veto = torch.maximum(max_veto, veto)
         component_rows[f"veto_density_{name}"] = _f(veto.mean())
-        component_rows[f"task_debt_cosine_{name}"] = task_debt_cosine(task_mu, debt_mus[name])
+        component_rows[f"task_debt_cosine_{name}"] = float(cosine)
     out = tg * (1.0 - max_veto.clamp(0.0, 1.0))
     removed = (tg - out).clamp_min(0.0)
     summary: dict[str, float | int | str] = {
         "component_count": len(component_rows) // 2,
+        "conflict_mode": str(conflict_mode),
         "veto_density_mean": _f(max_veto.mean()),
         "vetoed_task_energy_fraction": _f(removed.sum() / tg.sum().clamp_min(EPS)),
         "preserved_task_energy_fraction": _f(out.sum() / tg.sum().clamp_min(EPS)),
@@ -99,10 +106,21 @@ def debt_conflict_veto_smoke_test() -> dict[str, float | int]:
     orth_mu = torch.tensor([0.0, 1.0, 0.0, 0.0], dtype=torch.float64)
     same, same_summary = conflict_veto_gate(task_gate, task_mu, {"same": task_gate}, {"same": same_mu})
     orth, orth_summary = conflict_veto_gate(task_gate, task_mu, {"orth": task_gate}, {"orth": orth_mu})
+    opposite_mu = torch.tensor([-1.0, 0.0, 0.0, 0.0], dtype=torch.float64)
+    corrected, corrected_summary = conflict_veto_gate(
+        task_gate,
+        task_mu,
+        {"opposite": task_gate},
+        {"opposite": opposite_mu},
+        conflict_mode="descent_negative",
+    )
     return {
         "same_direction_gate_mean": _f(same.mean()),
         "orthogonal_gate_mean": _f(orth.mean()),
         "same_reduces_gate": int(_f(same.mean()) < _f(orth.mean())),
         "same_veto_density": float(same_summary.get("veto_density_mean", 0.0)),
         "orth_veto_density": float(orth_summary.get("veto_density_mean", 0.0)),
+        "corrected_opposite_gate_mean": _f(corrected.mean()),
+        "corrected_opposite_reduces_gate": int(_f(corrected.mean()) < 1.0),
+        "corrected_opposite_veto_density": float(corrected_summary.get("veto_density_mean", 0.0)),
     }

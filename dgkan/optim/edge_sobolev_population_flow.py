@@ -73,6 +73,7 @@ class EdgeSobolevPopulationFlow(torch.optim.Optimizer):
             stat_warmup_steps=int(stat_warmup_steps),
             use_population_gate=bool(use_population_gate),
             use_debt_veto=bool(use_debt_veto),
+            debt_veto_conflict_mode="legacy_positive",
         )
         super().__init__(list(params), defaults)
         self._observed_grads: dict[int, torch.Tensor] = {}
@@ -167,11 +168,25 @@ class EdgeSobolevPopulationFlow(torch.optim.Optimizer):
         out = flat @ inv_sqrt.T.to(device=tensor.device, dtype=tensor.dtype)
         return out.reshape(orig_shape).movedim(-1, axis + (1 if leading_example else 0))
 
-    def _blocks_for_param(self, param: torch.nn.Parameter) -> list[list[int]]:
+    def _blocks_for_param(self, param: torch.nn.Parameter, group: dict | None = None) -> list[list[int]]:
         basis_key = getattr(param, "_kan_basis_key", getattr(param, "_kan_basis_name", "dche_k5"))
         k = int(getattr(param, "_kan_basis_order_or_freq_count", param.shape[-1] if param.ndim else 1))
         if int(param.numel()) <= 0 or k <= 0:
             return []
+        family = str((group or {}).get("gate_family", "block")).lower()
+        if "edgebank" in family:
+            rows = max(1, int(param.numel()) // k)
+            if "degree" not in family:
+                return [list(range(row * k, min((row + 1) * k, int(param.numel())))) for row in range(rows)]
+            bands = mode_band_slices(k, str(basis_key))
+            blocks: list[list[int]] = []
+            for row in range(rows):
+                base = row * k
+                for mode_ids in bands.values():
+                    block = [base + mode for mode in mode_ids if base + mode < int(param.numel())]
+                    if block:
+                        blocks.append(block)
+            return blocks
         blocks: list[list[int]] = []
         bands = mode_band_slices(k, str(basis_key))
         for mode_ids in bands.values():
@@ -185,7 +200,9 @@ class EdgeSobolevPopulationFlow(torch.optim.Optimizer):
         white_obs = white_tensor.reshape(int(observed.shape[0]), -1)
         family = str(group.get("gate_family", "diagonal"))
         if family == "block":
-            gres = block_snr_gate(white_obs.detach().cpu(), self._blocks_for_param(param), beta=float(group["gate_beta"]))
+            gres = block_snr_gate(white_obs.detach().cpu(), self._blocks_for_param(param, group), beta=float(group["gate_beta"]))
+        elif family in {"edgebank", "degree_edgebank"}:
+            gres = block_snr_gate(white_obs.detach().cpu(), self._blocks_for_param(param, group), beta=float(group["gate_beta"]))
         else:
             gres = diagonal_snr_gate(white_obs.detach().cpu(), beta=float(group["gate_beta"]))
         gate = gres.gate.to(device=param.device, dtype=param.dtype)
@@ -260,7 +277,13 @@ class EdgeSobolevPopulationFlow(torch.optim.Optimizer):
                                 debt_gates[component] = dgate.reshape(-1)
                                 debt_mus[component] = dmu.reshape(-1)
                             if debt_gates:
-                                flat_gate, veto_summary = conflict_veto_gate(gate.reshape(-1), task_mu.reshape(-1), debt_gates, debt_mus)
+                                flat_gate, veto_summary = conflict_veto_gate(
+                                    gate.reshape(-1),
+                                    task_mu.reshape(-1),
+                                    debt_gates,
+                                    debt_mus,
+                                    conflict_mode=str(group.get("debt_veto_conflict_mode", "legacy_positive")),
+                                )
                                 gate = flat_gate.to(device=param.device, dtype=param.dtype).reshape_as(param)
                                 veto_density.append(float(veto_summary.get("veto_density_mean", 0.0)))
                                 preserved_energy.append(float(veto_summary.get("preserved_task_energy_fraction", 1.0)))

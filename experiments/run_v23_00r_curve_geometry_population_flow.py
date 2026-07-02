@@ -1089,7 +1089,15 @@ def observe_task_gradients(opt: EdgeSobolevSNRFU, model: v2293.TrueDeepPureKAN, 
     )
 
 
-def debt_component_loss(logits: torch.Tensor, y: torch.Tensor, component: str, baseline: dict[str, float] | None = None, budget: float = 0.0) -> torch.Tensor:
+def debt_component_loss(
+    logits: torch.Tensor,
+    y: torch.Tensor,
+    component: str,
+    baseline: dict[str, float] | None = None,
+    budget: float = 0.0,
+    *,
+    proactive: bool = False,
+) -> torch.Tensor:
     prob = F.softmax(logits.float(), dim=1)
     one_hot = F.one_hot(y.long(), num_classes=int(logits.shape[1])).to(dtype=prob.dtype)
     true_prob = prob.gather(1, y.long().reshape(-1, 1)).reshape(-1)
@@ -1104,6 +1112,8 @@ def debt_component_loss(logits: torch.Tensor, y: torch.Tensor, component: str, b
         k = max(1, int(math.ceil(float(q) * int(true_prob.numel()))))
         sorted_risk = torch.sort(1.0 - true_prob).values
         tail = sorted_risk[min(k - 1, int(sorted_risk.numel()) - 1) :].mean()
+        if bool(proactive):
+            return tail
         target = float((baseline or {}).get(component, 0.0)) + float(budget)
         return F.relu(tail - target).square()
     if component == "margin10":
@@ -1113,29 +1123,60 @@ def debt_component_loss(logits: torch.Tensor, y: torch.Tensor, component: str, b
         margin = true_logit - other_logits.max(dim=1).values
         k = max(1, int(math.ceil(0.10 * int(margin.numel()))))
         low_margin = torch.sort(margin).values[:k].mean()
+        if bool(proactive):
+            return -low_margin
         floor = float((baseline or {}).get(component, 0.0)) - float(budget)
         return F.relu(floor - low_margin).square()
     return logits.float().sum() * 0.0
 
 
-def per_example_debt_gradient_matrix(model: torch.nn.Module, x: torch.Tensor, y: torch.Tensor, component: str, *, max_examples: int, baseline: dict[str, float], budget: float) -> torch.Tensor:
+def per_example_debt_gradient_matrix(
+    model: torch.nn.Module,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    component: str,
+    *,
+    max_examples: int,
+    baseline: dict[str, float],
+    budget: float,
+    proactive: bool = False,
+) -> torch.Tensor:
     rows: list[torch.Tensor] = []
     params = list(getattr(model, "coeffs", list(model.parameters())))
     n = min(int(max_examples), int(x.shape[0]))
     for idx in range(n):
         logits = model(x[idx : idx + 1])
-        loss = debt_component_loss(logits, y[idx : idx + 1], component, baseline=baseline, budget=budget)
+        loss = debt_component_loss(logits, y[idx : idx + 1], component, baseline=baseline, budget=budget, proactive=proactive)
         grads = torch.autograd.grad(loss, params, retain_graph=False, allow_unused=True)
         rows.append(torch.cat([(torch.zeros_like(p) if g is None else g).detach().reshape(-1).to(dtype=torch.float64) for g, p in zip(grads, params)]).cpu())
     return torch.stack(rows, dim=0).to(dtype=torch.float64) if rows else torch.zeros((0, 0), dtype=torch.float64)
 
 
-def observe_debt_gradients(opt: EdgeSobolevSNRFUWithDebtVeto, model: v2293.TrueDeepPureKAN, x: torch.Tensor, y: torch.Tensor, args: argparse.Namespace, baseline: dict[str, float], *, randomize_alignment: bool = False) -> dict[str, float | int | str]:
+def observe_debt_gradients(
+    opt: EdgeSobolevSNRFUWithDebtVeto,
+    model: v2293.TrueDeepPureKAN,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    args: argparse.Namespace,
+    baseline: dict[str, float],
+    *,
+    randomize_alignment: bool = False,
+    proactive: bool = False,
+) -> dict[str, float | int | str]:
     params = list(model.coeffs)
     components = csv_items(args.debt_veto_components)
-    out: dict[str, float | int | str] = {"debt_veto_components": ",".join(components)}
+    out: dict[str, float | int | str] = {"debt_veto_components": ",".join(components), "debt_veto_proactive": int(bool(proactive))}
     for component in components:
-        flat = per_example_debt_gradient_matrix(model, x, y, component, max_examples=int(args.debt_grad_examples), baseline=baseline, budget=float(args.no_debt_budget))
+        flat = per_example_debt_gradient_matrix(
+            model,
+            x,
+            y,
+            component,
+            max_examples=int(args.debt_grad_examples),
+            baseline=baseline,
+            budget=float(args.no_debt_budget),
+            proactive=bool(proactive),
+        )
         if randomize_alignment and flat.ndim == 2 and int(flat.shape[1]) > 0:
             perm = torch.randperm(int(flat.shape[1]))
             flat = flat[:, perm]
@@ -1168,6 +1209,18 @@ def debt_deltas(metrics: dict[str, float], baseline: dict[str, float]) -> dict[s
         "tail99": float(metrics.get("tail99", 0.0)) - float(baseline.get("tail99", 0.0)),
         "margin10": float(metrics.get("margin10", 0.0)) - float(baseline.get("margin10", 0.0)),
     }
+
+
+def debt_component_ok(component: str, delta: float, budget: float) -> bool:
+    if str(component) == "margin10":
+        return float(delta) >= -float(budget)
+    return float(delta) <= float(budget)
+
+
+def debt_component_slack(component: str, delta: float, budget: float) -> float:
+    if str(component) == "margin10":
+        return float(delta) + float(budget)
+    return float(budget) - float(delta)
 
 
 def snapshot_model_params(model: torch.nn.Module) -> list[tuple[torch.nn.Parameter, torch.Tensor]]:
@@ -1232,8 +1285,56 @@ def finite_step_guarded_step(
     safety_type: str,
     step: int,
 ) -> dict[str, float | int | str]:
-    finite_enabled = "finite" in str(safety_type).lower()
+    safety_lower = str(safety_type).lower()
+    predictive_enabled = "predictive" in safety_lower or "scaled_cadence" in safety_lower
+    finite_enabled = "finite" in str(safety_type).lower() or predictive_enabled
+    predictive_scale = max(0.0, min(1.0, fval(getattr(args, "predictive_trust_scale", 1.0), 1.0)))
+    guard_n = min(int(args.finite_step_guard_examples), int(xg.shape[0]))
+    x_eval = xg[:guard_n]
+    y_eval = yg[:guard_n]
+    components = csv_items(args.finite_step_components)
+    budget = float(args.no_debt_budget)
+
+    def state_slack_adjusted_scale(base_scale: float) -> tuple[float, str]:
+        if "slack" not in safety_lower and "component_risk" not in safety_lower:
+            return float(base_scale), "predictive_unchecked"
+        metrics = v2293.metrics_for_model(model, x_eval, y_eval)
+        deltas = debt_deltas(metrics, baseline)
+        if not components:
+            return float(base_scale), "predictive_slack_no_components"
+        slack = min(debt_component_slack(component, float(deltas.get(component, 0.0)), float(budget)) for component in components)
+        denom = max(abs(float(budget)), 1.0e-8)
+        slack_ratio = max(0.0, min(1.0, slack / denom))
+        return float(base_scale) * slack_ratio, f"predictive_slack_ratio={slack_ratio:.6g}"
+
     if not finite_enabled or int(args.finite_step_guard_every) <= 0 or int(step) % int(args.finite_step_guard_every) != 0:
+        if finite_enabled and predictive_enabled:
+            predictive_scale, reason = state_slack_adjusted_scale(predictive_scale)
+            if predictive_scale <= 0.0:
+                if hasattr(opt, "clear_observed_gradients"):
+                    opt.clear_observed_gradients()
+                return {
+                    "finite_step_enabled": int(finite_enabled),
+                    "finite_step_accept": 0,
+                    "finite_step_skip": 1,
+                    "finite_step_scale": 0.0,
+                    "finite_step_attempts": 1,
+                    "finite_step_reject_reason": "predictive_slack_zero",
+                }
+            base_lrs = [float(group.get("lr", 0.0)) for group in opt.param_groups]
+            for group, lr in zip(opt.param_groups, base_lrs):
+                group["lr"] = lr * predictive_scale
+            opt.step()
+            for group, lr in zip(opt.param_groups, base_lrs):
+                group["lr"] = lr
+            return {
+                "finite_step_enabled": int(finite_enabled),
+                "finite_step_accept": 1,
+                "finite_step_skip": 0,
+                "finite_step_scale": predictive_scale,
+                "finite_step_attempts": 1,
+                "finite_step_reject_reason": reason,
+            }
         opt.step()
         return {
             "finite_step_enabled": int(finite_enabled),
@@ -1247,24 +1348,33 @@ def finite_step_guarded_step(
     model_snapshot = snapshot_model_params(model)
     opt_snapshot = snapshot_optimizer(opt)
     base_lrs = [float(group.get("lr", 0.0)) for group in opt.param_groups]
-    guard_n = min(int(args.finite_step_guard_examples), int(xg.shape[0]))
-    x_eval = xg[:guard_n]
-    y_eval = yg[:guard_n]
-    components = csv_items(args.finite_step_components)
-    budget = float(args.no_debt_budget)
     enforce_debt = str(part).upper() == "F5" or bool(int(args.finite_step_apply_all_parts))
     last_reason = "no_attempt"
     attempts = max(1, int(args.finite_step_tries))
+    predictive_scale, predictive_reason = state_slack_adjusted_scale(predictive_scale)
+    if predictive_enabled and predictive_scale <= 0.0:
+        restore_model_params(model_snapshot)
+        restore_optimizer(opt, opt_snapshot)
+        if hasattr(opt, "clear_observed_gradients"):
+            opt.clear_observed_gradients()
+        return {
+            "finite_step_enabled": 1,
+            "finite_step_accept": 0,
+            "finite_step_skip": 1,
+            "finite_step_scale": 0.0,
+            "finite_step_attempts": 1,
+            "finite_step_reject_reason": "predictive_slack_zero",
+        }
     for attempt in range(attempts):
         restore_model_params(model_snapshot)
         restore_optimizer(opt, opt_snapshot)
-        scale = float(args.finite_step_shrink) ** attempt
+        scale = (predictive_scale if predictive_enabled else 1.0) * (float(args.finite_step_shrink) ** attempt)
         for group, lr in zip(opt.param_groups, base_lrs):
             group["lr"] = lr * scale
         opt.step()
         metrics = v2293.metrics_for_model(model, x_eval, y_eval)
         deltas = debt_deltas(metrics, baseline)
-        debt_ok = all(float(deltas.get(component, 0.0)) <= budget for component in components)
+        debt_ok = all(debt_component_ok(component, float(deltas.get(component, 0.0)), budget) for component in components)
         c2_delta = float(metrics.get("coverage_CVaR25", 0.0)) - float(baseline.get("coverage_CVaR25", 0.0))
         c2_ok = str(part).upper() != "F3" or c2_delta >= float(args.finite_step_c2_floor)
         if (debt_ok or not enforce_debt) and c2_ok:
@@ -1278,13 +1388,13 @@ def finite_step_guarded_step(
                 "finite_step_attempts": attempt + 1,
                 "finite_step_reject_reason": "accepted",
             }
-        bad_components = [component for component in components if float(deltas.get(component, 0.0)) > budget]
+        bad_components = [component for component in components if not debt_component_ok(component, float(deltas.get(component, 0.0)), budget)]
         if not c2_ok:
             last_reason = "c2_floor"
         elif bad_components:
             last_reason = "debt_" + "|".join(bad_components)
         else:
-            last_reason = "unknown"
+            last_reason = predictive_reason if predictive_enabled else "unknown"
     restore_model_params(model_snapshot)
     restore_optimizer(opt, opt_snapshot)
     for group, lr in zip(opt.param_groups, base_lrs):
@@ -1304,10 +1414,20 @@ def finite_step_guarded_step(
 def parse_v23_scheme(scheme: str, *, safety_type: str = "") -> dict[str, Any]:
     text = str(scheme)
     lower = text.lower()
+    if "random" in lower:
+        gate_family = "random_matched"
+    elif "degree" in lower and "edgebank" in lower:
+        gate_family = "degree_edgebank"
+    elif "edgebank" in lower or "edge_bank" in lower:
+        gate_family = "edgebank"
+    elif "block" in lower:
+        gate_family = "block"
+    else:
+        gate_family = "diagonal"
     return {
         "optimizer_family": "adamw" if text == "E0_AdamW_control" or "adamw_control" in lower else "edge_sobolev",
         "use_population_gate": int("snr" in lower or "random" in lower),
-        "gate_family": "block" if "block" in lower else ("random_matched" if "random" in lower else "diagonal"),
+        "gate_family": gate_family,
         "sobolev_exponent": scheme_sobolev_exponent(text),
         "edge_metric_type": "functional_gram" if "functionalgram" in lower or "functional_gram" in lower else "mode_diag",
         "use_debt_veto": int("veto" in str(safety_type).lower()),
@@ -1334,6 +1454,10 @@ def make_v23_optimizer(model: v2293.TrueDeepPureKAN, basis_key: str, scheme: str
         gate_floor=float(args.gate_floor),
         stat_warmup_steps=int(args.stat_warmup_steps),
     )
+    if spec["use_debt_veto"]:
+        mode = "descent_negative" if ("corrected" in str(safety_type).lower() or "proactive" in str(safety_type).lower()) else "legacy_positive"
+        for group in opt.param_groups:
+            group["debt_veto_conflict_mode"] = mode
     return opt, spec
 
 
@@ -1391,8 +1515,27 @@ def train_v23_scheme(
             grad_nan_count += nnan
             grad_inf_count += ninf
             if isinstance(opt, EdgeSobolevSNRFUWithDebtVeto):
-                debt_diag = observe_debt_gradients(opt, model, xb, yb, args, before_train, randomize_alignment="random" in str(safety_type).lower())
-        loss = F.cross_entropy(model(xb).float(), yb.long())
+                debt_diag = observe_debt_gradients(
+                    opt,
+                    model,
+                    xb,
+                    yb,
+                    args,
+                    before_train,
+                    randomize_alignment="random" in str(safety_type).lower(),
+                    proactive=("proactive" in str(safety_type).lower() or "corrected" in str(safety_type).lower()),
+                )
+        logits = model(xb).float()
+        loss = F.cross_entropy(logits, yb.long())
+        reg_weight = fval(getattr(args, "debt_regularization_weight", 0.0), 0.0)
+        if reg_weight > 0.0:
+            reg_components = csv_items(getattr(args, "debt_regularization_components", getattr(args, "debt_veto_components", "")))
+            reg_terms = [
+                debt_component_loss(logits, yb, component, baseline=before_train, budget=float(args.no_debt_budget), proactive=True)
+                for component in reg_components
+            ]
+            if reg_terms:
+                loss = loss + float(reg_weight) * torch.stack([term.reshape(()) for term in reg_terms]).mean()
         loss.backward()
         finite_diag = finite_step_guarded_step(opt, model, before, xg, yg, args, part=part, safety_type=safety_type, step=step)
         finite_accept_count += ival(finite_diag.get("finite_step_accept"))
@@ -1400,7 +1543,7 @@ def train_v23_scheme(
         finite_attempt_count += ival(finite_diag.get("finite_step_attempts"))
         finite_scale_trace.append(fval(finite_diag.get("finite_step_scale"), 1.0))
         reason = str(finite_diag.get("finite_step_reject_reason", ""))
-        if reason and reason not in {"accepted", "not_checked"}:
+        if reason and reason not in {"accepted", "not_checked"} and not reason.startswith("predictive_unchecked") and not reason.startswith("predictive_slack_ratio"):
             finite_reject_reasons[reason] = finite_reject_reasons.get(reason, 0) + 1
         if hasattr(opt, "last_stats"):
             gate_trace.append(float(opt.last_stats.gate_density_mean))
@@ -1417,7 +1560,7 @@ def train_v23_scheme(
         "tail99": after.get("tail99", 0.0) - before.get("tail99", 0.0),
         "margin10": after.get("margin10", 0.0) - before.get("margin10", 0.0),
     }
-    no_debt = int(all(float(component_deltas[k]) <= float(args.no_debt_budget) for k in component_deltas))
+    no_debt = int(all(debt_component_ok(k, float(component_deltas[k]), float(args.no_debt_budget)) for k in component_deltas))
     return {
         "part": part,
         "status": "ok",
@@ -1436,8 +1579,14 @@ def train_v23_scheme(
         "snr_gate_type": spec["gate_family"] if spec["use_population_gate"] else "none",
         "sobolev_s": spec["sobolev_exponent"],
         "stat_warmup_steps": int(args.stat_warmup_steps),
+        "edge_lr": float(args.edge_lr),
+        "adamw_lr": float(args.adamw_lr),
+        "no_debt_budget": float(args.no_debt_budget),
+        "debt_veto_conflict_mode": str(opt.param_groups[0].get("debt_veto_conflict_mode", "none")) if opt.param_groups else "none",
+        "debt_regularization_weight": fval(getattr(args, "debt_regularization_weight", 0.0), 0.0),
+        "debt_regularization_components": str(getattr(args, "debt_regularization_components", "")),
         "gate_floor": float(args.gate_floor),
-        "finite_step_enabled": int("finite" in str(safety_type).lower()),
+        "finite_step_enabled": int("finite" in str(safety_type).lower() or "predictive" in str(safety_type).lower() or "scaled_cadence" in str(safety_type).lower()),
         "finite_step_accept_count": finite_accept_count,
         "finite_step_skip_count": finite_skip_count,
         "finite_step_attempt_count": finite_attempt_count,
@@ -1673,7 +1822,7 @@ def merge_part_f(args: argparse.Namespace) -> dict[str, Any]:
                 and fval(r.get("ECE_delta")) <= float(args.no_debt_budget)
                 and fval(r.get("tail95_delta")) <= float(args.no_debt_budget)
                 and fval(r.get("tail99_delta")) <= float(args.no_debt_budget)
-                and fval(r.get("margin10_delta")) <= float(args.no_debt_budget)
+                and fval(r.get("margin10_delta")) >= -float(args.no_debt_budget)
             )
             for r in f5
         )
@@ -1931,6 +2080,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--population-grad-examples", type=int, default=8)
     p.add_argument("--debt-grad-examples", type=int, default=8)
     p.add_argument("--debt-veto-components", default="Brier,ECE,tail95,tail99,margin10")
+    p.add_argument("--debt-regularization-weight", type=float, default=0.0)
+    p.add_argument("--debt-regularization-components", default="Brier,ECE,tail95,tail99,margin10")
     p.add_argument("--gate-floor", type=float, default=0.0)
     p.add_argument("--stat-warmup-steps", type=int, default=5)
     p.add_argument("--train-steps", type=int, default=40)
