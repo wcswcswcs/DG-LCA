@@ -13,7 +13,7 @@ import py_compile
 import re
 import sys
 import time
-from copy import copy
+import copy
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -1160,6 +1160,147 @@ def data_op_drifts(model: v2293.TrueDeepPureKAN, before_mats: list[torch.Tensor]
     return max(data_drifts or [0.0]), max(op_drifts or [0.0])
 
 
+def debt_deltas(metrics: dict[str, float], baseline: dict[str, float]) -> dict[str, float]:
+    return {
+        "Brier": float(metrics.get("brier", 0.0)) - float(baseline.get("brier", 0.0)),
+        "ECE": float(metrics.get("ece", 0.0)) - float(baseline.get("ece", 0.0)),
+        "tail95": float(metrics.get("tail95", 0.0)) - float(baseline.get("tail95", 0.0)),
+        "tail99": float(metrics.get("tail99", 0.0)) - float(baseline.get("tail99", 0.0)),
+        "margin10": float(metrics.get("margin10", 0.0)) - float(baseline.get("margin10", 0.0)),
+    }
+
+
+def snapshot_model_params(model: torch.nn.Module) -> list[tuple[torch.nn.Parameter, torch.Tensor]]:
+    return [(p, p.detach().clone()) for p in model.parameters()]
+
+
+@torch.no_grad()
+def restore_model_params(snapshot: list[tuple[torch.nn.Parameter, torch.Tensor]]) -> None:
+    for param, value in snapshot:
+        param.copy_(value)
+
+
+def clone_state_value(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.detach().clone()
+    if isinstance(value, dict):
+        return {k: clone_state_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [clone_state_value(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(clone_state_value(v) for v in value)
+    return copy.deepcopy(value)
+
+
+def snapshot_optimizer(opt: torch.optim.Optimizer) -> dict[str, Any]:
+    snap: dict[str, Any] = {
+        "state": {p: {k: clone_state_value(v) for k, v in state.items()} for p, state in opt.state.items()},
+        "group_scalars": [
+            {k: clone_state_value(v) for k, v in group.items() if k != "params" and not isinstance(v, torch.Tensor)}
+            for group in opt.param_groups
+        ],
+    }
+    if hasattr(opt, "_observed_grads"):
+        snap["observed_grads"] = clone_state_value(getattr(opt, "_observed_grads"))
+    if hasattr(opt, "_observed_debt_grads"):
+        snap["observed_debt_grads"] = clone_state_value(getattr(opt, "_observed_debt_grads"))
+    return snap
+
+
+def restore_optimizer(opt: torch.optim.Optimizer, snapshot: dict[str, Any]) -> None:
+    opt.state.clear()
+    for param, state in snapshot.get("state", {}).items():
+        opt.state[param] = {k: clone_state_value(v) for k, v in state.items()}
+    for group, scalars in zip(opt.param_groups, snapshot.get("group_scalars", [])):
+        for key, value in scalars.items():
+            group[key] = clone_state_value(value)
+    if "observed_grads" in snapshot and hasattr(opt, "_observed_grads"):
+        setattr(opt, "_observed_grads", clone_state_value(snapshot["observed_grads"]))
+    if "observed_debt_grads" in snapshot and hasattr(opt, "_observed_debt_grads"):
+        setattr(opt, "_observed_debt_grads", clone_state_value(snapshot["observed_debt_grads"]))
+
+
+def finite_step_guarded_step(
+    opt: torch.optim.Optimizer,
+    model: v2293.TrueDeepPureKAN,
+    baseline: dict[str, float],
+    xg: torch.Tensor,
+    yg: torch.Tensor,
+    args: argparse.Namespace,
+    *,
+    part: str,
+    safety_type: str,
+    step: int,
+) -> dict[str, float | int | str]:
+    finite_enabled = "finite" in str(safety_type).lower()
+    if not finite_enabled or int(args.finite_step_guard_every) <= 0 or int(step) % int(args.finite_step_guard_every) != 0:
+        opt.step()
+        return {
+            "finite_step_enabled": int(finite_enabled),
+            "finite_step_accept": 1,
+            "finite_step_skip": 0,
+            "finite_step_scale": 1.0,
+            "finite_step_attempts": 1,
+            "finite_step_reject_reason": "not_checked",
+        }
+
+    model_snapshot = snapshot_model_params(model)
+    opt_snapshot = snapshot_optimizer(opt)
+    base_lrs = [float(group.get("lr", 0.0)) for group in opt.param_groups]
+    guard_n = min(int(args.finite_step_guard_examples), int(xg.shape[0]))
+    x_eval = xg[:guard_n]
+    y_eval = yg[:guard_n]
+    components = csv_items(args.finite_step_components)
+    budget = float(args.no_debt_budget)
+    enforce_debt = str(part).upper() == "F5" or bool(int(args.finite_step_apply_all_parts))
+    last_reason = "no_attempt"
+    attempts = max(1, int(args.finite_step_tries))
+    for attempt in range(attempts):
+        restore_model_params(model_snapshot)
+        restore_optimizer(opt, opt_snapshot)
+        scale = float(args.finite_step_shrink) ** attempt
+        for group, lr in zip(opt.param_groups, base_lrs):
+            group["lr"] = lr * scale
+        opt.step()
+        metrics = v2293.metrics_for_model(model, x_eval, y_eval)
+        deltas = debt_deltas(metrics, baseline)
+        debt_ok = all(float(deltas.get(component, 0.0)) <= budget for component in components)
+        c2_delta = float(metrics.get("coverage_CVaR25", 0.0)) - float(baseline.get("coverage_CVaR25", 0.0))
+        c2_ok = str(part).upper() != "F3" or c2_delta >= float(args.finite_step_c2_floor)
+        if (debt_ok or not enforce_debt) and c2_ok:
+            for group, lr in zip(opt.param_groups, base_lrs):
+                group["lr"] = lr
+            return {
+                "finite_step_enabled": 1,
+                "finite_step_accept": 1,
+                "finite_step_skip": 0,
+                "finite_step_scale": scale,
+                "finite_step_attempts": attempt + 1,
+                "finite_step_reject_reason": "accepted",
+            }
+        bad_components = [component for component in components if float(deltas.get(component, 0.0)) > budget]
+        if not c2_ok:
+            last_reason = "c2_floor"
+        elif bad_components:
+            last_reason = "debt_" + "|".join(bad_components)
+        else:
+            last_reason = "unknown"
+    restore_model_params(model_snapshot)
+    restore_optimizer(opt, opt_snapshot)
+    for group, lr in zip(opt.param_groups, base_lrs):
+        group["lr"] = lr
+    if hasattr(opt, "clear_observed_gradients"):
+        opt.clear_observed_gradients()
+    return {
+        "finite_step_enabled": 1,
+        "finite_step_accept": 0,
+        "finite_step_skip": 1,
+        "finite_step_scale": 0.0,
+        "finite_step_attempts": attempts,
+        "finite_step_reject_reason": last_reason,
+    }
+
+
 def parse_v23_scheme(scheme: str, *, safety_type: str = "") -> dict[str, Any]:
     text = str(scheme)
     lower = text.lower()
@@ -1234,6 +1375,11 @@ def train_v23_scheme(
     grad_inf_count = 0
     per_example_count = 0
     debt_diag: dict[str, float | int | str] = {}
+    finite_accept_count = 0
+    finite_skip_count = 0
+    finite_attempt_count = 0
+    finite_scale_trace: list[float] = []
+    finite_reject_reasons: dict[str, int] = {}
     for step in range(1, int(args.train_steps) + 1):
         xb, yb = v2293.v2289.iter_train_batches(xtr, ytr, step - 1, int(args.batch_size), int(seed))
         opt.zero_grad(set_to_none=True)
@@ -1248,7 +1394,14 @@ def train_v23_scheme(
                 debt_diag = observe_debt_gradients(opt, model, xb, yb, args, before_train, randomize_alignment="random" in str(safety_type).lower())
         loss = F.cross_entropy(model(xb).float(), yb.long())
         loss.backward()
-        opt.step()
+        finite_diag = finite_step_guarded_step(opt, model, before, xg, yg, args, part=part, safety_type=safety_type, step=step)
+        finite_accept_count += ival(finite_diag.get("finite_step_accept"))
+        finite_skip_count += ival(finite_diag.get("finite_step_skip"))
+        finite_attempt_count += ival(finite_diag.get("finite_step_attempts"))
+        finite_scale_trace.append(fval(finite_diag.get("finite_step_scale"), 1.0))
+        reason = str(finite_diag.get("finite_step_reject_reason", ""))
+        if reason and reason not in {"accepted", "not_checked"}:
+            finite_reject_reasons[reason] = finite_reject_reasons.get(reason, 0) + 1
         if hasattr(opt, "last_stats"):
             gate_trace.append(float(opt.last_stats.gate_density_mean))
             veto_trace.append(float(opt.last_stats.veto_density_mean))
@@ -1284,6 +1437,13 @@ def train_v23_scheme(
         "sobolev_s": spec["sobolev_exponent"],
         "stat_warmup_steps": int(args.stat_warmup_steps),
         "gate_floor": float(args.gate_floor),
+        "finite_step_enabled": int("finite" in str(safety_type).lower()),
+        "finite_step_accept_count": finite_accept_count,
+        "finite_step_skip_count": finite_skip_count,
+        "finite_step_attempt_count": finite_attempt_count,
+        "finite_step_accept_rate": finite_accept_count / max(1, finite_accept_count + finite_skip_count),
+        "finite_step_scale_mean": mean(finite_scale_trace, 1.0),
+        "finite_step_reject_reasons": ";".join(f"{k}:{v}" for k, v in sorted(finite_reject_reasons.items())),
         "gate_density_mean": mean(gate_trace, 1.0 if not spec["use_population_gate"] else 0.0),
         "gate_density_median": median(gate_trace, 1.0 if not spec["use_population_gate"] else 0.0),
         "gate_density_p10": float(np.quantile(gate_trace, 0.10)) if gate_trace else 0.0,
@@ -1775,6 +1935,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--stat-warmup-steps", type=int, default=5)
     p.add_argument("--train-steps", type=int, default=40)
     p.add_argument("--no-debt-budget", type=float, default=0.01)
+    p.add_argument("--finite-step-components", default="Brier,ECE,tail95,tail99,margin10")
+    p.add_argument("--finite-step-tries", type=int, default=5)
+    p.add_argument("--finite-step-shrink", type=float, default=0.5)
+    p.add_argument("--finite-step-guard-examples", type=int, default=128)
+    p.add_argument("--finite-step-guard-every", type=int, default=1)
+    p.add_argument("--finite-step-apply-all-parts", type=int, default=0)
+    p.add_argument("--finite-step-c2-floor", type=float, default=-0.05)
     p.add_argument("--part-e-schemes", default="E0_AdamW_control,E1_EdgeSobolev_AdamW_s0,E3_EdgeSobolev_DiagonalSNR_s0,E4_EdgeSobolev_BlockSNR_s0,E6_RandomMatchedGate_Control_s0")
     p.add_argument("--part-e-basis", default="dche_k9")
     p.add_argument("--part-e-depths", default="depth3")
