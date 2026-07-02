@@ -1339,3 +1339,36 @@ Interpretation:
 - More finite-step tries can still pass Direct F after the sign fix, and in this diagnostic improves random-veto gap to 13.
 - It also makes the accepted update profile more conservative than the selected main run (`accept_rate_median=0.375`, `scale_mean_median=0.2553262910323156`, `skip_count_median=50.0`).
 - This diagnostic does not change the final conclusion because Part C official taskwise C2 remains failed.
+
+
+## 2026-07-03 04:28:44 +0800 code-save audit note: checker-patch edge gate support
+
+During final git-save audit, two remaining core-code diffs were found after the first commit and were classified as experiment/repair support code rather than generated artifacts.
+
+Files:
+
+- `dgkan/optim/edge_sobolev_population_flow.py`
+- `experiments/run_v23_00r_curve_geometry_population_flow.py`
+- `experiments/run_v23_02_predictive_trust_functional_population_flow.py`
+
+Code changes saved:
+
+- Added `gate_input_side` and `gate_patch_size` optimizer parameters.
+- Added checker/local-patch edge-function block construction for first-layer KAN edge parameters.
+- Added block-level random-matched permutation so checker/edgebank gates have matched random controls at the same block granularity.
+- Added scheme parsing and v23.02 Part C mappings for `C16_FunctionalGram_CheckerPatchDegreeEdgebankSNR_s0` and `C17_FunctionalGram_CheckerPatchDegreeRandomMatched_s0`.
+
+Verification command:
+
+```bash
+/home/chengshun.wang/miniconda3/envs/kan/bin/python -m py_compile \
+  dgkan/optim/edge_sobolev_population_flow.py \
+  experiments/run_v23_00r_curve_geometry_population_flow.py \
+  experiments/run_v23_02_predictive_trust_functional_population_flow.py
+```
+
+Verification result:
+
+- Exit code 0.
+- No new experiment metrics were produced by this audit save step.
+- The selected final result remains `results/v23_02_direct_f_signfix_etailreg_lr00025_seed15`.

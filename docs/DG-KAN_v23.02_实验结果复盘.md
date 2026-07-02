@@ -6238,6 +6238,27 @@ From `results/v23_02_etailreg0p3_tries20_seed15/part_f_predictive_trust_positive
 - The selected main result remains `results/v23_02_direct_f_signfix_etailreg_lr00025_seed15` because it has better update efficiency (`accept_rate_median=0.725`, `scale_mean_median=0.7134385585784913`, `skip_count_median=22.0`) while still satisfying Direct F.
 - Part G still fails with route `G_DirectFPassButPartCSanityFailed`, and final route remains `DirectFPassButPartCSanityFailed`; therefore this diagnostic strengthens the Direct F evidence chain but does not remove the Part C blocker.
 
+## 2026-07-03 04:28:44 +0800 Code-Save Audit Recap
+
+During final git-save audit, remaining core-code diffs were found in the edge optimizer and v23 runner support files. These were saved as support code, not as new experimental evidence.
+
+### What was saved
+
+- `dgkan/optim/edge_sobolev_population_flow.py`: added checker/local-patch block construction over first-layer KAN edge functions; added block-granular random-matched permutation for matched random controls; added `gate_input_side` and `gate_patch_size` parameters.
+- `experiments/run_v23_00r_curve_geometry_population_flow.py`: passed visual-side and patch-size metadata into the optimizer; parsed checker/local-patch schemes.
+- `experiments/run_v23_02_predictive_trust_functional_population_flow.py`: added C16/C17 checker-patch Part C scheme mappings and random-control pairing.
+
+### Verification
+
+- Command: `/home/chengshun.wang/miniconda3/envs/kan/bin/python -m py_compile dgkan/optim/edge_sobolev_population_flow.py experiments/run_v23_00r_curve_geometry_population_flow.py experiments/run_v23_02_predictive_trust_functional_population_flow.py`
+- Result: exit code 0.
+
+### Interpretation
+
+- This implements an additional edge-function structured gate family aligned with the plan's repair direction, but no new numeric experiment result is claimed from this code-save step.
+- The final recorded evidence remains the sign-fixed Direct F results, especially `results/v23_02_direct_f_signfix_etailreg_lr00025_seed15` and the additional `results/v23_02_etailreg0p3_tries20_seed15` diagnostic.
+- The promotion conclusion is unchanged: Part C remains the official blocker and `promotion_allowed=0`.
+
 ## 2026-07-03 04:17:29 +0800 Part F direct C2/F5 positive-control
 
 ```json

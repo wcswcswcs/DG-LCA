@@ -51,6 +51,8 @@ class EdgeSobolevPopulationFlow(torch.optim.Optimizer):
         gate_beta: float = 2.0,
         gate_family: str = "diagonal",
         gate_floor: float = 0.0,
+        gate_input_side: int = 0,
+        gate_patch_size: int = 2,
         stat_warmup_steps: int = 0,
         use_population_gate: bool = False,
         use_debt_veto: bool = False,
@@ -70,6 +72,8 @@ class EdgeSobolevPopulationFlow(torch.optim.Optimizer):
             gate_beta=float(gate_beta),
             gate_family=str(gate_family),
             gate_floor=float(gate_floor),
+            gate_input_side=int(gate_input_side),
+            gate_patch_size=int(gate_patch_size),
             stat_warmup_steps=int(stat_warmup_steps),
             use_population_gate=bool(use_population_gate),
             use_debt_veto=bool(use_debt_veto),
@@ -174,6 +178,13 @@ class EdgeSobolevPopulationFlow(torch.optim.Optimizer):
         if int(param.numel()) <= 0 or k <= 0:
             return []
         family = str((group or {}).get("gate_family", "block")).lower()
+        if "checker_patch" in family or "checkerpatch" in family or "local_patch" in family or "localpatch" in family:
+            blocks = self._checker_patch_blocks_for_param(param, group or {}, degree_bands="degree" in family)
+            if blocks:
+                return blocks
+            fallback = dict(group or {})
+            fallback["gate_family"] = "degree_edgebank" if "degree" in family else "edgebank"
+            return self._blocks_for_param(param, fallback)
         if "edgebank" in family:
             rows = max(1, int(param.numel()) // k)
             if "degree" not in family:
@@ -195,20 +206,92 @@ class EdgeSobolevPopulationFlow(torch.optim.Optimizer):
                 blocks.append(block)
         return blocks
 
+    def _checker_patch_blocks_for_param(self, param: torch.nn.Parameter, group: dict, *, degree_bands: bool) -> list[list[int]]:
+        if int(getattr(param, "_kan_layer_id", -1)) != 0 or int(param.ndim) < 3:
+            return []
+        k = int(getattr(param, "_kan_basis_order_or_freq_count", param.shape[-1] if param.ndim else 1))
+        if k <= 0 or int(param.shape[-1]) != k:
+            return []
+        input_dim = int(param.shape[0])
+        side = int(group.get("gate_input_side", 0) or 0)
+        if side <= 0:
+            root = int(round(math.sqrt(max(1, input_dim))))
+            side = root if root * root == input_dim else 0
+        patch_size = max(2, int(group.get("gate_patch_size", 2) or 2))
+        if side <= 0 or side * side != input_dim or side < patch_size + 1:
+            return []
+        row_count = max(1, int(param.numel()) // k)
+        rows_per_input = row_count // max(1, input_dim)
+        if rows_per_input <= 0:
+            return []
+        anchors = list(range(1, max(2, side - patch_size), patch_size))
+        if not anchors:
+            anchors = [0]
+        max_anchor = side - patch_size
+        anchors = sorted({min(max(0, anchor), max_anchor) for anchor in anchors})
+        basis_key = getattr(param, "_kan_basis_key", getattr(param, "_kan_basis_name", "dche_k5"))
+        mode_groups = mode_band_slices(k, str(basis_key)).values() if degree_bands else [list(range(k))]
+        blocks: list[list[int]] = []
+        for top in anchors:
+            for left in anchors:
+                polarities = (
+                    ((top, left), (top + 1, left + 1)),
+                    ((top, left + 1), (top + 1, left)),
+                )
+                for coords in polarities:
+                    edge_rows: list[int] = []
+                    for row, col in coords:
+                        if 0 <= row < side and 0 <= col < side:
+                            input_idx = row * side + col
+                            start = input_idx * rows_per_input
+                            edge_rows.extend(range(start, min(start + rows_per_input, row_count)))
+                    for mode_ids in mode_groups:
+                        block = [edge_row * k + mode for edge_row in edge_rows for mode in mode_ids if edge_row * k + mode < int(param.numel())]
+                        if block:
+                            blocks.append(block)
+        return blocks
+
+    @staticmethod
+    def _base_family_for_random_match(family: str) -> str:
+        lower = str(family).lower()
+        if "random_matched" not in lower:
+            return lower
+        base = lower.replace("_random_matched", "").replace("random_matched_", "")
+        return base or "diagonal"
+
+    @staticmethod
+    def _permute_block_gate(gate: torch.Tensor, blocks: list[list[int]]) -> torch.Tensor:
+        clean = [sorted({int(i) for i in block if 0 <= int(i) < int(gate.numel())}) for block in blocks]
+        clean = [block for block in clean if block]
+        if len(clean) <= 1:
+            return gate
+        vals = [gate[block[0]].detach().clone() for block in clean]
+        perm = torch.randperm(len(clean), device=gate.device).tolist()
+        out = gate.clone()
+        for dst, src in enumerate(perm):
+            out[torch.tensor(clean[dst], dtype=torch.long, device=gate.device)] = vals[int(src)]
+        return out
+
     def _gate_from_observed(self, observed: torch.Tensor, weights: torch.Tensor, param: torch.nn.Parameter, group: dict) -> tuple[torch.Tensor, torch.Tensor]:
         white_tensor = self._apply_metric_inv_sqrt(observed, param, group)
         white_obs = white_tensor.reshape(int(observed.shape[0]), -1)
-        family = str(group.get("gate_family", "diagonal"))
-        if family == "block":
-            gres = block_snr_gate(white_obs.detach().cpu(), self._blocks_for_param(param, group), beta=float(group["gate_beta"]))
-        elif family in {"edgebank", "degree_edgebank"}:
-            gres = block_snr_gate(white_obs.detach().cpu(), self._blocks_for_param(param, group), beta=float(group["gate_beta"]))
+        family = str(group.get("gate_family", "diagonal")).lower()
+        random_matched = "random_matched" in family
+        base_family = self._base_family_for_random_match(family)
+        block_group = dict(group)
+        block_group["gate_family"] = base_family
+        if base_family == "block" or "edgebank" in base_family or "checker_patch" in base_family or "checkerpatch" in base_family or "local_patch" in base_family or "localpatch" in base_family:
+            blocks = self._blocks_for_param(param, block_group)
+            gres = block_snr_gate(white_obs.detach().cpu(), blocks, beta=float(group["gate_beta"]))
         else:
             gres = diagonal_snr_gate(white_obs.detach().cpu(), beta=float(group["gate_beta"]))
         gate = gres.gate.to(device=param.device, dtype=param.dtype)
-        if family == "random_matched" and int(gate.numel()) > 0:
-            perm = torch.randperm(int(gate.numel()), device=param.device)
-            gate = gate[perm]
+        if random_matched and int(gate.numel()) > 0:
+            if base_family == "block" or "edgebank" in base_family or "checker_patch" in base_family or "checkerpatch" in base_family or "local_patch" in base_family or "localpatch" in base_family:
+                gate = self._permute_block_gate(gate, blocks)
+            else:
+                perm = torch.randperm(int(gate.numel()), device=param.device)
+                gate = gate[perm]
         if float(group.get("gate_floor", 0.0)) > 0.0:
             floor = float(group["gate_floor"])
             gate = gate * (1.0 - floor) + floor

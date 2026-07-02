@@ -1414,7 +1414,10 @@ def finite_step_guarded_step(
 def parse_v23_scheme(scheme: str, *, safety_type: str = "") -> dict[str, Any]:
     text = str(scheme)
     lower = text.lower()
-    if "random" in lower:
+    if "checkerpatch" in lower or "checker_patch" in lower or "localpatch" in lower or "local_patch" in lower:
+        base = "checker_patch_degree_edgebank" if "degree" in lower else "checker_patch_edgebank"
+        gate_family = f"{base}_random_matched" if "random" in lower else base
+    elif "random" in lower:
         gate_family = "random_matched"
     elif "degree" in lower and "edgebank" in lower:
         gate_family = "degree_edgebank"
@@ -1452,6 +1455,8 @@ def make_v23_optimizer(model: v2293.TrueDeepPureKAN, basis_key: str, scheme: str
         gate_beta=float(args.snr_beta),
         gate_family=str(spec["gate_family"]),
         gate_floor=float(args.gate_floor),
+        gate_input_side=int(getattr(args, "visual_side", 0)),
+        gate_patch_size=2,
         stat_warmup_steps=int(args.stat_warmup_steps),
     )
     if spec["use_debt_veto"]:
