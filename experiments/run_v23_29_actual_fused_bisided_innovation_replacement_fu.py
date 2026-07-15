@@ -2912,6 +2912,267 @@ def run_partF_aggregate(args: argparse.Namespace) -> None:
     )
 
 
+def partg_metric_names(args: argparse.Namespace) -> list[str]:
+    raw = str(args.partg_metrics).strip()
+    if raw:
+        return [item.strip() for item in raw.split(",") if item.strip()]
+    return ["M0_DataL2", "M1_LocalJet", "M2_CompositionalJet_PRIMARY", "M3_PathShuffledJet", "M4_UniformPathJet"]
+
+
+def run_partg_single_metric(checkpoint_row: dict[str, Any], metric_kind: str, args: argparse.Namespace, device: torch.device) -> dict[str, Any]:
+    payload = load_torch_checkpoint(ROOT / str(checkpoint_row["checkpoint_path"]), device)
+    dataset = make_partd_dataset(
+        str(checkpoint_row["dataset"]),
+        int(checkpoint_row["seed"]),
+        int(payload["input_dim"]),
+        int(payload["output_dim"]),
+        int(args.partd_train_count),
+        max(int(args.partd_audit_batch), int(args.parte_eval_count), int(args.batch)),
+        device,
+    )
+    split_verified = int(str(dataset["split_hash"]) == str(payload.get("dataset_split_hash", "")))
+    carrier = str(checkpoint_row["carrier"])
+    model = factory_for(carrier)(
+        int(payload["input_dim"]),
+        int(payload["output_dim"]),
+        int(payload["hidden_dim"]),
+        dataset["x_stats"],
+        int(payload["model_seed"]),
+        device,
+    )
+    model.load_state_dict(payload["model_state_dict"])
+    x_eval = dataset["x_audit"][: int(args.parte_eval_count)]
+    y_eval = dataset["y_audit"][: int(args.parte_eval_count)]
+    x_train = dataset["x_train"]
+    y_train = dataset["y_train"]
+    initial_loss, initial_acc, initial_tag = evaluate_ce_loss(model, x_eval, y_eval)
+    gen = torch.Generator(device=device).manual_seed(1010000 + int(checkpoint_row["seed"]) + int(checkpoint_row["step"]) + 31 * len(metric_kind))
+    memory: dict[tuple[str, int], torch.Tensor] | None = None
+    truth_passes: list[int] = []
+    shuffle_distances: list[float] = []
+    uniform_distances: list[float] = []
+    path_corrs: list[float] = []
+    condition_means: list[float] = []
+    update_norms: list[float] = []
+    for step in range(1, int(args.partg_horizon) + 1):
+        perm = torch.randperm(int(x_train.shape[0]), device=device, generator=gen)
+        idx = perm[: int(args.batch)]
+        raw, current, trace = bank_update_maps(
+            model,
+            x_train[idx],
+            y_train[idx],
+            rank=int(args.parte_rank),
+            rounds=int(args.partd_fit_rounds),
+            seed=1020000 + step + int(checkpoint_row["seed"]),
+            metric_kind=metric_kind,
+        )
+        if memory is None:
+            memory = {key: torch.zeros_like(value) for key, value in current.items()}
+        updates = {key: raw[key] - current[key] + memory[key] for key in raw}
+        update_norms.append(apply_bank_updates(model, updates, float(args.parte_eta)))
+        memory = {key: float(args.parte_beta) * memory[key] + (1.0 - float(args.parte_beta)) * current[key] for key in current}
+        truth_passes.append(int(trace["actual_carrier_truth_pass"]))
+        shuffle_distances.append(float(trace["true_vs_shuffle_metric_distance_mean"]))
+        uniform_distances.append(float(trace["true_vs_uniform_metric_distance_mean"]))
+        path_corrs.append(float(trace["path_weight_basis_jet_abs_corr_mean"]))
+        condition_means.append(float(trace["metric_condition_mean"]))
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+    final_loss, final_acc, final_tag = evaluate_ce_loss(model, x_eval, y_eval)
+    pair_key = stable_hash_obj(
+        {
+            "checkpoint_sha256": checkpoint_row["checkpoint_sha256"],
+            "dataset": checkpoint_row["dataset"],
+            "seed": int(checkpoint_row["seed"]),
+            "carrier": carrier,
+            "stage": checkpoint_row["stage"],
+            "step": int(checkpoint_row["step"]),
+        }
+    )
+    return {
+        "phase": "partG_metric_causality_diagnostic",
+        "official_partG_completion_claim": 0,
+        "diagnostic_dataset_only": 1,
+        "pair_key": pair_key,
+        "dataset": checkpoint_row["dataset"],
+        "task_family": checkpoint_row["task_family"],
+        "seed": int(checkpoint_row["seed"]),
+        "carrier": carrier,
+        "checkpoint_stage": checkpoint_row["stage"],
+        "checkpoint_step": int(checkpoint_row["step"]),
+        "checkpoint_path": checkpoint_row["checkpoint_path"],
+        "checkpoint_sha256": checkpoint_row["checkpoint_sha256"],
+        "metric_kind": metric_kind,
+        "scheme": "P2_BiSided_Persistent_Replacement_PRIMARY",
+        "horizon": int(args.partg_horizon),
+        "eta": float(args.parte_eta),
+        "beta": float(args.parte_beta),
+        "rank": int(args.parte_rank),
+        "initial_eval_loss": initial_loss,
+        "final_eval_loss": final_loss,
+        "eval_loss_delta_initial_minus_final": initial_loss - final_loss,
+        "score_neg_final_loss": -final_loss,
+        "initial_eval_acc": initial_acc,
+        "final_eval_acc": final_acc,
+        "initial_cache_tag": initial_tag,
+        "final_cache_tag": final_tag,
+        "actual_fused_forward_count": int(args.partg_horizon) + 2,
+        "actual_fused_backward_from_grad_logits_count": int(args.partg_horizon),
+        "actual_dense_basis_materialization_count": 0,
+        "actual_compact_proxy_forward_count": 0,
+        "actual_linear_bank_proxy_count": 0,
+        "checkpoint_reloaded_for_pair": 1,
+        "same_checkpoint_pair_key": pair_key,
+        "dataset_split_hash_verified": split_verified,
+        "metric_refresh_count": int(args.partg_horizon),
+        "true_vs_shuffle_metric_distance_mean": float(sum(shuffle_distances) / max(1, len(shuffle_distances))),
+        "true_vs_uniform_metric_distance_mean": float(sum(uniform_distances) / max(1, len(uniform_distances))),
+        "path_weight_basis_jet_abs_corr_mean": float(sum(path_corrs) / max(1, len(path_corrs))),
+        "metric_condition_mean": float(sum(condition_means) / max(1, len(condition_means))),
+        "update_norm_mean": float(sum(update_norms) / max(1, len(update_norms))),
+        "current_forcing_same_step_use_count": 0,
+        "innovation_residual_compute_count": int(args.partg_horizon),
+        "row_valid_for_science": int(split_verified == 1 and all(value == 1 for value in truth_passes)),
+    }
+
+
+def summarize_partg_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    by_pair: dict[str, dict[str, dict[str, Any]]] = {}
+    for row in rows:
+        by_pair.setdefault(str(row["pair_key"]), {})[str(row["metric_kind"])] = row
+
+    def paired_diff(left: str, right: str) -> list[float]:
+        vals: list[float] = []
+        for metrics in by_pair.values():
+            if left in metrics and right in metrics:
+                vals.append(float(metrics[left]["score_neg_final_loss"]) - float(metrics[right]["score_neg_final_loss"]))
+        return vals
+
+    m2 = "M2_CompositionalJet_PRIMARY"
+    diffs_m2_m1 = paired_diff(m2, "M1_LocalJet")
+    diffs_m2_m3 = paired_diff(m2, "M3_PathShuffledJet")
+    diffs_m2_m0 = paired_diff(m2, "M0_DataL2")
+    diffs_m2_m4 = paired_diff(m2, "M4_UniformPathJet")
+    valid_fraction = float(sum(int(row["row_valid_for_science"]) for row in rows) / max(1, len(rows)))
+    m2_rows = [row for row in rows if str(row.get("metric_kind")) == m2]
+    shuffle_dist = median_value([float(row["true_vs_shuffle_metric_distance_mean"]) for row in m2_rows])
+    path_corr = median_value([float(row["path_weight_basis_jet_abs_corr_mean"]) for row in m2_rows])
+    metric_refresh_min = min([int(row["metric_refresh_count"]) for row in rows], default=0)
+    no_debt_vs_m1 = fraction_ge(diffs_m2_m1, 0.0)
+    gate = int(
+        valid_fraction == 1.0
+        and shuffle_dist > 1.0e-8
+        and path_corr > 1.0e-8
+        and metric_refresh_min > 0
+        and median_value(diffs_m2_m1) > 0.0
+        and median_value(diffs_m2_m3) > 0.0
+        and cvar_low(diffs_m2_m1, 0.25) > 0.0
+        and no_debt_vs_m1 >= 0.80
+    )
+    blockers = []
+    if not rows:
+        blockers.append("partG_rows_missing")
+    if valid_fraction != 1.0:
+        blockers.append("partG_rows_invalid")
+    if not (shuffle_dist > 1.0e-8):
+        blockers.append("true_vs_shuffle_metric_distance_zero")
+    if not (path_corr > 1.0e-8):
+        blockers.append("path_weight_basis_jet_correlation_zero")
+    if not (metric_refresh_min > 0):
+        blockers.append("metric_refresh_not_observed")
+    if not (median_value(diffs_m2_m1) > 0.0):
+        blockers.append("M2_minus_M1_median_not_positive")
+    if not (median_value(diffs_m2_m3) > 0.0):
+        blockers.append("M2_minus_M3_median_not_positive")
+    if not (cvar_low(diffs_m2_m1, 0.25) > 0.0):
+        blockers.append("M2_minus_M1_CVaR25_not_positive")
+    if no_debt_vs_m1 < 0.80:
+        blockers.append("M2_paired_no_debt_vs_M1_below_0p80")
+    blockers.append("diagnostic_synthetic_partG_not_official")
+    route_hint = ""
+    if median_value(diffs_m2_m0) > 0.0 and median_value(diffs_m2_m1) <= 0.0:
+        route_hint = "CompositionalMetricSupportOnly"
+    if abs(median_value(diffs_m2_m3)) <= 1.0e-12:
+        route_hint = "PathGeometryNotIdentified"
+    return {
+        "phase": "partG-metric",
+        "rows": len(rows),
+        "pair_count": len(by_pair),
+        "metrics_count": len({str(row.get("metric_kind")) for row in rows}),
+        "datasets": sorted({str(row["dataset"]) for row in rows}),
+        "carriers": sorted({str(row["carrier"]) for row in rows}),
+        "row_valid_for_science_fraction": valid_fraction,
+        "true_vs_shuffle_metric_distance_median": shuffle_dist,
+        "path_weight_basis_jet_abs_corr_median": path_corr,
+        "metric_refresh_min": metric_refresh_min,
+        "M2_minus_M1_median": median_value(diffs_m2_m1),
+        "M2_minus_M1_CVaR25": cvar_low(diffs_m2_m1, 0.25),
+        "M2_minus_M3_median": median_value(diffs_m2_m3),
+        "M2_minus_M0_median": median_value(diffs_m2_m0),
+        "M2_minus_M4_median": median_value(diffs_m2_m4),
+        "M2_paired_no_debt_vs_M1_fraction": no_debt_vs_m1,
+        "partG_diagnostic_gate_pass_on_this_matrix": gate,
+        "route_hint": route_hint,
+        "official_partG_completion_claim": 0,
+        "blockers": blockers,
+    }
+
+
+def run_partG_metric(args: argparse.Namespace) -> None:
+    OUT_ROOT.mkdir(parents=True, exist_ok=True)
+    ensure_logs()
+    device = torch.device(args.device)
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
+    checkpoint_rows = read_csv(ROOT / str(args.parte_checkpoint_manifest))
+    if int(args.partg_max_checkpoints) > 0:
+        checkpoint_rows = checkpoint_rows[: int(args.partg_max_checkpoints)]
+    if int(args.partg_shard_count) > 1:
+        checkpoint_rows = [row for idx, row in enumerate(checkpoint_rows) if idx % int(args.partg_shard_count) == int(args.partg_shard_index)]
+    metrics = partg_metric_names(args)
+    rows: list[dict[str, Any]] = []
+    for checkpoint_row in checkpoint_rows:
+        for metric_kind in metrics:
+            rows.append(run_partg_single_metric(checkpoint_row, metric_kind, args, device))
+    summary = summarize_partg_rows(rows)
+    files = ["v23_29_metric_causality_matrix.csv", "v23_29_partG_metric_causality_summary.json"]
+    write_csv(OUT_ROOT / files[0], rows)
+    write_json(OUT_ROOT / files[1], summary)
+    append_exec("PartG_metric_causality_diagnostic", args, files, summary, "completed_incomplete_gate")
+    append_recap(
+        "PartG metric causality diagnostic",
+        [
+            f"rows `{summary['rows']}`; pairs `{summary['pair_count']}`; valid_fraction `{summary['row_valid_for_science_fraction']}`.",
+            f"M2-M1/M3 medians `{summary['M2_minus_M1_median']}/{summary['M2_minus_M3_median']}`; M2-M1 CVaR25 `{summary['M2_minus_M1_CVaR25']}`.",
+            f"shuffle_distance/corr `{summary['true_vs_shuffle_metric_distance_median']}/{summary['path_weight_basis_jet_abs_corr_median']}`; partG_diagnostic_gate `{summary['partG_diagnostic_gate_pass_on_this_matrix']}`; official_partG_completion_claim `0`; blockers `{summary['blockers']}`.",
+        ],
+    )
+
+
+def run_partG_aggregate(args: argparse.Namespace) -> None:
+    OUT_ROOT.mkdir(parents=True, exist_ok=True)
+    ensure_logs()
+    paths = [Path(path) for path in sorted(glob.glob(str(args.partg_aggregate_glob)))]
+    rows: list[dict[str, Any]] = []
+    for path in paths:
+        rows.extend(read_csv(path))
+    summary = summarize_partg_rows(rows)
+    summary["phase"] = "partG-aggregate"
+    summary["source_files"] = [rel(path) for path in paths]
+    files = ["v23_29_metric_causality_matrix.csv", "v23_29_partG_metric_causality_summary.json"]
+    write_csv(OUT_ROOT / files[0], rows)
+    write_json(OUT_ROOT / files[1], summary)
+    append_exec("PartG_metric_causality_aggregate", args, files, summary, "completed_incomplete_gate")
+    append_recap(
+        "PartG metric causality aggregate",
+        [
+            f"rows `{summary['rows']}`; pairs `{summary['pair_count']}`; valid_fraction `{summary['row_valid_for_science_fraction']}`.",
+            f"M2-M1/M3 medians `{summary['M2_minus_M1_median']}/{summary['M2_minus_M3_median']}`; M2-M1 CVaR25 `{summary['M2_minus_M1_CVaR25']}`.",
+            f"shuffle_distance/corr `{summary['true_vs_shuffle_metric_distance_median']}/{summary['path_weight_basis_jet_abs_corr_median']}`; partG_diagnostic_gate `{summary['partG_diagnostic_gate_pass_on_this_matrix']}`; official_partG_completion_claim `0`; blockers `{summary['blockers']}`.",
+        ],
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -2929,6 +3190,8 @@ def main() -> int:
             "partE-aggregate",
             "partF-state",
             "partF-aggregate",
+            "partG-metric",
+            "partG-aggregate",
         ],
     )
     parser.add_argument("--device", default="cuda:0")
@@ -2969,6 +3232,12 @@ def main() -> int:
     parser.add_argument("--partf-shard-index", type=int, default=0)
     parser.add_argument("--partf-shard-count", type=int, default=1)
     parser.add_argument("--partf-aggregate-glob", default="")
+    parser.add_argument("--partg-metrics", default="")
+    parser.add_argument("--partg-horizon", type=int, default=20)
+    parser.add_argument("--partg-max-checkpoints", type=int, default=0)
+    parser.add_argument("--partg-shard-index", type=int, default=0)
+    parser.add_argument("--partg-shard-count", type=int, default=1)
+    parser.add_argument("--partg-aggregate-glob", default="")
     args = parser.parse_args()
     if args.phase == "part0":
         run_part0(args)
@@ -2992,6 +3261,10 @@ def main() -> int:
         run_partF_state(args)
     elif args.phase == "partF-aggregate":
         run_partF_aggregate(args)
+    elif args.phase == "partG-metric":
+        run_partG_metric(args)
+    elif args.phase == "partG-aggregate":
+        run_partG_aggregate(args)
     return 0
 
 
