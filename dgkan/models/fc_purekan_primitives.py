@@ -89,6 +89,17 @@ def _basis_eval(z: torch.Tensor, basis_name: str, k: int, centers: torch.Tensor,
                 vals.append(torch.cos(math.pi * freq * z))
             freq += 1
         return torch.stack(vals[:k], dim=-1) / math.sqrt(max(1, k))
+    if basis_name in {"fourier_trig", "fourier_trig_dc"}:
+        vals = []
+        if basis_name == "fourier_trig_dc":
+            vals.append(torch.ones_like(z))
+        freq = 1
+        while len(vals) < k:
+            vals.append(torch.sin(math.pi * freq * z))
+            if len(vals) < k:
+                vals.append(torch.cos(math.pi * freq * z))
+            freq += 1
+        return torch.stack(vals[:k], dim=-1) / math.sqrt(max(1, k))
     if basis_name == "ricker_wavelet":
         vals = []
         width = scales[0].clamp_min(1.0e-3)
@@ -173,6 +184,17 @@ def _basis_derivative(z: torch.Tensor, basis_name: str, k: int, centers: torch.T
         return torch.stack(vals[:k], dim=-1)
     if basis_name == "fourier_lowfreq":
         vals = [torch.ones_like(z)]
+        freq = 1
+        while len(vals) < k:
+            vals.append(math.pi * freq * torch.cos(math.pi * freq * z))
+            if len(vals) < k:
+                vals.append(-math.pi * freq * torch.sin(math.pi * freq * z))
+            freq += 1
+        return torch.stack(vals[:k], dim=-1) / math.sqrt(max(1, k))
+    if basis_name in {"fourier_trig", "fourier_trig_dc"}:
+        vals = []
+        if basis_name == "fourier_trig_dc":
+            vals.append(torch.zeros_like(z))
         freq = 1
         while len(vals) < k:
             vals.append(math.pi * freq * torch.cos(math.pi * freq * z))
@@ -1778,6 +1800,12 @@ class PrimitiveKAN(nn.Module):
     def _manual_fourier_k4_memory_planned(self) -> bool:
         return self.spec.basis_name == "fourier_lowfreq" and int(self.k) == 4
 
+    def _manual_fourier_trig_k4_memory_planned(self) -> bool:
+        return self.spec.basis_name == "fourier_trig" and int(self.k) == 4
+
+    def _manual_fourier_trig_k5_memory_planned(self) -> bool:
+        return self.spec.basis_name == "fourier_trig_dc" and int(self.k) == 5
+
     def _manual_fourier_k2_flat_gemm(self) -> bool:
         return self._manual_fourier_k2_memory_planned() and self.spec.init_variant == "fourier_k2_flatgemm_cache"
 
@@ -1804,6 +1832,12 @@ class PrimitiveKAN(nn.Module):
 
     def _manual_fourier_k4_linearres_gemm_l3_matmul(self) -> bool:
         return self._manual_fourier_k4_memory_planned() and str(self.spec.init_variant).startswith("fourier_k4_linearres_gemm_l3_matmul")
+
+    def _manual_fourier_trig_k4_triton_l3_matmul(self) -> bool:
+        return self._manual_fourier_trig_k4_memory_planned() and self.spec.init_variant == "fourier_trig_k4_triton_l3_matmul"
+
+    def _manual_fourier_trig_k5_triton_l3_matmul(self) -> bool:
+        return self._manual_fourier_trig_k5_memory_planned() and self.spec.init_variant == "fourier_trig_k5_triton_l3_matmul"
 
     def _manual_cheby_k3_triton_l3_matmul(self) -> bool:
         return self.spec.basis_name == "chebyshev" and int(self.k) == 3 and self.spec.init_variant == "cheby_k3_triton_l3_matmul"
@@ -1871,6 +1905,10 @@ class PrimitiveKAN(nn.Module):
             return "fourier_k4_linearres_gemm_l3_matmul"
         if self._manual_fourier_k4_linearres_triton_l3_matmul():
             return "fourier_k4_linearres_triton_l3_matmul"
+        if self._manual_fourier_trig_k5_triton_l3_matmul():
+            return "fourier_trig_k5_triton_l3_matmul"
+        if self._manual_fourier_trig_k4_triton_l3_matmul():
+            return "fourier_trig_k4_triton_l3_matmul"
         if self._manual_fourier_k4_triton_l3_matmul():
             return "fourier_k4_triton_l3_matmul"
         if self._manual_fourier_k3_triton_l3_matmul():
@@ -1974,6 +2012,16 @@ class PrimitiveKAN(nn.Module):
 
                 logits, h = fused_chebyshev_k3.forward_matmul_k4(self, x)
                 return logits, ("cheby_k4_triton_l3_matmul", x, h)
+            if self._manual_fourier_trig_k5_triton_l3_matmul():
+                from dgkan.kernels import fused_fourier_trig
+
+                logits, h = fused_fourier_trig.forward_matmul_k5(self, x)
+                return logits, ("fourier_trig_k5_triton_l3_matmul", x, h)
+            if self._manual_fourier_trig_k4_triton_l3_matmul():
+                from dgkan.kernels import fused_fourier_trig
+
+                logits, h = fused_fourier_trig.forward_matmul_k4(self, x)
+                return logits, ("fourier_trig_k4_triton_l3_matmul", x, h)
             if self._manual_fourier_k4_linearres_gemm_l3_matmul():
                 from dgkan.kernels import fused_fourier_k2
 
@@ -2136,6 +2184,16 @@ class PrimitiveKAN(nn.Module):
 
                 _variant, x, h = cache
                 return fused_chebyshev_k3.backward_k4(self, x, y, logits, h)
+            if cache and isinstance(cache[0], str) and cache[0] == "fourier_trig_k5_triton_l3_matmul":
+                from dgkan.kernels import fused_fourier_trig
+
+                _variant, x, h = cache
+                return fused_fourier_trig.backward_k5(self, x, y, logits, h)
+            if cache and isinstance(cache[0], str) and cache[0] == "fourier_trig_k4_triton_l3_matmul":
+                from dgkan.kernels import fused_fourier_trig
+
+                _variant, x, h = cache
+                return fused_fourier_trig.backward_k4(self, x, y, logits, h)
             if cache and isinstance(cache[0], str) and cache[0] == "fourier_k4_linearres_gemm_l3_matmul":
                 from dgkan.kernels import fused_fourier_k2
 

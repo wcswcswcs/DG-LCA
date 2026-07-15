@@ -1078,8 +1078,9 @@ def observe_task_gradients(opt: EdgeSobolevSNRFU, model: v2293.TrueDeepPureKAN, 
     inf_count = int(torch.isinf(flat).sum().item()) if int(flat.numel()) else 0
     norms = flat.norm(dim=1) if flat.ndim == 2 and int(flat.shape[0]) else torch.zeros(0, dtype=torch.float64)
     params = list(model.coeffs)
+    labels = y[: int(flat.shape[0])].detach() if flat.ndim == 2 else None
     for param, grads in zip(params, split_flat_grads(flat, params)):
-        opt.observe_per_example_gradients(param, grads.to(device=param.device, dtype=param.dtype))
+        opt.observe_per_example_gradients(param, grads.to(device=param.device, dtype=param.dtype), labels=labels)
     return (
         int(flat.shape[0]) if flat.ndim == 2 else 0,
         float(norms.median().item()) if int(norms.numel()) else 0.0,
@@ -1255,6 +1256,10 @@ def snapshot_optimizer(opt: torch.optim.Optimizer) -> dict[str, Any]:
     }
     if hasattr(opt, "_observed_grads"):
         snap["observed_grads"] = clone_state_value(getattr(opt, "_observed_grads"))
+    if hasattr(opt, "_observed_labels"):
+        snap["observed_labels"] = clone_state_value(getattr(opt, "_observed_labels"))
+    if hasattr(opt, "_observed_structure_gates"):
+        snap["observed_structure_gates"] = clone_state_value(getattr(opt, "_observed_structure_gates"))
     if hasattr(opt, "_observed_debt_grads"):
         snap["observed_debt_grads"] = clone_state_value(getattr(opt, "_observed_debt_grads"))
     return snap
@@ -1269,6 +1274,10 @@ def restore_optimizer(opt: torch.optim.Optimizer, snapshot: dict[str, Any]) -> N
             group[key] = clone_state_value(value)
     if "observed_grads" in snapshot and hasattr(opt, "_observed_grads"):
         setattr(opt, "_observed_grads", clone_state_value(snapshot["observed_grads"]))
+    if "observed_labels" in snapshot and hasattr(opt, "_observed_labels"):
+        setattr(opt, "_observed_labels", clone_state_value(snapshot["observed_labels"]))
+    if "observed_structure_gates" in snapshot and hasattr(opt, "_observed_structure_gates"):
+        setattr(opt, "_observed_structure_gates", clone_state_value(snapshot["observed_structure_gates"]))
     if "observed_debt_grads" in snapshot and hasattr(opt, "_observed_debt_grads"):
         setattr(opt, "_observed_debt_grads", clone_state_value(snapshot["observed_debt_grads"]))
 
@@ -1414,8 +1423,34 @@ def finite_step_guarded_step(
 def parse_v23_scheme(scheme: str, *, safety_type: str = "") -> dict[str, Any]:
     text = str(scheme)
     lower = text.lower()
-    if "cornercheckerhybrid" in lower or "corner_checker_hybrid" in lower:
-        base = "corner_checker_hybrid_degree_edgebank" if "degree" in lower else "corner_checker_hybrid_edgebank"
+    if "cornercheckercontrast" in lower or "corner_checker_contrast" in lower:
+        base = "corner_checker_contrast_degree_edgebank" if "degree" in lower else "corner_checker_contrast_edgebank"
+        gate_family = f"{base}_random_matched" if "random" in lower else base
+    elif "cornercheckerfocus" in lower or "corner_checker_focus" in lower:
+        base = "corner_checker_focus_degree_edgebank" if "degree" in lower else "corner_checker_focus_edgebank"
+        gate_family = f"{base}_random_matched" if "random" in lower else base
+    elif "cornercheckermultiring" in lower or "corner_checker_multiring" in lower:
+        base = "corner_checker_multiring_hybrid_degree_edgebank" if "degree" in lower else "corner_checker_multiring_hybrid_edgebank"
+        gate_family = f"{base}_random_matched" if "random" in lower else base
+    elif "cornercheckerdiagonalunion" in lower or "corner_checker_diagonal_union" in lower:
+        base = "corner_checker_diagonal_union_degree_edgebank" if "degree" in lower else "corner_checker_diagonal_union_edgebank"
+        gate_family = f"{base}_random_matched" if "random" in lower else base
+    elif "cornercheckerdiagonalhybrid" in lower or "corner_checker_diagonal_hybrid" in lower:
+        base = "corner_checker_diagonal_hybrid_degree_edgebank" if "degree" in lower else "corner_checker_diagonal_hybrid_edgebank"
+        gate_family = f"{base}_random_matched" if "random" in lower else base
+    elif "cornercheckerhybrid" in lower or "corner_checker_hybrid" in lower:
+        if "classcohort" in lower or "class_cohort" in lower:
+            base = "corner_checker_hybrid_class_cohort_degree_edgebank" if "degree" in lower else "corner_checker_hybrid_class_cohort_edgebank"
+        elif "classconditional" in lower or "class_conditional" in lower:
+            base = "corner_checker_hybrid_class_conditional_degree_edgebank" if "degree" in lower else "corner_checker_hybrid_class_conditional_edgebank"
+        else:
+            base = "corner_checker_hybrid_degree_edgebank" if "degree" in lower else "corner_checker_hybrid_edgebank"
+        if "topk25" in lower or "top_k25" in lower:
+            base = f"{base}_topk25"
+        elif "topk50" in lower or "top_k50" in lower:
+            base = f"{base}_topk50"
+        elif "topk" in lower or "top_k" in lower:
+            base = f"{base}_topk"
         gate_family = f"{base}_random_matched" if "random" in lower else base
     elif "visualpattern" in lower or "visual_pattern" in lower:
         base = "visual_pattern_degree_edgebank" if "degree" in lower else "visual_pattern_edgebank"
@@ -1429,8 +1464,10 @@ def parse_v23_scheme(scheme: str, *, safety_type: str = "") -> dict[str, Any]:
         gate_family = "degree_edgebank"
     elif "edgebank" in lower or "edge_bank" in lower:
         gate_family = "edgebank"
+    elif "block" in lower and "degree" in lower:
+        gate_family = "degree"
     elif "block" in lower:
-        gate_family = "block"
+        gate_family = "layer"
     else:
         gate_family = "diagonal"
     return {

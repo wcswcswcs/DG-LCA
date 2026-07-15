@@ -93,6 +93,26 @@ C_SCHEME_MAP: dict[str, str] = {
     "C25_FunctionalSobolev_CornerCheckerHybridDegreeRandomMatched_s0p5": "E14_FunctionalGram_CornerCheckerHybridDegreeRandomMatched_s0p5",
     "C26_FunctionalSobolev_CornerCheckerHybridDegreeEdgebankSNR_s1": "E13_FunctionalGram_CornerCheckerHybridDegreeEdgebankSNR_s1",
     "C27_FunctionalSobolev_CornerCheckerHybridDegreeRandomMatched_s1": "E14_FunctionalGram_CornerCheckerHybridDegreeRandomMatched_s1",
+    "C28_FunctionalGram_CornerCheckerDiagonalHybridDegreeEdgebankSNR_s0": "E15_FunctionalGram_CornerCheckerDiagonalHybridDegreeEdgebankSNR_s0",
+    "C29_FunctionalGram_CornerCheckerDiagonalHybridDegreeRandomMatched_s0": "E16_FunctionalGram_CornerCheckerDiagonalHybridDegreeRandomMatched_s0",
+    "C30_FunctionalGram_CornerCheckerDiagonalUnionDegreeEdgebankSNR_s0": "E17_FunctionalGram_CornerCheckerDiagonalUnionDegreeEdgebankSNR_s0",
+    "C31_FunctionalGram_CornerCheckerDiagonalUnionDegreeRandomMatched_s0": "E18_FunctionalGram_CornerCheckerDiagonalUnionDegreeRandomMatched_s0",
+    "C32_FunctionalGram_CornerCheckerHybridClassConditionalDegreeEdgebankSNR_s0": "E19_FunctionalGram_CornerCheckerHybridClassConditionalDegreeEdgebankSNR_s0",
+    "C33_FunctionalGram_CornerCheckerHybridClassConditionalDegreeRandomMatched_s0": "E20_FunctionalGram_CornerCheckerHybridClassConditionalDegreeRandomMatched_s0",
+    "C34_FunctionalGram_CornerCheckerHybridClassCohortDegreeEdgebankSNR_s0": "E21_FunctionalGram_CornerCheckerHybridClassCohortDegreeEdgebankSNR_s0",
+    "C35_FunctionalGram_CornerCheckerHybridClassCohortDegreeRandomMatched_s0": "E22_FunctionalGram_CornerCheckerHybridClassCohortDegreeRandomMatched_s0",
+    "C36_FunctionalGram_CornerCheckerMultiRingHybridDegreeEdgebankSNR_s0": "E23_FunctionalGram_CornerCheckerMultiRingHybridDegreeEdgebankSNR_s0",
+    "C37_FunctionalGram_CornerCheckerMultiRingHybridDegreeRandomMatched_s0": "E24_FunctionalGram_CornerCheckerMultiRingHybridDegreeRandomMatched_s0",
+    "C38_FunctionalGram_CornerCheckerFocusDegreeEdgebankSNR_s0": "E25_FunctionalGram_CornerCheckerFocusDegreeEdgebankSNR_s0",
+    "C39_FunctionalGram_CornerCheckerFocusDegreeRandomMatched_s0": "E26_FunctionalGram_CornerCheckerFocusDegreeRandomMatched_s0",
+    "C40_FunctionalGram_CornerCheckerContrastDegreeEdgebankSNR_s0": "E27_FunctionalGram_CornerCheckerContrastDegreeEdgebankSNR_s0",
+    "C41_FunctionalGram_CornerCheckerContrastDegreeRandomMatched_s0": "E28_FunctionalGram_CornerCheckerContrastDegreeRandomMatched_s0",
+    "C42_FunctionalGram_CornerCheckerHybridTopKDegreeEdgebankSNR_s0": "E29_FunctionalGram_CornerCheckerHybridTopKDegreeEdgebankSNR_s0",
+    "C43_FunctionalGram_CornerCheckerHybridTopKDegreeRandomMatched_s0": "E30_FunctionalGram_CornerCheckerHybridTopKDegreeRandomMatched_s0",
+    "C44_FunctionalGram_CornerCheckerHybridTopK25DegreeEdgebankSNR_s0": "E31_FunctionalGram_CornerCheckerHybridTopK25DegreeEdgebankSNR_s0",
+    "C45_FunctionalGram_CornerCheckerHybridTopK25DegreeRandomMatched_s0": "E32_FunctionalGram_CornerCheckerHybridTopK25DegreeRandomMatched_s0",
+    "C46_FunctionalGram_CornerCheckerHybridTopK50DegreeEdgebankSNR_s0": "E33_FunctionalGram_CornerCheckerHybridTopK50DegreeEdgebankSNR_s0",
+    "C47_FunctionalGram_CornerCheckerHybridTopK50DegreeRandomMatched_s0": "E34_FunctionalGram_CornerCheckerHybridTopK50DegreeRandomMatched_s0",
 }
 
 RANDOM_CONTROL_FOR_SCHEME: dict[str, str] = {
@@ -105,6 +125,16 @@ RANDOM_CONTROL_FOR_SCHEME: dict[str, str] = {
     "C22_FunctionalSobolev_CornerCheckerHybridDegreeEdgebankSNR_s0p25": "C23_FunctionalSobolev_CornerCheckerHybridDegreeRandomMatched_s0p25",
     "C24_FunctionalSobolev_CornerCheckerHybridDegreeEdgebankSNR_s0p5": "C25_FunctionalSobolev_CornerCheckerHybridDegreeRandomMatched_s0p5",
     "C26_FunctionalSobolev_CornerCheckerHybridDegreeEdgebankSNR_s1": "C27_FunctionalSobolev_CornerCheckerHybridDegreeRandomMatched_s1",
+    "C28_FunctionalGram_CornerCheckerDiagonalHybridDegreeEdgebankSNR_s0": "C29_FunctionalGram_CornerCheckerDiagonalHybridDegreeRandomMatched_s0",
+    "C30_FunctionalGram_CornerCheckerDiagonalUnionDegreeEdgebankSNR_s0": "C31_FunctionalGram_CornerCheckerDiagonalUnionDegreeRandomMatched_s0",
+    "C32_FunctionalGram_CornerCheckerHybridClassConditionalDegreeEdgebankSNR_s0": "C33_FunctionalGram_CornerCheckerHybridClassConditionalDegreeRandomMatched_s0",
+    "C34_FunctionalGram_CornerCheckerHybridClassCohortDegreeEdgebankSNR_s0": "C35_FunctionalGram_CornerCheckerHybridClassCohortDegreeRandomMatched_s0",
+    "C36_FunctionalGram_CornerCheckerMultiRingHybridDegreeEdgebankSNR_s0": "C37_FunctionalGram_CornerCheckerMultiRingHybridDegreeRandomMatched_s0",
+    "C38_FunctionalGram_CornerCheckerFocusDegreeEdgebankSNR_s0": "C39_FunctionalGram_CornerCheckerFocusDegreeRandomMatched_s0",
+    "C40_FunctionalGram_CornerCheckerContrastDegreeEdgebankSNR_s0": "C41_FunctionalGram_CornerCheckerContrastDegreeRandomMatched_s0",
+    "C42_FunctionalGram_CornerCheckerHybridTopKDegreeEdgebankSNR_s0": "C43_FunctionalGram_CornerCheckerHybridTopKDegreeRandomMatched_s0",
+    "C44_FunctionalGram_CornerCheckerHybridTopK25DegreeEdgebankSNR_s0": "C45_FunctionalGram_CornerCheckerHybridTopK25DegreeRandomMatched_s0",
+    "C46_FunctionalGram_CornerCheckerHybridTopK50DegreeEdgebankSNR_s0": "C47_FunctionalGram_CornerCheckerHybridTopK50DegreeRandomMatched_s0",
 }
 
 
@@ -648,6 +678,16 @@ def merge_part_c(args: argparse.Namespace) -> dict[str, Any]:
                 "C22_FunctionalSobolev_CornerCheckerHybridDegreeEdgebankSNR_s0p25",
                 "C24_FunctionalSobolev_CornerCheckerHybridDegreeEdgebankSNR_s0p5",
                 "C26_FunctionalSobolev_CornerCheckerHybridDegreeEdgebankSNR_s1",
+                "C28_FunctionalGram_CornerCheckerDiagonalHybridDegreeEdgebankSNR_s0",
+                "C30_FunctionalGram_CornerCheckerDiagonalUnionDegreeEdgebankSNR_s0",
+                "C32_FunctionalGram_CornerCheckerHybridClassConditionalDegreeEdgebankSNR_s0",
+                "C34_FunctionalGram_CornerCheckerHybridClassCohortDegreeEdgebankSNR_s0",
+                "C36_FunctionalGram_CornerCheckerMultiRingHybridDegreeEdgebankSNR_s0",
+                "C38_FunctionalGram_CornerCheckerFocusDegreeEdgebankSNR_s0",
+                "C40_FunctionalGram_CornerCheckerContrastDegreeEdgebankSNR_s0",
+                "C42_FunctionalGram_CornerCheckerHybridTopKDegreeEdgebankSNR_s0",
+                "C44_FunctionalGram_CornerCheckerHybridTopK25DegreeEdgebankSNR_s0",
+                "C46_FunctionalGram_CornerCheckerHybridTopK50DegreeEdgebankSNR_s0",
             }
             and key[1] == "dche_k9"
             and key[2] == "depth3"
@@ -968,7 +1008,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         finite_step_guard_examples=128,
         predictive_trust_scale=1.0,
     )
-    p.add_argument("--part-c-schemes", default="C0_AdamW_control,C1_FunctionalGram_AdamW_s0_no_Qpop,C2_FunctionalGram_DiagonalSNR_s0,C3_FunctionalGram_BlockSNR_layer_s0,C4_FunctionalGram_BlockSNR_degree_s0,C5_FunctionalGram_BlockSNR_edgebank_s0,C10_FunctionalSobolev_DegreeEdgebankSNR_s0p25,C11_FunctionalSobolev_DegreeEdgebankSNR_s0p5,C12_FunctionalSobolev_DegreeEdgebankSNR_s1,C13_FunctionalSobolev_RandomMatchedGate_s0p25,C14_FunctionalSobolev_RandomMatchedGate_s0p5,C15_FunctionalSobolev_RandomMatchedGate_s1,C16_FunctionalGram_CheckerPatchDegreeEdgebankSNR_s0,C17_FunctionalGram_CheckerPatchDegreeRandomMatched_s0,C18_FunctionalGram_VisualPatternDegreeEdgebankSNR_s0,C19_FunctionalGram_VisualPatternDegreeRandomMatched_s0,C20_FunctionalGram_CornerCheckerHybridDegreeEdgebankSNR_s0,C21_FunctionalGram_CornerCheckerHybridDegreeRandomMatched_s0,C22_FunctionalSobolev_CornerCheckerHybridDegreeEdgebankSNR_s0p25,C23_FunctionalSobolev_CornerCheckerHybridDegreeRandomMatched_s0p25,C24_FunctionalSobolev_CornerCheckerHybridDegreeEdgebankSNR_s0p5,C25_FunctionalSobolev_CornerCheckerHybridDegreeRandomMatched_s0p5,C26_FunctionalSobolev_CornerCheckerHybridDegreeEdgebankSNR_s1,C27_FunctionalSobolev_CornerCheckerHybridDegreeRandomMatched_s1,C6_FunctionalGram_BlockSNR_class_conditional_s0,C7_FunctionalGram_RandomMatchedGate_s0,C8_FunctionalGram_SameComputeNoOp_s0,C9_FunctionalGram_s1_derivative_diagnostic")
+    p.add_argument("--part-c-schemes", default="C0_AdamW_control,C1_FunctionalGram_AdamW_s0_no_Qpop,C2_FunctionalGram_DiagonalSNR_s0,C3_FunctionalGram_BlockSNR_layer_s0,C4_FunctionalGram_BlockSNR_degree_s0,C5_FunctionalGram_BlockSNR_edgebank_s0,C10_FunctionalSobolev_DegreeEdgebankSNR_s0p25,C11_FunctionalSobolev_DegreeEdgebankSNR_s0p5,C12_FunctionalSobolev_DegreeEdgebankSNR_s1,C13_FunctionalSobolev_RandomMatchedGate_s0p25,C14_FunctionalSobolev_RandomMatchedGate_s0p5,C15_FunctionalSobolev_RandomMatchedGate_s1,C16_FunctionalGram_CheckerPatchDegreeEdgebankSNR_s0,C17_FunctionalGram_CheckerPatchDegreeRandomMatched_s0,C18_FunctionalGram_VisualPatternDegreeEdgebankSNR_s0,C19_FunctionalGram_VisualPatternDegreeRandomMatched_s0,C20_FunctionalGram_CornerCheckerHybridDegreeEdgebankSNR_s0,C21_FunctionalGram_CornerCheckerHybridDegreeRandomMatched_s0,C22_FunctionalSobolev_CornerCheckerHybridDegreeEdgebankSNR_s0p25,C23_FunctionalSobolev_CornerCheckerHybridDegreeRandomMatched_s0p25,C24_FunctionalSobolev_CornerCheckerHybridDegreeEdgebankSNR_s0p5,C25_FunctionalSobolev_CornerCheckerHybridDegreeRandomMatched_s0p5,C26_FunctionalSobolev_CornerCheckerHybridDegreeEdgebankSNR_s1,C27_FunctionalSobolev_CornerCheckerHybridDegreeRandomMatched_s1,C28_FunctionalGram_CornerCheckerDiagonalHybridDegreeEdgebankSNR_s0,C29_FunctionalGram_CornerCheckerDiagonalHybridDegreeRandomMatched_s0,C30_FunctionalGram_CornerCheckerDiagonalUnionDegreeEdgebankSNR_s0,C31_FunctionalGram_CornerCheckerDiagonalUnionDegreeRandomMatched_s0,C32_FunctionalGram_CornerCheckerHybridClassConditionalDegreeEdgebankSNR_s0,C33_FunctionalGram_CornerCheckerHybridClassConditionalDegreeRandomMatched_s0,C34_FunctionalGram_CornerCheckerHybridClassCohortDegreeEdgebankSNR_s0,C35_FunctionalGram_CornerCheckerHybridClassCohortDegreeRandomMatched_s0,C36_FunctionalGram_CornerCheckerMultiRingHybridDegreeEdgebankSNR_s0,C37_FunctionalGram_CornerCheckerMultiRingHybridDegreeRandomMatched_s0,C38_FunctionalGram_CornerCheckerFocusDegreeEdgebankSNR_s0,C39_FunctionalGram_CornerCheckerFocusDegreeRandomMatched_s0,C40_FunctionalGram_CornerCheckerContrastDegreeEdgebankSNR_s0,C41_FunctionalGram_CornerCheckerContrastDegreeRandomMatched_s0,C6_FunctionalGram_BlockSNR_class_conditional_s0,C7_FunctionalGram_RandomMatchedGate_s0,C8_FunctionalGram_SameComputeNoOp_s0,C9_FunctionalGram_s1_derivative_diagnostic")
     p.add_argument("--part-c-seed-count", type=int, default=15)
     p.add_argument("--part-c-gate-floors", default="0.2,0.3,0.4")
     p.add_argument("--c-task-coverage-gate", type=float, default=0.03)
